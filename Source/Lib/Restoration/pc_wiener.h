@@ -15,4 +15,10 @@ int svt_av2_pcwiener_filter_y(const uint16_t* src, ptrdiff_t src_stride,
     uint32_t bit_depth, uint32_t base_q_idx, const uint8_t* tskip,
     ptrdiff_t tskip_stride);
 
+/* With CDEF, deblocked holds the saved input to CDEF, with src_stride in samples. */
+int svt_av2_pcwiener_filter_y_boundaries(const uint16_t* src, ptrdiff_t src_stride,
+    uint16_t* dst, ptrdiff_t dst_stride, uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t base_q_idx, const uint8_t* tskip,
+    ptrdiff_t tskip_stride, const uint16_t* deblocked);
+
 #endif

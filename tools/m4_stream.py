@@ -52,7 +52,7 @@ def obus(data):
         offset += size
 
 
-def sequence(payload):
+def sequence(payload, *, allow_cfl=False, allow_ist=False, expected_ibp=False, expected_gdf=False):
     b = Bits(payload)
     if b.uvlc() != 0:
         raise ValueError("nonzero sequence id")
@@ -73,7 +73,12 @@ def sequence(payload):
     b.expect(3, 0, "crop/display-delay/decoder-model")
     b.expect(5, 0, "SB/SDP/extended partition")
     b.expect(2, 0, "segmentation")
-    b.expect(8, 0, "intra tools")
+    b.expect(3, 0, "DIP/intra edge filter/MRL")
+    cfl = b.read(1)
+    if cfl and not (allow_cfl and profile == chroma == bd == 0):
+        raise ValueError("experimental CfL outside the expected 10-bit 420 profile")
+    b.expect(3, 0, "CfL downsampling/MHCCP")
+    b.expect(1, int(expected_ibp), "IBP")
     b.expect(6, 0, "motion modes/compound/ref_frame_mvs")
     hint_bits = b.read(4) + 1
     b.expect(1, 0, "refmvbank")
@@ -89,16 +94,26 @@ def sequence(payload):
     b.expect(1, 0, "frame IBC DRL override")
     b.expect(17, 0, "compound/TIP/trajectory/BAWP/CWP/refinement/MVD/global tools")
     b.expect(2, 3, "screen-content/integer-MV selectable")
-    b.expect(10, 0, "transform/TCQ/parity tools")
+    b.expect(2, 0, "FSC/IDTX")
+    ist = b.read(1)
+    if ist and not allow_ist:
+        raise ValueError("unexpected intra IST")
+    b.expect(7, 0, "remaining transform/TCQ/parity tools")
     b.expect(2, 3, "average per-tile CDF")
     b.expect(1, 0, "separate UV delta Q")
     b.expect(1, 1, "equal AC/DC Q")
     b.expect(5, 23, "base UV delta Q")
     b.expect(1, 0, "UV AC delta Q enabled")
-    b.expect(12, 0, "filters/tile/film-grain/extension tools")
+    b.expect(2, 0, "loop filters across tiles/CDEF")
+    b.expect(1, int(expected_gdf), "GDF")
+    if expected_gdf:
+        b.expect(1, 1, "GDF unit matches superblock")
+    b.expect(9, 0, "remaining filters/tile/film-grain/extension tools")
     return {"width": width, "height": height, "bit_depth": 10 if bd == 0 else 8,
             "chroma": "444" if chroma == 2 else "420", "slots": slots,
-            "hint_bits": hint_bits, "explicit_map": explicit_map}
+            "hint_bits": hint_bits, "explicit_map": explicit_map,
+            **({"cfl": bool(cfl)} if allow_cfl else {}),
+            **({"intra_ist": bool(ist)} if allow_ist else {})}
 
 
 def inspect_stream(data, expected_frames, inter=True):

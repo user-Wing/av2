@@ -17,6 +17,8 @@
 #include "motion_syntax.h"
 #include "cdf_tables_coeff.h"
 #include "entropy_encoder.h"
+#include "entropy_models.h"
+#include "intra_mode_map.h"
 
 #include "test_util.h"
 
@@ -578,7 +580,7 @@ static void test_m4_far_left_is_not_mvp(void) {
             state.cells[35u * state.cols + 15u] = far;
         }
         const SvtAv2BlockView block = {80u,128u,16u,16u,NULL};
-        const SvtAv2TileBlockMode mode = {1u,2,-2};
+        const SvtAv2TileBlockMode mode = {1u,2,-2,0u};
         uint16_t precarry[64];
         SvtAv2EntropyEncoder enc;
         svt_av2_entropy_encoder_init(&enc, coded[pass], 64u, precarry, 64u);
@@ -626,7 +628,41 @@ static void test_m53_q_contexts_and_high_range(void) {
     }
 }
 
+static void test_intra_ist_eob(void) {
+    /* IST set ordering follows wide-angle mapping even on long DCT blocks
+     * where the mapped angle never selected a different primary type. */
+    SVT_TEST_CHECK_EQ_INT(svt_av2_intra_tx_mode(13u, 64u, 16u, 0u), 8u);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_intra_tx_mode(9u, 16u, 64u, 0u), 13u);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_intra_tx_mode(13u, 32u, 16u, 0u), 13u);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_intra_tx_mode(9u, 8u, 64u, 0u), 13u);
+    const SvtAv2CoeffPlaneInfo pi = {0u, SVT_AV2_TX_8X8, 0u, 0u, 2u, 2u, 8u, 8u};
+    uint16_t scan[64];
+    SVT_TEST_CHECK_EQ_INT(svt_av2_coeff_scan_dct_dct(pi.tx_size, scan), 64u);
+    SvtAv2EntropyModels models;
+    SvtAv2EntropyEncoder enc;
+    SvtAv2CoeffNeighbours nb;
+    const uint32_t context = SVT_AV2_MODEL_INTRA_IST + 1u;
+    const uint32_t eobs[] = {1u, 2u, 20u, 21u};
+    for (uint32_t i = 0u; i < 4u; ++i) {
+        for (uint32_t code = 0u; code <= 1u; ++code) {
+            int32_t qcoeff[64] = {0};
+            qcoeff[scan[eobs[i] - 1u]] = 1;
+            svt_av2_coeff_neighbours_reset(&nb);
+            svt_av2_entropy_rate_init(&enc);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_entropy_models_init(&models, 2u), 0);
+            enc.models = &models;
+            const int allowed = eobs[i] >= 2u && eobs[i] <= 20u;
+            const int status = svt_av2_coeff_write_block_transform_ist(&enc, &pi, 0u, qcoeff,
+                &nb, 2u, 0u, 0u, 0u, 0u, 1u, code);
+            SVT_TEST_CHECK_EQ_INT(status, code && !allowed ? SVT_AV2_COEFF_ERR_UNSUPPORTED : 0);
+            SVT_TEST_CHECK_EQ_INT(models.cdf[context][4], allowed);
+            SVT_TEST_CHECK_EQ_INT(models.cdf[SVT_AV2_MODEL_IST_SET_DCT][7], allowed && code);
+        }
+    }
+}
+
 int main(void) {
+    test_intra_ist_eob();
     test_m53_q_contexts_and_high_range();
     test_m4_far_left_is_not_mvp();
     test_m4_inter_dct_idtx_symbol();

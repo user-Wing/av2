@@ -474,6 +474,53 @@ static void test_multi_frame_seq_bytes_720p_and_144p(void) {
     }
 }
 
+static uint32_t seq_bits_at(const uint8_t* data, size_t first, size_t count) {
+    uint32_t value = 0u;
+    for (size_t i = first; i < first + count; ++i)
+        value = (value << 1u) | ((data[i >> 3u] >> (7u - (i & 7u))) & 1u);
+    return value;
+}
+
+static void test_dual_ref_sequence_fields(void) {
+    uint8_t legacy[64], dual[64];
+    SvtAv2BitWriter bw;
+    SvtAv2SequenceHeaderConfig cfg;
+    svt_av2_sequence_header_config_default(&cfg, 64u, 64u);
+    SVT_TEST_CHECK_EQ_INT(cfg.dual_ref, 0u);
+    cfg.low_delay_p = 1u;
+    svt_av2_bit_writer_init(&bw, legacy, sizeof(legacy));
+    SVT_TEST_CHECK_EQ_INT(svt_av2_sequence_header_write_multi(&bw, &cfg), SVT_AV2_BW_OK);
+    const size_t bits = svt_av2_bit_writer_bits_written(&bw);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_obu_payload_finalize(&bw), SVT_AV2_BW_OK);
+    const size_t bytes = svt_av2_bit_writer_bytes_written(&bw);
+    cfg.dual_ref = 1u;
+    svt_av2_bit_writer_init(&bw, dual, sizeof(dual));
+    SVT_TEST_CHECK_EQ_INT(svt_av2_sequence_header_write_multi(&bw, &cfg), SVT_AV2_BW_OK);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_bit_writer_bits_written(&bw), bits);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_obu_payload_finalize(&bw), SVT_AV2_BW_OK);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_bit_writer_bytes_written(&bw), bytes);
+    /* From the fixed AV2 1.0 sequence layout for 64x64, 8b 420, level 2.0:
+     * 16 profile/level/format bits + 10 layer bits + 23 size/timing bits
+     * + 15 partition/segment/intra bits + 12 inter bits before the map. */
+    const size_t map_pos = 16u + 10u + 23u + 15u + 12u;
+    SVT_TEST_CHECK_EQ_INT(seq_bits_at(dual, map_pos, 2u), 3u); /* explicit map and DPB length */
+    SVT_TEST_CHECK_EQ_INT(seq_bits_at(legacy, map_pos + 2u, 4u), 0u); /* one slot */
+    SVT_TEST_CHECK_EQ_INT(seq_bits_at(dual, map_pos + 2u, 4u), 1u); /* two slots */
+    SVT_TEST_CHECK_EQ_INT(seq_bits_at(dual, map_pos + 30u, 1u), 0u); /* short refresh off */
+    const size_t changed = map_pos + 5u;
+    for (size_t i = 0u; i < bytes * 8u; ++i)
+        SVT_TEST_CHECK_EQ_INT(seq_bits_at(dual, i, 1u), seq_bits_at(legacy, i, 1u) ^ (uint32_t)(i == changed));
+
+    svt_av2_bit_writer_init(&bw, dual, sizeof(dual));
+    SVT_TEST_CHECK_EQ_INT(svt_av2_sequence_header_write(&bw, &cfg), SVT_AV2_BW_ERROR_UNSUPPORTED);
+    cfg.low_delay_p = 0u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_sequence_header_write_multi(&bw, &cfg), SVT_AV2_BW_ERROR_UNSUPPORTED);
+    cfg.low_delay_p = 1u;
+    cfg.dual_ref = 2u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_sequence_header_write_multi(&bw, &cfg), SVT_AV2_BW_ERROR_RANGE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_bit_writer_bits_written(&bw), 0u);
+}
+
 static void test_multi_frame_requires_alignment(void) {
     SvtAv2BitWriter            bw;
     uint8_t                    buf[16];
@@ -519,6 +566,7 @@ int main(void) {
     test_multi_frame_seq_is_longer_and_differs();
     test_multi_frame_seq_bytes_1920x1080();
     test_multi_frame_seq_bytes_720p_and_144p();
+    test_dual_ref_sequence_fields();
     test_multi_frame_requires_alignment();
     test_multi_frame_obu_framing();
     SVT_TEST_REPORT("test_header_frames");

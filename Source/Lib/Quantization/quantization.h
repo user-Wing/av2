@@ -100,6 +100,9 @@ typedef struct SvtAv2QuantParams {
      * Always true under the frozen stream (DC and AC use the same q index but
      * the quantizer tables still index 0 vs 1). Present so the block entry
      * points do not need to know about the plane tables. */
+    const uint8_t (*inverse_matrix)[3600];
+    uint16_t qm_size, qm_offset;  /* Zero size selects flat quantization. */
+    uint8_t avm_fp_round;  /* Use AVM round_fp_QTX in the forward quantizer. */
     int applies;
 } SvtAv2QuantParams;
 
@@ -126,6 +129,10 @@ SvtAv2QuantStatus svt_av2_quant_params_init(SvtAv2QuantParams* params, uint32_t 
  * instead of 2 and makes dqcoeff systematically 2x too large, with no error.
  * Pass (64,64) -- see svt_av2_quant_params_init() and the T010 report.
  */
+SvtAv2QuantStatus svt_av2_quant_params_init_matrix(SvtAv2QuantParams* params,
+    uint32_t qindex, uint32_t width, uint32_t height, uint32_t depth, int qm_level, int uv_delta_q);
+int32_t svt_av2_dequant_position(const SvtAv2QuantParams* params, int32_t level, int plane, size_t pos);
+
 SvtAv2QuantStatus svt_av2_quant_params_init_tx(SvtAv2QuantParams* params,
                                                uint32_t base_q_idx,
                                                uint32_t tx_width,

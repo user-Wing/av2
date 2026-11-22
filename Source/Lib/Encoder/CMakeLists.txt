@@ -21,6 +21,8 @@ add_library(svt_av2_encoder_core STATIC
     inter_frame.c
     transform_path.c
     rd_frame.c
+    gdf_luma.c
+    cdef_luma.c
     deblock_luma.c
     content_filter_guard.c)
 
@@ -38,6 +40,10 @@ target_link_libraries(svt_av2_encoder_core
     PRIVATE
         svt_av2_transform
         svt_av2_quantization)
+
+if(UNIX)
+    target_link_libraries(svt_av2_encoder_core PRIVATE m)
+endif()
 
 set_target_properties(svt_av2_encoder_core PROPERTIES OUTPUT_NAME "svt_av2_encoder_core")
 

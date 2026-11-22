@@ -39,6 +39,8 @@ typedef struct AppOptions {
     const char* output_path;
     const char* recon_path; /* NULL = do not export the reconstruction */
     int32_t     qp;
+    int32_t     video_key_qp;
+    int32_t     video_anchor_qp;
     int32_t     preset;
     int32_t     threads;
     int32_t     frames; /* -1 = all frames in the source */
@@ -51,13 +53,23 @@ typedef struct AppOptions {
     uint32_t mrl_search;
     uint32_t tree_refinement;
     uint32_t rd_lambda_model;
+    uint32_t rd_lambda_scale;
     uint32_t cfl_search;
     uint32_t mhccp_search;
     uint32_t intra_joint;
     uint32_t rd_mode;
     uint32_t coeff_optimization;
     uint32_t motion_optimization;
+    uint32_t inter_skip_search;
+    uint32_t inter_ref_period;
+    uint32_t inter_fine;
+    uint32_t inter_near;
+    uint32_t inter_tail;
+    uint32_t dual_ref_period;
+    uint32_t dual_ref_policy;
+    uint32_t dual_ref_cadence;
     uint32_t entropy_adaptation;
+    uint32_t cdf_inherit;
     uint32_t still_picture;
     SvtAv2ContentType content_type; /* NONE unless supplied explicitly */
     int         verbose;
@@ -70,6 +82,7 @@ static void app_options_set_defaults(AppOptions* options) {
     options->threads = 1;
     options->frames = -1;
     options->deterministic = 1;
+    options->inter_ref_period = 1u;
 }
 
 static void print_usage(const char* program) {
@@ -93,8 +106,9 @@ static void print_usage(const char* program) {
            "  --intra-select <dc|adaptive|basic|directional|cfl>  extended single-picture Y/UV RD\n"
            "  --partition-select <fixed|adaptive|fine|mixed|rect|longrect|mixedrect|mixed8|thinrect|mixedthin|thin64>  fine=64/32/16; mixed adds 8 and quadrant splits; rect adds 16x8/8x16; longrect adds six larger rectangles; mixedrect adds mixed rectangular quadrants; mixed8 adds mixed small rectangles; thinrect adds uniform 8x32/32x8; mixedthin adds mixed thin quadrants; thin64 adds uniform 8x64/64x8 (still + basic/directional + RD)\n"
            "  --rd-mode <off|exhaustive|pruned|fast>  M6 bounded RD (default: off)\n"
-           "  --tree-refine <off|rd|wide>  rd=best two trees; wide preserves seeds before long rectangles; thinrect/mixedthin also preserve pre-thin seeds with up to eight finalists; thin64 preserves those eight plus both new shapes (still + fine or later + RD)\n"
-           "  --rd-lambda <original|avm-ai|avm-ai150>  Experimental intra RD lambda model (still + RD; default original)\n"
+           "  --tree-refine <off|rd|wide|screen>  screen=bounded mixed8 still search; rd=best two trees; wide preserves seeds before long rectangles; thinrect/mixedthin also preserve pre-thin seeds with up to eight finalists; thin64 preserves those eight plus both new shapes (still + fine or later + RD)\n"
+           "  --rd-lambda <original|avm-ai|avm-ai150>  RD lambda model (still RD or pruned low-delay P; default original)\n"
+           "  --rd-lambda-scale <50..250>  Percent of selected AVM lambda (default 100)\n"
            "  --content-type <animation|real> Externally supplied content hint (default: none)\n"
            "                        Animation guard: compiled on + 10-bit 420 still + 1920x1080/3840x2160\n"
            "  --cfl-search <off|rd>  Also search classic explicit UV alpha (still + cfl + RD)\n"
@@ -105,9 +119,29 @@ static void print_usage(const char* program) {
            "  --transform-select <dct|primary|full>  Y 4/8/16 DCT/ADST subset; full also supports 8x16/16x8 (still + basic/directional + RD)\n"
            "  fast: still intra directional/cfl, partition <= mixed8, joint off\n"
            "  --coeff-opt <off|rd|rdoq>  rdoq=bounded level/EOB search (still + RD)\n"
-           "  --motion-opt <off|rd|wide> Integer MV RD (requires RD, excludes coefficient RD)\n"
-           "  --entropy-adapt <off|on> Frame-local CDF updates (requires RD off)\n"
+           "  --motion-opt <off|rd|wide|half|sharp|quarter> Fractional modes require low-delay-p, pruned RD and fixed/adaptive partitions\n"
+           "  --inter-skip <off|rd>  Explicit predictor-only inter candidate (default: off)\n"
+           "  --ref-period <1|2|4|8>  Refresh the single reference every n pictures (default: 1)\n"
+           "                        Both require low-delay-p, pruned RD, fixed/64-32 partition, coeff off\n"
+           "  --entropy-adapt <off|on> Frame-local CDF updates (default: off)\n"
+           "                        With RD: still (motion off, coeff off/rdoq), or low-delay-p\n"
+           "                        (pruned, DC or DC/V/H, fixed or 64/32 partition, coeff off)\n"
+           "  --cdf-inherit <off|on> Seed P entropy from logical reference 0 (default: off)\n"
+           "                        Requires low-delay-p, pruned RD and entropy adaptation on\n"
+           "  --inter-fine <off|rd>  Local 32-to-16 search (quarter, adaptive partitions, skip RD off)\n"
+           "  --inter-near <off|rd>  Test the exact DRL0 motion predictor in RD (default: off)\n"
+           "                        Requires pruned low-delay-p, quarter, fixed/adaptive partitions, skip RD off\n"
+           "  --inter-tail <off|rd>  Experimental inter residual tail pruning (default: off)\n"
+           "                        Requires pruned low-delay-p, quarter, fixed/adaptive partitions, skip RD off\n"
+           "                        With dual references, requires --dual-ref-policy block\n"
+           "  --dual-ref-period <0|2|4|8>  Optional second DPB slot (quarter, --ref-period 1)\n"
+           "  --dual-ref-policy <auto|last|long|block>  Reference selection (default: auto)\n"
+           "                        block: experimental per-block LAST/LONG (skip RD off)\n"
+           "  --dual-ref-cadence <fixed|adaptive>  Long-slot refresh timing (default: fixed)\n"
+           "                        adaptive requires --dual-ref-policy block and --dual-ref-period 4\n"
            "  --qp <1..255>         CQP (10-bit actual qindex=QP+48) (default: 100)\n"
+           "  --key-qp <1..255>     Override the first KEY QP in low-delay P only (default: inherit --qp)\n"
+           "  --anchor-qp <1..255>  Override QP on P frames refreshing the long slot (requires dual ref)\n"
            "  --preset <0|4|8|12>   Speed preset placeholder (default: 4)\n"
            "  --threads <n>         Thread count; M4 only supports 1 (default: 1)\n"
            "  --deterministic       Enable deterministic mode (default)\n"
@@ -252,12 +286,103 @@ static int app_parse_args(int argc, char** argv, AppOptions* options) {
             ++i;
             continue;
         }
-        if (strcmp(arg, "--motion-opt") == 0) {
-            if (!has_next || (strcmp(value, "off") != 0 && strcmp(value, "rd") != 0 && strcmp(value, "wide") != 0)) {
-                fprintf(stderr, "error: --motion-opt requires off, rd or wide\n");
+        if (strcmp(arg, "--cdf-inherit") == 0) {
+            if (!has_next || (strcmp(value, "off") != 0 && strcmp(value, "on") != 0)) {
+                fprintf(stderr, "error: --cdf-inherit requires off or on\n");
                 return -1;
             }
-            options->motion_optimization = strcmp(value, "off") == 0 ? 0u : (strcmp(value, "rd") == 0 ? 1u : 2u);
+            options->cdf_inherit = strcmp(value, "on") == 0 ? 1u : 0u;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--inter-fine") == 0) {
+            if (!has_next || (strcmp(value, "off") && strcmp(value, "rd"))) {
+                fprintf(stderr, "error: --inter-fine requires off or rd\n");
+                return -1;
+            }
+            options->inter_fine = strcmp(value, "rd") == 0 ? 1u : 0u;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--inter-near") == 0) {
+            if (value == NULL || (strcmp(value, "off") != 0 && strcmp(value, "rd") != 0)) {
+                fprintf(stderr, "error: --inter-near requires off or rd\n");
+                return -1;
+            }
+            options->inter_near = strcmp(value, "rd") == 0 ? 1u : 0u;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--inter-tail") == 0) {
+            if (!has_next || (strcmp(value, "off") && strcmp(value, "rd"))) {
+                fprintf(stderr, "error: --inter-tail requires off or rd\n");
+                return -1;
+            }
+            options->inter_tail = strcmp(value, "rd") == 0 ? 1u : 0u;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--inter-skip") == 0) {
+            if (!has_next || (strcmp(value, "off") && strcmp(value, "rd"))) {
+                fprintf(stderr, "error: --inter-skip requires off or rd\n");
+                return -1;
+            }
+            options->inter_skip_search = strcmp(value, "rd") == 0 ? 1u : 0u;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--dual-ref-period") == 0) {
+            int32_t period;
+            if (!has_next || parse_int32(value, &period) != 0 ||
+                (period != 0 && period != 2 && period != 4 && period != 8)) {
+                fprintf(stderr, "error: --dual-ref-period requires 0, 2, 4 or 8\n");
+                return -1;
+            }
+            options->dual_ref_period = (uint32_t)period;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--dual-ref-policy") == 0) {
+            if (!has_next || (strcmp(value, "auto") && strcmp(value, "last") && strcmp(value, "long") &&
+                strcmp(value, "block"))) {
+                fprintf(stderr, "error: --dual-ref-policy requires auto, last, long or block\n");
+                return -1;
+            }
+            options->dual_ref_policy = strcmp(value, "auto") == 0 ? 0u : strcmp(value, "last") == 0 ? 1u :
+                strcmp(value, "long") == 0 ? 2u : 3u;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--dual-ref-cadence") == 0) {
+            if (!has_next || (strcmp(value, "fixed") && strcmp(value, "adaptive"))) {
+                fprintf(stderr, "error: --dual-ref-cadence requires fixed or adaptive\n");
+                return -1;
+            }
+            options->dual_ref_cadence = strcmp(value, "adaptive") == 0 ? 1u : 0u;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--ref-period") == 0) {
+            int32_t period;
+            if (!has_next || parse_int32(value, &period) != 0 ||
+                (period != 1 && period != 2 && period != 4 && period != 8)) {
+                fprintf(stderr, "error: --ref-period requires 1, 2, 4 or 8\n");
+                return -1;
+            }
+            options->inter_ref_period = (uint32_t)period;
+            ++i;
+            continue;
+        }
+        if (strcmp(arg, "--motion-opt") == 0) {
+            if (!has_next || (strcmp(value, "off") != 0 && strcmp(value, "rd") != 0 &&
+                strcmp(value, "wide") != 0 && strcmp(value, "half") != 0 && strcmp(value, "sharp") != 0 &&
+                strcmp(value, "quarter") != 0)) {
+                fprintf(stderr, "error: --motion-opt requires off, rd, wide, half, sharp or quarter\n");
+                return -1;
+            }
+            options->motion_optimization = strcmp(value, "off") == 0 ? 0u :
+                strcmp(value, "rd") == 0 ? 1u : strcmp(value, "wide") == 0 ? 2u :
+                strcmp(value, "half") == 0 ? 3u : strcmp(value, "sharp") == 0 ? 4u : 5u;
             ++i;
             continue;
         }
@@ -270,11 +395,11 @@ static int app_parse_args(int argc, char** argv, AppOptions* options) {
             ++i; continue;
         }
         if (strcmp(arg, "--tree-refine") == 0) {
-            if (!has_next || (strcmp(value, "off") != 0 && strcmp(value, "rd") != 0 && strcmp(value, "wide") != 0)) {
-                fprintf(stderr, "error: --tree-refine requires off, rd or wide\n");
+            if (!has_next || (strcmp(value, "off") != 0 && strcmp(value, "rd") != 0 && strcmp(value, "wide") != 0 && strcmp(value, "screen") != 0)) {
+                fprintf(stderr, "error: --tree-refine requires off, rd, wide or screen\n");
                 return -1;
             }
-            options->tree_refinement = strcmp(value, "wide") == 0 ? 2u : (uint32_t)(strcmp(value, "rd") == 0);
+            options->tree_refinement = strcmp(value, "screen") == 0 ? 3u : strcmp(value, "wide") == 0 ? 2u : (uint32_t)(strcmp(value, "rd") == 0);
             ++i; continue;
         }
         if (strcmp(arg, "--content-type") == 0) {
@@ -292,6 +417,16 @@ static int app_parse_args(int argc, char** argv, AppOptions* options) {
                 return -1;
             }
             options->rd_lambda_model = strcmp(value, "avm-ai150") == 0 ? 2u : (uint32_t)(strcmp(value, "avm-ai") == 0);
+            ++i; continue;
+        }
+        if (strcmp(arg, "--rd-lambda-scale") == 0) {
+            char* end = NULL;
+            long sc = value ? strtol(value, &end, 10) : 0;
+            if (value == NULL || end == value || *end != '\0' || sc < 50 || sc > 250) {
+                fprintf(stderr, "error: --rd-lambda-scale requires an integer in 50..250\n");
+                return -1;
+            }
+            options->rd_lambda_scale = (uint32_t)sc;
             ++i; continue;
         }
         if (strcmp(arg, "--mrl-search") == 0) {
@@ -353,6 +488,15 @@ static int app_parse_args(int argc, char** argv, AppOptions* options) {
             ++i;
             continue;
         }
+        if (strcmp(arg, "--key-qp") == 0 || strcmp(arg, "--anchor-qp") == 0) {
+            int32_t* qp = strcmp(arg, "--key-qp") == 0 ? &options->video_key_qp : &options->video_anchor_qp;
+            if (!has_next || parse_int32(value, qp) != 0 || *qp < 1 || *qp > 255) {
+                fprintf(stderr, "error: %s requires an integer in [1, 255]\n", arg);
+                return -1;
+            }
+            ++i;
+            continue;
+        }
         if (strcmp(arg, "--qp") == 0) {
             if (!has_next || parse_int32(value, &options->qp) != 0 || options->qp < 1 || options->qp > 255) {
                 fprintf(stderr, "error: --qp requires an integer in [1, 255]\n");
@@ -384,6 +528,37 @@ static int app_parse_args(int argc, char** argv, AppOptions* options) {
 
     if (options->input_path == NULL) {
         fprintf(stderr, "error: --input is required\n");
+        return -1;
+    }
+    if (options->cdf_inherit && (options->still_picture ||
+        options->prediction_structure != SVT_AV2_PRED_LOW_DELAY_P || options->rd_mode != 2u ||
+        !options->entropy_adaptation)) {
+        fprintf(stderr, "error: --cdf-inherit on requires non-still low-delay-p, --rd-mode pruned "
+                        "and --entropy-adapt on\n");
+        return -1;
+    }
+    if (options->dual_ref_cadence && (options->dual_ref_policy != 3u ||
+        options->dual_ref_period != 4u || options->inter_skip_search)) {
+        fprintf(stderr, "error: adaptive cadence requires --dual-ref-policy block, "
+                        "--dual-ref-period 4 and --inter-skip off\n");
+        return -1;
+    }
+    if (options->inter_near && (options->still_picture ||
+        options->prediction_structure != SVT_AV2_PRED_LOW_DELAY_P || options->rd_mode != 2u ||
+        options->motion_optimization != 5u || options->partition_selection > 1u ||
+        options->inter_skip_search || options->intra_mode_selection > 1u)) {
+        fprintf(stderr, "error: --inter-near rd requires non-still low-delay-p, --rd-mode pruned, "
+                        "--motion-opt quarter, fixed/adaptive partitions, simple intra, and --inter-skip off\n");
+        return -1;
+    }
+    if (options->inter_tail && (options->still_picture ||
+        options->prediction_structure != SVT_AV2_PRED_LOW_DELAY_P || options->rd_mode != 2u ||
+        options->motion_optimization != 5u || options->partition_selection > 1u || options->inter_skip_search ||
+        options->intra_mode_selection > 1u || options->coeff_optimization || options->transform_selection ||
+        (options->dual_ref_period ? options->dual_ref_policy != 3u : options->dual_ref_policy != 0u))) {
+        fprintf(stderr, "error: --inter-tail rd requires non-still low-delay-p, --rd-mode pruned, "
+                        "--motion-opt quarter, fixed/adaptive partitions, simple intra, default coefficients and transforms, "
+                        "--inter-skip off, and block policy if dual references are enabled\n");
         return -1;
     }
     if (options->still_picture && (options->frames == 0 || options->frames > 1 ||
@@ -612,6 +787,8 @@ int main(int argc, char** argv) {
     if (err == SVT_AV2_ERROR_NONE) err = svt_av2_enc_set_parameter(handle,
         SVT_AV2_PARAM_RD_LAMBDA_MODEL, &options.rd_lambda_model);
     if (err == SVT_AV2_ERROR_NONE) err = svt_av2_enc_set_parameter(handle,
+        SVT_AV2_PARAM_RD_LAMBDA_SCALE, &options.rd_lambda_scale);
+    if (err == SVT_AV2_ERROR_NONE) err = svt_av2_enc_set_parameter(handle,
         SVT_AV2_PARAM_CFL_SEARCH, &options.cfl_search);
     if (err == SVT_AV2_ERROR_NONE) err = svt_av2_enc_set_parameter(handle,
         SVT_AV2_PARAM_MHCCP_SEARCH, &options.mhccp_search);
@@ -630,6 +807,28 @@ int main(int argc, char** argv) {
     /* Omission preserves the historical setter sequence and NONE default. */
     if (err == SVT_AV2_ERROR_NONE && options.content_type!=SVT_AV2_CONTENT_NONE)
         err = svt_av2_enc_set_parameter(handle,SVT_AV2_PARAM_CONTENT_TYPE,&options.content_type);
+    if (err == SVT_AV2_ERROR_NONE && options.inter_skip_search)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_SKIP_SEARCH, &options.inter_skip_search);
+    if (err == SVT_AV2_ERROR_NONE && options.inter_ref_period != 1u)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_REF_PERIOD, &options.inter_ref_period);
+    if (err == SVT_AV2_ERROR_NONE && options.video_key_qp)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_KEY_QP, &options.video_key_qp);
+    if (err == SVT_AV2_ERROR_NONE && options.inter_fine)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_FINE, &options.inter_fine);
+    if (err == SVT_AV2_ERROR_NONE && options.video_anchor_qp)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_ANCHOR_QP, &options.video_anchor_qp);
+    if (err == SVT_AV2_ERROR_NONE && options.dual_ref_period)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_PERIOD, &options.dual_ref_period);
+    if (err == SVT_AV2_ERROR_NONE && options.dual_ref_policy)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &options.dual_ref_policy);
+    if (err == SVT_AV2_ERROR_NONE && options.dual_ref_cadence)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_CADENCE, &options.dual_ref_cadence);
+    if (err == SVT_AV2_ERROR_NONE && options.inter_near)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_NEAR, &options.inter_near);
+    if (err == SVT_AV2_ERROR_NONE && options.inter_tail)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_TAIL, &options.inter_tail);
+    if (err == SVT_AV2_ERROR_NONE && options.cdf_inherit)
+        err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_CDF_INHERIT, &options.cdf_inherit);
     if (err == SVT_AV2_ERROR_NONE) err = svt_av2_enc_init(handle);
     if (err != SVT_AV2_ERROR_NONE) {
         fprintf(stderr, "error: svt_av2_enc_init failed (%s)\n", svt_av2_error_to_string(err));
@@ -914,11 +1113,49 @@ int main(int argc, char** argv) {
                 printf("coeff frame=%u trials=%" PRIu64 " accepts=%" PRIu64 "\n",
                     frames_written, rd.coeff_trials, rd.coeff_accepts);
             if (options.motion_optimization)
-                printf("motion frame=%u trials=%" PRIu64 " accepts=%" PRIu64 "\n",
+                printf("%s frame=%u trials=%" PRIu64 " accepts=%" PRIu64 "\n",
+                    options.motion_optimization == 5u ? "quarter" : options.motion_optimization == 4u ? "sharp" :
+                    options.motion_optimization == 3u ? "half" : "motion",
                     frames_written, rd.motion_trials, rd.motion_accepts);
             if (options.motion_optimization == 2u)
                 printf("wide frame=%u trials=%" PRIu64 " accepts=%" PRIu64 "\n",
                     frames_written, rd.wide_trials, rd.wide_accepts);
+            if (options.dual_ref_policy == 3u) {
+                SvtAv2BlockRefStats refs;
+                const SvtAv2Error ref_error = svt_av2_enc_get_block_ref_stats(handle, &refs);
+                if (ref_error != SVT_AV2_ERROR_NONE) {
+                    fprintf(stderr, "error: reading block reference statistics failed (%s)\n", svt_av2_error_to_string(ref_error));
+                    exit_code = 11;
+                    break;
+                }
+                printf("dual-ref frame=%u logical=%u d0=%u d1=%u refresh=%u rank0=%u rank1=%u odd_rank0=%u odd_rank1=%u\n",
+                    frames_written, refs.logical_ref_count, refs.ref_distance[0], refs.ref_distance[1],
+                    refs.refresh_mask, refs.rank_leaves[0], refs.rank_leaves[1], refs.odd_mv_leaves[0], refs.odd_mv_leaves[1]);
+            }
+            if (options.inter_skip_search) {
+                uint64_t trials, accepts;
+                const SvtAv2Error skip_error = svt_av2_enc_get_inter_skip_stats(handle, &trials, &accepts);
+                if (skip_error != SVT_AV2_ERROR_NONE) {
+                    fprintf(stderr, "error: reading inter skip statistics failed (%s)\n",
+                        svt_av2_error_to_string(skip_error));
+                    exit_code = 11;
+                    break;
+                }
+                printf("inter-skip frame=%u trials=%" PRIu64 " accepts=%" PRIu64 "\n",
+                    frames_written, trials, accepts);
+            }
+            if (options.inter_fine) {
+                uint64_t trials, accepts;
+                const SvtAv2Error fine_error = svt_av2_enc_get_inter_fine_stats(handle, &trials, &accepts);
+                if (fine_error != SVT_AV2_ERROR_NONE) {
+                    fprintf(stderr, "error: reading inter fine statistics failed (%s)\n",
+                        svt_av2_error_to_string(fine_error));
+                    exit_code = 11;
+                    break;
+                }
+                printf("inter-fine frame=%u trials=%" PRIu64 " accepts=%" PRIu64 "\n",
+                    frames_written, trials, accepts);
+            }
         }
         frames_written++;
     }
@@ -973,7 +1210,8 @@ int main(int argc, char** argv) {
     printf("frames      : %u encoded\n", frames_written);
     printf("note        : %s, coded transform residuals\n",
            options.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P
-               ? "LOW_DELAY_P, single reconstructed reference" :
+               ? (options.dual_ref_policy == 3u ? "LOW_DELAY_P, block-selected LAST/LONG" :
+                    "LOW_DELAY_P, single logical reconstructed reference") :
                  options.intra_mode_selection == 4u ? "SINGLE_PICTURE/directional Y + implicit CfL UV RD" :
                  options.intra_mode_selection == 3u ? "SINGLE_PICTURE/directional Y + basic UV RD" :
                  options.intra_mode_selection == 2u ? "SINGLE_PICTURE/basic Y/UV RD" : "ALL_INTRA/DC_PRED");

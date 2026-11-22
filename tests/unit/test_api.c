@@ -829,7 +829,8 @@ static void test_coefficient_rd_configuration(void) {
 static void test_motion_rd_configuration(void) {
     SvtAv2Handle handle = NULL;
     SvtAv2EncoderConfig config;
-    uint32_t value = 1u, zero = 0u, invalid = 3u, wide = 2u;
+    uint32_t value = 1u, zero = 0u, invalid = 6u, wide = 2u, half = 3u;
+    SvtAv2PredictionStructure p = SVT_AV2_PRED_LOW_DELAY_P;
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init_handle(&handle, NULL), SVT_AV2_ERROR_NONE);
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_config(handle, &config), SVT_AV2_ERROR_NONE);
     SVT_TEST_CHECK_EQ_INT(config.motion_optimization, 0u);
@@ -860,6 +861,17 @@ static void test_motion_rd_configuration(void) {
     SVT_TEST_CHECK_EQ_INT(config.motion_optimization, 2u);
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_NONE);
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&handle), SVT_AV2_ERROR_NONE);
+
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init_handle(&handle, NULL), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(configure_valid(handle, 64u, 64u), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_MOTION_OPTIMIZATION, &half),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_RD_MODE, &wide), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER); /* All-Intra */
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_PREDICTION_STRUCTURE, &p),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&handle), SVT_AV2_ERROR_NONE);
 }
 
 static void test_entropy_adaptation_configuration(void) {
@@ -888,8 +900,294 @@ static void test_entropy_adaptation_configuration(void) {
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&handle), SVT_AV2_ERROR_NONE);
 }
 
+static void test_video_private_configuration(void) {
+    SvtAv2Handle handle = NULL;
+    const int32_t key = 143, invalid = 256, negative = -1, inherit = 0;
+    const uint32_t on = 1u, off = 0u, pruned = 2u, quarter = 5u;
+    const SvtAv2PredictionStructure low_delay = SVT_AV2_PRED_LOW_DELAY_P;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init_handle(&handle, NULL), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(configure_valid(handle, 64u, 64u), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_KEY_QP, &invalid),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_KEY_QP, &negative),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_KEY_QP, &key),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_KEY_QP, &inherit),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_FINE, &pruned),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_FINE, &on),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_PREDICTION_STRUCTURE, &low_delay),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_RD_MODE, &pruned),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_PARTITION_SELECTION, &on),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_MOTION_OPTIMIZATION, &quarter),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_SKIP_SEARCH, &on),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_SKIP_SEARCH, &off),
+        SVT_AV2_ERROR_NONE);
+    const uint32_t invalid_period = 3u, period = 4u, invalid_policy = 4u, block = 3u;
+    const int32_t anchor = 88;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_ANCHOR_QP, &invalid),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_ANCHOR_QP, &negative),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_ANCHOR_QP, &anchor),
+        SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_PERIOD, &invalid_period),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &invalid_policy),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_ANCHOR_QP, &inherit), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_PERIOD, &period), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_REF_PERIOD, &period), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_REF_PERIOD, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &block), SVT_AV2_ERROR_NONE);
+    /* Block itself rejects explicit skip, independent of the fine restriction. */
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_FINE, &off), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_SKIP_SEARCH, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_SKIP_SEARCH, &off), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_FINE, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_PARTITION_SELECTION, &off), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_PARTITION_SELECTION, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_CADENCE, &pruned), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_CADENCE, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &block), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_PERIOD, &pruned), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_PERIOD, &period), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_NEAR, &pruned), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_NEAR, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_TAIL, &pruned), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_TAIL, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_CADENCE, &off), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &block), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_CADENCE, &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_NEAR, &off), SVT_AV2_ERROR_INVALID_STATE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_TAIL, &off), SVT_AV2_ERROR_INVALID_STATE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_CADENCE, &off), SVT_AV2_ERROR_INVALID_STATE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_PERIOD, &off), SVT_AV2_ERROR_INVALID_STATE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_KEY_QP, &key),
+        SVT_AV2_ERROR_INVALID_STATE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&handle), SVT_AV2_ERROR_NONE);
+}
+
+static void test_low_delay_adaptive_rd(uint32_t motion, uint32_t ref_period, uint32_t skip_search,
+    uint32_t fine, int32_t video_key_qp, uint32_t dual_period, uint32_t dual_policy, int32_t anchor_qp) {
+    SvtAv2Handle handle = NULL;
+    const SvtAv2PredictionStructure low_delay = SVT_AV2_PRED_LOW_DELAY_P;
+    const uint32_t on = 1u, pruned = 2u, off = 0u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init_handle(&handle, NULL), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(configure_valid(handle, 64u, 64u), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_PREDICTION_STRUCTURE,
+        &low_delay), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_ENTROPY_ADAPTATION,
+        &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_RD_MODE,
+        &on), SVT_AV2_ERROR_NONE); /* Exhaustive is not part of the video profile. */
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_RD_MODE,
+        &pruned), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_COEFF_OPTIMIZATION,
+        &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_COEFF_OPTIMIZATION,
+        &off), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTRA_MODE_SELECTION,
+        &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_PARTITION_SELECTION,
+        &on), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_MOTION_OPTIMIZATION,
+        &motion), SVT_AV2_ERROR_NONE);
+    const uint32_t invalid_period = 3u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_REF_PERIOD,
+        &invalid_period), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_SKIP_SEARCH,
+        &pruned), SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_SKIP_SEARCH,
+        &skip_search), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_REF_PERIOD,
+        &ref_period), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_KEY_QP,
+        &video_key_qp), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_FINE,
+        &fine), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_PERIOD,
+        &dual_period), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY,
+        &dual_policy), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_VIDEO_ANCHOR_QP,
+        &anchor_qp), SVT_AV2_ERROR_NONE);
+    SvtAv2EncoderConfig config;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_config(handle, &config), SVT_AV2_ERROR_NONE);
+    if (video_key_qp) SVT_TEST_CHECK(config.qp != video_key_qp);
+    const SvtAv2Error initialized = svt_av2_enc_init(handle);
+    SVT_TEST_CHECK_EQ_INT(initialized, SVT_AV2_ERROR_NONE);
+    if (initialized == SVT_AV2_ERROR_NONE) {
+        uint64_t trials, accepts, key_lambda = 0u, p_lambda = 0u;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_inter_fine_stats(handle, &trials, &accepts),
+            SVT_AV2_ERROR_INVALID_STATE);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_inter_skip_stats(handle, &trials, &accepts),
+            SVT_AV2_ERROR_INVALID_STATE);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_REF_PERIOD,
+            &ref_period), SVT_AV2_ERROR_INVALID_STATE);
+        TestPicture test;
+        uint8_t bytes[8192], pixels[sizeof(test.storage)];
+        /* KEY followed by P pictures, including the next refresh boundary. */
+        const uint32_t end = dual_period ? dual_period + 2u : ref_period > 1u ? ref_period + 1u : 2u;
+        for (uint32_t frame = 0u; frame <= end; ++frame) {
+            test_picture_init_64x64(&test);
+            test.picture.pts = frame + 17u;
+            for (size_t i = 0u; i < 64u * 64u; ++i)
+                test.storage[i] = (uint8_t)(test.storage[i] + 5u * frame);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture(handle, &test.picture), SVT_AV2_ERROR_NONE);
+            bytes[0] = 0xa5u;
+            SvtAv2Packet packet = {0};
+            packet.data = bytes; packet.capacity = 1u;
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_packet_ex(handle, &packet), SVT_AV2_ERROR_OUT_OF_MEMORY);
+            SVT_TEST_CHECK_EQ_INT(bytes[0], 0xa5u);
+            const size_t required = packet.size;
+            packet.capacity = sizeof(bytes);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_packet_ex(handle, &packet), SVT_AV2_ERROR_NONE);
+            SVT_TEST_CHECK(required > 1u && packet.size == required);
+            SVT_TEST_CHECK_EQ_INT(packet.pts, test.picture.pts);
+            SvtAv2ReconFrame recon = {0};
+            recon.data = pixels; recon.capacity = sizeof(pixels);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_recon(handle, &recon), SVT_AV2_ERROR_NONE);
+            SVT_TEST_CHECK_EQ_INT(recon.frame_index, frame);
+            SVT_TEST_CHECK_EQ_INT(recon.byte_count, sizeof(pixels));
+            if (dual_policy == 3u) {
+                SvtAv2BlockRefStats refs;
+                SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_block_ref_stats(handle, &refs), SVT_AV2_ERROR_NONE);
+                const int two = frame >= dual_period + 2u;
+                SVT_TEST_CHECK_EQ_INT(refs.logical_ref_count, frame == 0u ? 0u : two ? 2u : 1u);
+                SVT_TEST_CHECK_EQ_INT(refs.refresh_mask, frame == 0u ? 0u : frame % dual_period == 0u ? 3u : 1u);
+                SVT_TEST_CHECK_EQ_INT(refs.ref_distance[0], frame == 0u ? 0u : 1u);
+                SVT_TEST_CHECK_EQ_INT(refs.ref_distance[1], two ? 2u : 0u);
+                if (!two) SVT_TEST_CHECK_EQ_INT(refs.rank_leaves[1], 0u);
+                SVT_TEST_CHECK(refs.odd_mv_leaves[0] <= refs.rank_leaves[0]);
+                SVT_TEST_CHECK(refs.odd_mv_leaves[1] <= refs.rank_leaves[1]);
+            }
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_inter_skip_stats(handle, &trials, &accepts),
+                SVT_AV2_ERROR_NONE);
+            SVT_TEST_CHECK(accepts <= trials);
+            if (frame == 0u || !skip_search) SVT_TEST_CHECK(trials == 0u);
+            else SVT_TEST_CHECK(trials > 0u);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_inter_fine_stats(handle, &trials, &trials),
+                SVT_AV2_ERROR_INVALID_PARAMETER);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_inter_fine_stats(handle, &trials, &accepts),
+                SVT_AV2_ERROR_NONE);
+            SVT_TEST_CHECK(accepts <= trials);
+            if (frame == 0u || !fine) SVT_TEST_CHECK(trials == 0u);
+            if (video_key_qp || anchor_qp) {
+                SvtAv2RdStats stats;
+                SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_rd_stats(handle, &stats), SVT_AV2_ERROR_NONE);
+                if (frame == 0u) key_lambda = stats.lambda_q8;
+                else if (video_key_qp) SVT_TEST_CHECK(stats.lambda_q8 != key_lambda);
+                if (anchor_qp && frame) {
+                    if (frame == 1u) p_lambda = stats.lambda_q8;
+                    else if (frame % dual_period == 0u) SVT_TEST_CHECK(stats.lambda_q8 != p_lambda);
+                    else SVT_TEST_CHECK_EQ_INT(stats.lambda_q8, p_lambda);
+                }
+            }
+        }
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture(handle, NULL), SVT_AV2_ERROR_NONE);
+    }
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&handle), SVT_AV2_ERROR_NONE);
+}
+
+static void test_causal_anchor_retries(int inherit) {
+    SvtAv2Handle handle = NULL;
+    const SvtAv2PredictionStructure low_delay = SVT_AV2_PRED_LOW_DELAY_P;
+    const uint32_t quarter = 5u, pruned = 2u, period = 4u, block = 3u, on = 1u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init_handle(&handle, NULL), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(configure_valid(handle, 64u, 64u), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_PREDICTION_STRUCTURE, &low_delay), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_RD_MODE, &pruned), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_MOTION_OPTIMIZATION, &quarter), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_PERIOD, &period), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_POLICY, &block), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DUAL_REF_CADENCE, &on), SVT_AV2_ERROR_NONE);
+    if (inherit) {
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_INTER_NEAR, &on), SVT_AV2_ERROR_NONE);
+        const uint32_t invalid = 2u;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_CDF_INHERIT, &invalid), SVT_AV2_ERROR_INVALID_PARAMETER);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_CDF_INHERIT, &on), SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(handle), SVT_AV2_ERROR_INVALID_PARAMETER);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_ENTROPY_ADAPTATION, &on), SVT_AV2_ERROR_NONE);
+    }
+    const SvtAv2Error initialized = svt_av2_enc_init(handle);
+    SVT_TEST_CHECK_EQ_INT(initialized, SVT_AV2_ERROR_NONE);
+    uint32_t anchor_index = 0u;
+    if (initialized == SVT_AV2_ERROR_NONE) for (uint32_t frame = 0u; frame <= 16u; ++frame) {
+        TestPicture test;
+        uint8_t bytes[8192];
+        test_picture_init_64x64(&test);
+        test.picture.pts = frame + 73u;
+        memset(test.storage, 128, sizeof(test.storage));
+        if (frame >= 13u) memset(test.storage, frame == 13u ? 144 : 164, 64u * 64u);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture(handle, &test.picture), SVT_AV2_ERROR_NONE);
+        SvtAv2Packet packet = {0};
+        bytes[0] = 0xa5u;
+        packet.data = bytes; packet.capacity = 1u;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_packet_ex(handle, &packet), SVT_AV2_ERROR_OUT_OF_MEMORY);
+        SVT_TEST_CHECK_EQ_INT(bytes[0], 0xa5u);
+        SvtAv2BlockRefStats first = {0}, second = {0};
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_block_ref_stats(handle, &first), SVT_AV2_ERROR_NONE);
+        const size_t required = packet.size;
+        packet.capacity = sizeof(bytes);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_packet_ex(handle, &packet), SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK_EQ_INT(packet.pts, test.picture.pts);
+        SVT_TEST_CHECK(packet.size == required && required > 1u);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_block_ref_stats(handle, &second), SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK(first.refresh_mask == second.refresh_mask && first.ref_distance[1] == second.ref_distance[1]);
+        /* P4 seed, a neutral hold reaches P12, source change plus stale
+         * LONG then produces early P14 refresh. Query before publish. */
+        const int refresh = frame == 4u || frame == 12u || frame == 14u;
+        const int two = anchor_index > 0u && frame > anchor_index + 1u;
+        SVT_TEST_CHECK_EQ_INT(second.refresh_mask, frame == 0u ? 0u : refresh ? 3u : 1u);
+        SVT_TEST_CHECK_EQ_INT(second.logical_ref_count, frame == 0u ? 0u : two ? 2u : 1u);
+        SVT_TEST_CHECK_EQ_INT(second.ref_distance[1], two ? frame - anchor_index : 0u);
+        if (refresh) anchor_index = frame;
+    }
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&handle), SVT_AV2_ERROR_NONE);
+}
+
 int main(void) {
     test_entropy_adaptation_configuration();
+    test_causal_anchor_retries(0);
+    test_causal_anchor_retries(1);
+    test_video_private_configuration();
+    test_low_delay_adaptive_rd(2u, 1u, 0u, 0u, 0, 0u, 0u, 0); /* Old integer wide profile. */
+    test_low_delay_adaptive_rd(3u, 1u, 0u, 0u, 0, 0u, 0u, 0); /* Old half-luma pel. */
+    test_low_delay_adaptive_rd(0u, 2u, 1u, 0u, 0, 0u, 0u, 0);
+    test_low_delay_adaptive_rd(3u, 4u, 1u, 0u, 0, 0u, 0u, 0);
+    test_low_delay_adaptive_rd(4u, 4u, 1u, 0u, 0, 0u, 0u, 0);
+    test_low_delay_adaptive_rd(5u, 4u, 1u, 0u, 0, 0u, 0u, 0);
+    test_low_delay_adaptive_rd(5u, 2u, 0u, 1u, 143, 0u, 0u, 0);
+    test_low_delay_adaptive_rd(5u, 1u, 0u, 1u, 143, 2u, 2u, 88); /* Dual anchor cadence. */
+    test_low_delay_adaptive_rd(5u, 1u, 0u, 0u, 0, 4u, 3u, 0); /* Actual projected block policy. */
+    test_low_delay_adaptive_rd(5u, 1u, 0u, 1u, 0, 4u, 3u, 0); /* Fine enabled across the two-ref bootstrap. */
     test_motion_rd_configuration();
     test_coefficient_rd_configuration();
     test_m4_prediction_structure_validation();

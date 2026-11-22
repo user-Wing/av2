@@ -33,6 +33,13 @@
 extern "C" {
 #endif
 
+/* Normal adaptive low-delay KEY/P. Returns the raw end bank only on full
+ * packet success; caller may then verify, decay, and publish it. */
+int svt_av2_encode_packet_video_models(const SvtAv2FrameHeaderConfig* cfg, uint32_t frame_index,
+    const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count,
+    uint8_t* out, size_t out_cap, size_t* out_size, struct SvtAv2EntropyModels* end_models);
+
 /* Complete single-picture-header stream, using the production coefficient path. */
 int svt_av2_encode_still_picture(uint32_t width, uint32_t height,
     uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
@@ -149,6 +156,82 @@ int svt_av2_encode_packet_tools(uint32_t width, uint32_t height,
     uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
     const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t low_delay_p,
     uint32_t intra_modes, const uint16_t* partition_decisions, size_t decision_count,
+    uint8_t* out, size_t out_cap, size_t* out_size);
+
+/* Low-delay P only (frame_index > 0, low_delay_p == 1).
+ * Identical packet/plan contract to svt_av2_encode_packet_tools, but inter MV
+ * components are in half-luma-pel units. The first entry uses static CDFs;
+ * the entropy entry can opt into frame-local adaptation. Both use the old key path. */
+int svt_av2_encode_packet_tools_half(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t low_delay_p,
+    uint32_t intra_modes, const uint16_t* partition_decisions, size_t decision_count,
+    uint8_t* out, size_t out_cap, size_t* out_size);
+
+int svt_av2_encode_packet_tools_half_entropy(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t low_delay_p,
+    uint32_t intra_modes, const uint16_t* partition_decisions, size_t decision_count,
+    uint32_t entropy_adaptation, uint8_t* out, size_t out_cap, size_t* out_size);
+
+/* Immediate-output P: optional retention of slot 0 and fixed sharp interpolation. */
+int svt_av2_encode_packet_inter_profile(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count, uint32_t entropy_adaptation,
+    uint32_t mv_half, uint32_t retain_reference, uint32_t sharp_filter,
+    uint8_t* out, size_t out_cap, size_t* out_size);
+
+/* Experimental P-only packet with explicit physical map [0,1]. Both prior
+ * slots must already be occupied by distinct frames; KEY and bootstrap write
+ * through svt_av2_encode_packet_dual_ref. Only zero motion is accepted on
+ * coded leaves pending MVP coverage. This wrapper uses static CDFs. */
+int svt_av2_encode_packet_two_refs(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count,
+    uint32_t mv_half, uint32_t sharp_filter, uint32_t refresh_mask,
+    uint8_t* out, size_t out_cap, size_t* out_size);
+
+/* Same zero-MV gate, with independently trained per-frame reference CDFs
+ * when entropy_adaptation is 1. Entropy adaptation 0 is byte-equivalent to
+ * svt_av2_encode_packet_two_refs. */
+int svt_av2_encode_packet_two_refs_entropy(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count, uint32_t entropy_adaptation,
+    uint32_t mv_half, uint32_t sharp_filter, uint32_t refresh_mask,
+    uint8_t* out, size_t out_cap, size_t* out_size);
+
+/* Low-delay two-slot stream; P publishes exactly one logical reference from
+ * reference_slot 0/1 and refreshes the physical slots in refresh_mask (0..3).
+ * For frame 0 use modes=NULL/0 and mv_half, sharp_filter, refresh_mask and
+ * reference_slot all zero; CLOSED_LOOP_KEY has an implicit all-slots mask,
+ * but only populates slot 0. P may select slot 1 after a P refresh writes it. */
+/* Same logical map, with optional checked spatial MVP in eighth-luma units.
+ * Non-null distance gives the two distinct expanded prior display distances
+ * (1..8) in physical order; caller must agree with actual DPB residency.
+ * Quarter SHARP, single-reference/DRL0, full aligned 32/64 inter leaves only.
+ * A target on the wrong MVD parity lattice is rejected, never rounded. */
+int svt_av2_encode_packet_two_refs_projected(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count, uint32_t entropy_adaptation,
+    uint32_t mv_half, uint32_t sharp_filter, uint32_t refresh_mask,
+    const uint32_t distance[2], uint8_t* out, size_t out_cap, size_t* out_size);
+
+int svt_av2_encode_packet_dual_ref(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count, uint32_t entropy_adaptation,
+    uint32_t mv_half, uint32_t sharp_filter, uint32_t refresh_mask, uint32_t reference_slot,
     uint8_t* out, size_t out_cap, size_t* out_size);
 
 int svt_av2_encode_packet_tools_entropy(uint32_t width, uint32_t height,

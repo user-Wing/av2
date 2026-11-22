@@ -186,6 +186,12 @@ typedef struct SvtAv2CoeffPlaneInfo {
     uint32_t    bh;
 } SvtAv2CoeffPlaneInfo;
 
+int svt_av2_coeff_write_block_transform_ist(SvtAv2EntropyEncoder* enc,
+    const SvtAv2CoeffPlaneInfo* pi, uint8_t eob_u_nonzero, const int32_t* qcoeff,
+    SvtAv2CoeffNeighbours* nb, uint32_t q_ctx, uint32_t is_inter,
+    uint32_t reduced_tx_set, uint32_t tx_type, uint32_t intra_mode,
+    uint32_t enable_ist, uint32_t ist);
+
 /* --- block writer ---------------------------------------------------------- */
 
 /*

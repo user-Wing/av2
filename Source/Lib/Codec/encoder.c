@@ -32,6 +32,7 @@
  * locking is required. This is a deliberate limitation, not an oversight.
  */
 
+#include "inter_profile.h"
 #include "codec.h"
 
 #include <stdlib.h>
@@ -40,8 +41,12 @@
 #include <time.h>
 
 #include "keyframe.h"
+#include "entropy_models.h"
+#include "motion_two_ref_mvp.h"
 #include "rd_frame.h"
 #include "deblock_luma.h"
+#include "cdef_luma.h"
+#include "gdf_luma.h"
 #if M6_PC_WIENER
 #include "../Restoration/pc_wiener.h"
 #if M6_CONTENT_GUARD
@@ -49,17 +54,42 @@
 #endif
 #endif
 #include "inter_frame.h"
+#include "obu_writer.h"
 #include "bit_writer.h" /* SVT_AV2_BW_ERROR_NO_SPACE */
 #include "intra_frame.h" /* svt_av2_intra_frame_encode (T012), M2 recon */
 
 #define SVT_AV2_CONTEXT_MAGIC 0x53564132u /* "SVA2" */
 
-/* Runs T012's intra frame core for the pending frame, filling the context's
- * reconstruction picture. Defined after encode_pending_frame(); declared here
- * so that call site reads top-down. */
+/* Freeze the physical map and refresh decision before encoding, so RD and
+ * the formal writer see the same logical references and expanded distances. */
+typedef struct SvtAv2VideoCdfState {
+    SvtAv2EntropyModels slots[2]; /* Decayed, committed banks for the physical DPB. */
+    SvtAv2EntropyModels rd_end, writer_end; /* Detached raw banks for exact comparison. */
+    SvtAv2FrameHeaderConfig frame_header;
+    int64_t slot_frame[2];
+    int trace;
+#if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
+    uint8_t cfl_sequence, cfl_key, cfl_p;
+#endif
+} SvtAv2VideoCdfState;
+
+typedef struct SvtAv2PictureReference {
+    const SvtAv2ReferenceFrame* predictor;
+    const SvtAv2ReferenceFrame* secondary_reference;
+    uint32_t dual_ref, retain_reference, refresh_mask, reference_slot;
+    uint32_t ref_distance[2]; /* Populated only with a distinct [LAST, LONG]. */
+} SvtAv2PictureReference;
+
+typedef struct SvtAv2AnchorProbe {
+    uint16_t current[SVT_AV2_ANCHOR_GRID_COUNT];
+    uint32_t age, reason, source_q8, last_q8, long_q8;
+} SvtAv2AnchorProbe;
+
 static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
                                          uint32_t width,
-                                         uint32_t height);
+                                         uint32_t height,
+                                         uint32_t base_q_idx,
+                                         const SvtAv2PictureReference* refs);
 
 /* QP / base_q_idx validation range.
  *
@@ -158,7 +188,8 @@ SvtAv2Error svt_av2_config_validate(const SvtAv2EncoderConfig* config) {
         config->partition_selection>7u || config->intra_joint || config->coeff_optimization==1u ||
         config->motion_optimization)) return SVT_AV2_ERROR_INVALID_PARAMETER;
     if (config->rd_lambda_model > 2u || (config->rd_lambda_model &&
-        (!config->still_picture || !config->rd_mode))) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        (!config->rd_mode || (!config->still_picture && (config->rd_mode != 2u ||
+         config->prediction_structure != SVT_AV2_PRED_LOW_DELAY_P))))) return SVT_AV2_ERROR_INVALID_PARAMETER;
     if (config->cfl_search > 1u || (config->cfl_search &&
         (!config->still_picture || !config->rd_mode || config->intra_mode_selection != 4u)))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
@@ -171,8 +202,12 @@ SvtAv2Error svt_av2_config_validate(const SvtAv2EncoderConfig* config) {
     if (config->angle_search > 1u || (config->angle_search && (!config->still_picture ||
         !config->rd_mode || config->intra_mode_selection < 3u || config->motion_optimization)))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
-    if (config->tree_refinement > 2u || (config->tree_refinement && (!config->still_picture ||
+    if (config->tree_refinement > 3u || (config->tree_refinement && (!config->still_picture ||
         !config->rd_mode || config->intra_mode_selection < 2u || config->partition_selection < 2u)))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (config->tree_refinement == 3u && (config->partition_selection != 7u || config->rd_mode != 3u ||
+        config->intra_mode_selection != 4u || config->coeff_optimization != 2u ||
+        config->chroma_format != SVT_AV2_CHROMA_420))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
     if (config->mrl_search > 1u || (config->mrl_search && (!config->still_picture ||
         !config->rd_mode || config->intra_mode_selection < 3u || config->motion_optimization)))
@@ -184,12 +219,25 @@ SvtAv2Error svt_av2_config_validate(const SvtAv2EncoderConfig* config) {
     if (config->coeff_optimization > 2u || (config->coeff_optimization && !config->rd_mode) ||
         (config->coeff_optimization == 2u && (!config->still_picture || config->intra_mode_selection < 2u)))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
-    if (config->motion_optimization > 2u ||
-        (config->motion_optimization && (!config->rd_mode || config->coeff_optimization)))
+    if (config->motion_optimization > 5u ||
+        (config->motion_optimization && (!config->rd_mode || config->coeff_optimization)) ||
+        (config->motion_optimization >= 3u &&
+            (config->prediction_structure != SVT_AV2_PRED_LOW_DELAY_P || config->rd_mode != 2u ||
+             config->partition_selection > 1u)))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
-    if (config->entropy_adaptation > 1u || (config->entropy_adaptation && config->rd_mode &&
-        (!config->still_picture || config->coeff_optimization == 1u || config->motion_optimization)))
-        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    /* Video RD uses the same frame-local bank as formal coding, restricted
+     * to the low-delay P profile. Still-picture support is unchanged. */
+    if (config->entropy_adaptation > 1u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (config->entropy_adaptation && config->rd_mode) {
+        if (config->still_picture) {
+            if (config->coeff_optimization == 1u || config->motion_optimization)
+                return SVT_AV2_ERROR_INVALID_PARAMETER;
+        } else if (config->prediction_structure != SVT_AV2_PRED_LOW_DELAY_P ||
+                   config->rd_mode != 2u || config->intra_mode_selection > 1u ||
+                   config->partition_selection > 1u || config->coeff_optimization) {
+            return SVT_AV2_ERROR_INVALID_PARAMETER;
+        }
+    }
     if (config->still_picture > 1u || (config->still_picture &&
         config->prediction_structure != SVT_AV2_PRED_ALL_INTRA))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
@@ -230,8 +278,17 @@ void svt_av2_context_release_pipeline(SvtAv2EncoderContext* context) {
     context->frame_pending = 0;
     context->eos = 0;
     context->eos_reported = 0;
+    memset(&context->block_ref_stats, 0, sizeof(context->block_ref_stats));
+    context->anchor_source_valid = 0u;
+    context->held_pictures = 0u;
+    context->previous_motion_q8 = UINT32_MAX;
+    context->quiet_frames = 0u;
+    context->last_clean_frame = 0u;
 
     svt_av2_reference_release(&context->reference);
+    svt_av2_reference_release(&context->long_reference);
+    free(context->video_cdf);
+    context->video_cdf = NULL;
     free(context->partition_decisions); context->partition_decisions = NULL;
     context->partition_decision_capacity = context->partition_decision_count = 0;
     free(context->coded_modes); context->coded_modes = NULL;
@@ -426,7 +483,7 @@ SvtAv2Error svt_av2_enc_init_handle(SvtAv2Handle* handle, const SvtAv2EncoderInf
     }
     context->magic = SVT_AV2_CONTEXT_MAGIC;
     context->state = SVT_AV2_STATE_UNINITIALIZED;
-    context->parameter_mask = 0;
+    context->inter_ref_period = 1u;
     context->pictures_sent = 0;
     context->pictures_encoded = 0;
     context->fatal_error = 0;
@@ -511,7 +568,7 @@ SvtAv2Error svt_av2_enc_set_parameter(SvtAv2Handle handle, SvtAv2Parameter param
         context->config.coeff_optimization = *(const uint32_t*)value;
         break;
     case SVT_AV2_PARAM_MOTION_OPTIMIZATION:
-        if (*(const uint32_t*)value > 2u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        if (*(const uint32_t*)value > 5u) return SVT_AV2_ERROR_INVALID_PARAMETER;
         context->config.motion_optimization = *(const uint32_t*)value;
         break;
     case SVT_AV2_PARAM_ENTROPY_ADAPTATION:
@@ -527,13 +584,19 @@ SvtAv2Error svt_av2_enc_set_parameter(SvtAv2Handle handle, SvtAv2Parameter param
         context->config.transform_selection = *(const uint32_t*)value;
         break;
     case SVT_AV2_PARAM_TREE_REFINEMENT:
-        if (*(const uint32_t*)value > 2u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        if (*(const uint32_t*)value > 3u) return SVT_AV2_ERROR_INVALID_PARAMETER;
         context->config.tree_refinement = *(const uint32_t*)value;
         break;
     case SVT_AV2_PARAM_RD_LAMBDA_MODEL:
         if (*(const uint32_t*)value > 2u) return SVT_AV2_ERROR_INVALID_PARAMETER;
         context->config.rd_lambda_model = *(const uint32_t*)value;
         break;
+    case SVT_AV2_PARAM_RD_LAMBDA_SCALE: {
+        const uint32_t scale = *(const uint32_t*)value;
+        if (scale && (scale < 50u || scale > 250u)) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->rd_lambda_scale = scale;
+        break;
+    }
     case SVT_AV2_PARAM_CFL_SEARCH:
         if (*(const uint32_t*)value > 1u) return SVT_AV2_ERROR_INVALID_PARAMETER;
         context->config.cfl_search = *(const uint32_t*)value;
@@ -561,11 +624,63 @@ SvtAv2Error svt_av2_enc_set_parameter(SvtAv2Handle handle, SvtAv2Parameter param
         context->content_type=type;
         break;
     }
-    case SVT_AV2_PARAM_COUNT:
+    case SVT_AV2_PARAM_INTER_SKIP_SEARCH:
+        if (*(const uint32_t*)value > 1u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->inter_skip_search = *(const uint32_t*)value;
+        break;
+    case SVT_AV2_PARAM_INTER_REF_PERIOD: {
+        const uint32_t period = *(const uint32_t*)value;
+        if (period != 1u && period != 2u && period != 4u && period != 8u)
+            return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->inter_ref_period = period;
+        break;
+    }
+    case SVT_AV2_PARAM_VIDEO_KEY_QP: {
+        const int32_t qp = *(const int32_t*)value;
+        if (qp < SVT_AV2_QP_MIN || qp > SVT_AV2_QP_MAX) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->video_key_qp = qp;
+        break;
+    }
+    case SVT_AV2_PARAM_VIDEO_ANCHOR_QP: {
+        const int32_t qp = *(const int32_t*)value;
+        if (qp < SVT_AV2_QP_MIN || qp > SVT_AV2_QP_MAX) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->video_anchor_qp = qp;
+        break;
+    }
+    case SVT_AV2_PARAM_INTER_FINE:
+        if (*(const uint32_t*)value > 1u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->inter_fine = *(const uint32_t*)value;
+        break;
+    case SVT_AV2_PARAM_DUAL_REF_PERIOD: {
+        const uint32_t period = *(const uint32_t*)value;
+        if (period != 0u && period != 2u && period != 4u && period != 8u)
+            return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->dual_ref_period = period;
+        break;
+    }
+    case SVT_AV2_PARAM_DUAL_REF_POLICY:
+        if (*(const uint32_t*)value > 3u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->dual_ref_policy = *(const uint32_t*)value;
+        break;
+    case SVT_AV2_PARAM_DUAL_REF_CADENCE:
+        if (*(const uint32_t*)value > 1u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->dual_ref_cadence = *(const uint32_t*)value;
+        break;
+    case SVT_AV2_PARAM_INTER_TAIL:
+        if (*(const uint32_t*)value > 1u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->inter_tail = *(const uint32_t*)value;
+        break;
+    case SVT_AV2_PARAM_INTER_NEAR:
+        if (*(const uint32_t*)value > 1u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->inter_near = *(const uint32_t*)value;
+        break;
+    case SVT_AV2_PARAM_CDF_INHERIT:
+        if (*(const uint32_t*)value > 1u) return SVT_AV2_ERROR_INVALID_PARAMETER;
+        context->cdf_inherit = *(const uint32_t*)value;
+        break;
     default: return SVT_AV2_ERROR_INVALID_PARAMETER;
     }
 
-    context->parameter_mask |= (1u << (uint32_t)param);
     return SVT_AV2_ERROR_NONE;
 }
 
@@ -582,6 +697,40 @@ SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle) {
     if (err != SVT_AV2_ERROR_NONE) {
         return err;
     }
+    if (context->rd_lambda_scale && !context->config.rd_lambda_model) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (((context->dual_ref_policy || context->video_anchor_qp) && !context->dual_ref_period) ||
+        (context->dual_ref_period && (context->config.still_picture ||
+         context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P ||
+         context->config.motion_optimization != 5u || context->config.rd_mode != 2u ||
+         context->config.partition_selection > 1u || context->inter_ref_period != 1u)))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if ((context->dual_ref_policy == 3u && context->inter_skip_search) ||
+        (context->dual_ref_cadence && (context->dual_ref_policy != 3u || context->dual_ref_period != 4u)))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (context->video_key_qp && (context->config.still_picture ||
+        context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (context->inter_fine && (context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P ||
+        context->config.still_picture || context->config.rd_mode != 2u ||
+        context->config.motion_optimization != 5u || context->config.partition_selection != 1u ||
+        context->config.intra_mode_selection > 1u || context->inter_skip_search))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if ((context->inter_tail || context->inter_near) && (context->config.still_picture || context->inter_skip_search ||
+        context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P || context->config.rd_mode != 2u ||
+        context->config.motion_optimization != 5u || context->config.partition_selection > 1u ||
+        context->config.intra_mode_selection > 1u || context->config.coeff_optimization ||
+        context->config.transform_selection || (context->inter_tail && context->dual_ref_period &&
+         context->dual_ref_policy != 3u)))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (context->cdf_inherit && (context->config.still_picture ||
+         context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P ||
+         context->config.rd_mode != 2u || context->config.entropy_adaptation != 1u))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if ((context->inter_skip_search || context->inter_ref_period != 1u) &&
+        (context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P ||
+         context->config.rd_mode != 2u || context->config.partition_selection > 1u ||
+         context->config.coeff_optimization || context->config.still_picture))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
     if (context->config.width % 8u != 0 || context->config.height % 8u != 0 ||
         context->config.width > 4096u || context->config.height > 2160u ||
         !((context->config.bit_depth == SVT_AV2_BIT_DEPTH_8 && context->config.chroma_format == SVT_AV2_CHROMA_420) ||
@@ -595,10 +744,105 @@ SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle) {
         return SVT_AV2_ERROR_UNSUPPORTED;
     }
 
+#if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
+    /* Warm control keeps the same SEQ/KEY when comparing a P-only search.
+     * The distinct off control measures the overhead of the sequence tool. */
+    const char* cfl = getenv("SVT_AV2_VIDEO_CFL");
+    const int cfl_seq = cfl && (!strcmp(cfl,"signal") || !strcmp(cfl,"p") ||
+        !strcmp(cfl,"key") || !strcmp(cfl,"all"));
+    if (cfl_seq && (!context->cdf_inherit || context->config.bit_depth != SVT_AV2_BIT_DEPTH_10 ||
+        context->config.chroma_format != SVT_AV2_CHROMA_420 || context->config.intra_mode_selection != 1u ||
+        context->config.transform_selection || context->config.coeff_optimization || context->inter_skip_search))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+#endif
+    const char* ist = getenv("SVT_AV2_INTRA_IST");
+    uint8_t ist_scope = 0u;
+    if (ist && strcmp(ist, "off")) {
+        ist_scope = !strcmp(ist, "signal") ? 1u : !strcmp(ist, "key") ? 2u :
+            !strcmp(ist, "p") ? 4u : !strcmp(ist, "all") ? 6u : 0u;
+        if (!ist_scope || !context->config.entropy_adaptation ||
+            context->config.chroma_format != SVT_AV2_CHROMA_420 ||
+            !(context->config.still_picture ? context->config.rd_mode == 3u : context->cdf_inherit))
+            return SVT_AV2_ERROR_INVALID_PARAMETER;
+    }
+    const char* qm12 = getenv("SVT_AV2_QM12");
+    const char* delta = getenv("SVT_AV2_UV_DELTA_Q");
+    long uv_delta = 0;
+    if (delta) {
+        char* end;
+        uv_delta = strtol(delta, &end, 10);
+        if (end == delta || *end || uv_delta < -23 || uv_delta > 8 ||
+            !(context->config.still_picture ? context->config.rd_mode == 3u : context->cdf_inherit))
+            return SVT_AV2_ERROR_INVALID_PARAMETER;
+    }
+    const char* level = getenv("SVT_AV2_QM_LEVEL");
+    const uint8_t qm_level = !level || !strcmp(level, "12") ? 12u :
+        !strcmp(level, "8") ? 8u : !strcmp(level, "4") ? 4u : 0u;
+    if (!qm_level) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    const uint8_t qm_scope = ((!qm12 && level) || (qm12 && !strcmp(qm12, "all"))) ? 3u :
+        qm12 && !strcmp(qm12, "key") ? 1u : qm12 && !strcmp(qm12, "p") ? 2u : 0u;
+    if (qm_scope && (context->config.chroma_format != SVT_AV2_CHROMA_420 ||
+        !(context->config.still_picture ? context->config.rd_mode == 3u : context->cdf_inherit)))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    const char* edge = getenv("SVT_AV2_STILL_EDGE_FILTER");
+    const char* ibp = getenv("SVT_AV2_IBP");
+    const int enable_ibp = ibp && !strcmp(ibp, "1");
+    const int edge_filter = edge && !strcmp(edge, "1");
+    if (enable_ibp && (context->config.chroma_format != SVT_AV2_CHROMA_420 ||
+        !(context->config.still_picture ? context->config.rd_mode == 3u : context->cdf_inherit)))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (edge_filter && (!context->config.still_picture || context->config.rd_mode != 3u ||
+        context->config.chroma_format != SVT_AV2_CHROMA_420))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    const char* gdf = getenv("SVT_AV2_GDF");
+    if (gdf && strcmp(gdf,"off") && strcmp(gdf,"key") && strcmp(gdf,"all"))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    const int gdf_key = gdf && (!strcmp(gdf,"key") || !strcmp(gdf,"all"));
+    if (gdf_key && (context->config.chroma_format != SVT_AV2_CHROMA_420 ||
+        (!context->config.still_picture && !context->cdf_inherit)))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    const char* motion_q = getenv("SVT_AV2_MOTION_Q");
+    const int adaptive_q = motion_q && !strcmp(motion_q, "adaptive") ? 1 :
+        motion_q && !strcmp(motion_q, "hold") ? 2 :
+        motion_q && !strcmp(motion_q, "reuse") ? 3 :
+        motion_q && !strcmp(motion_q, "reuse-motion") ? 4 : 0;
+    if (adaptive_q && (!context->dual_ref_cadence || !context->video_anchor_qp ||
+        (adaptive_q >= 3 && context->config.chroma_format != SVT_AV2_CHROMA_420)))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    svt_av2_context_release_pipeline(context);
+    context->motion_q = (uint8_t)adaptive_q;
+    context->intra_ist_scope = ist_scope;
+    context->qm_scope = qm_scope;
+    context->qm_level = qm_level;
+    context->uv_delta_q = (int8_t)uv_delta;
+    context->enable_ibp = (uint8_t)enable_ibp;
+    context->still_edge_filter = (uint8_t)edge_filter;
+    const char* compensation = getenv("SVT_AV2_LUMA_COMPENSATION");
+    context->luma_compensation_scope = compensation && !strcmp(compensation, "all") ? 3u :
+        compensation && !strcmp(compensation, "key") ? 1u :
+        compensation && !strcmp(compensation, "p") ? 2u : 0u;
+    context->gdf_key = (uint8_t)gdf_key;
+    context->gdf_inter = gdf && !strcmp(gdf, "all");
+    const char* source_cdef = getenv("SVT_AV2_SOURCE_CDEF");
+    context->source_cdef_scope = source_cdef && !strcmp(source_cdef, "all") ? 3u :
+        source_cdef && !strcmp(source_cdef, "key") ? 1u :
+        source_cdef && !strcmp(source_cdef, "p") ? 2u : 0u;
+    if (context->cdf_inherit) {
+        SvtAv2VideoCdfState* cdf = (SvtAv2VideoCdfState*)malloc(sizeof(*cdf));
+        if (cdf == NULL) return SVT_AV2_ERROR_OUT_OF_MEMORY;
+        cdf->slot_frame[0] = cdf->slot_frame[1] = -1;
+        const char* trace = getenv("SVT_AV2_CDF_INHERIT_TRACE");
+        cdf->trace = trace && trace[0] == '1' && trace[1] == '\0';
+#if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
+        cdf->cfl_sequence = (uint8_t)cfl_seq;
+        cdf->cfl_key = (uint8_t)(cfl_seq && (!strcmp(cfl,"key") || !strcmp(cfl,"all")));
+        cdf->cfl_p = (uint8_t)(cfl_seq && (!strcmp(cfl,"p") || !strcmp(cfl,"all")));
+#endif
+        context->video_cdf = cdf;
+    }
     context->state = SVT_AV2_STATE_INITIALIZED;
     context->pictures_sent = 0;
     context->pictures_encoded = 0;
-    svt_av2_context_release_pipeline(context);
     return SVT_AV2_ERROR_NONE;
 }
 
@@ -637,6 +881,40 @@ static SvtAv2Error copy_picture(const SvtAv2Picture* picture,
     return svt_av2_picture_copy_from_view(destination, &view);
 }
 
+/* Luma-only unsharp proposal based on AVM tune_vmaf's Gaussian kernel.
+ * Bound the correction both in sample units and by the local extrema to
+ * protect line art. Read the caller's immutable plane, including its stride. */
+static void compensate_luma(const SvtAv2Picture* input, SvtAv2FrameBuffer* dst) {
+    static const int weights[5] = {4, 15, 26, 15, 4};
+    const int bd = (int)input->bit_depth, step = bd > 8 ? 2 : 1;
+    const int limit = 4 << (bd - 8);
+    for (uint32_t y = 2u; y + 2u < input->height; ++y) {
+        for (uint32_t x = 2u; x + 2u < input->width; ++x) {
+            const uint8_t* center = input->planes[0] + (size_t)y * input->strides[0] + x * step;
+            const int sample = svt_av2_sample_load(center, bd);
+            int sum = 0, lo = sample, hi = sample;
+            for (int j = 0; j < 5; ++j) {
+                const uint8_t* row = input->planes[0] + (size_t)(y - 2u + j) * input->strides[0] + (x - 2u) * step;
+                int horizontal = 0;
+                for (int i = 0; i < 5; ++i) {
+                    const int value = svt_av2_sample_load(row + i * step, bd);
+                    horizontal += weights[i] * value;
+                    if (i >= 1 && i <= 3 && j >= 1 && j <= 3) {
+                        if (value < lo) lo = value;
+                        if (value > hi) hi = value;
+                    }
+                }
+                sum += weights[j] * horizontal;
+            }
+            const int diff = sample - ((sum + 2048) >> 12);
+            const int correction = diff >= 0 ? (diff + 1) / 2 : -((1 - diff) / 2);
+            const int value = sample + SVT_AV2_MIN(limit, SVT_AV2_MAX(-limit, correction));
+            svt_av2_sample_store(dst->planes[0] + (size_t)y * dst->strides[0] + x * step,
+                bd, (uint16_t)SVT_AV2_MIN(hi, SVT_AV2_MAX(lo, value)));
+        }
+    }
+}
+
 /* Reuses the frame reconstruction and 64x64 block scratch across frames. */
 static SvtAv2Error ensure_recon_buffers(SvtAv2EncoderContext* context,
                                         uint32_t width,
@@ -665,9 +943,16 @@ static SvtAv2Error ensure_recon_buffers(SvtAv2EncoderContext* context,
         return status;
     }
     if (context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P) {
+        svt_av2_reference_release(&context->reference);
+        svt_av2_reference_release(&context->long_reference);
         status = svt_av2_reference_init(&context->reference, width, height,
             (uint32_t)context->config.bit_depth, context->config.chroma_format);
+        if (status == SVT_AV2_ERROR_NONE && context->dual_ref_period)
+            status = svt_av2_reference_init(&context->long_reference, width, height,
+                (uint32_t)context->config.bit_depth, context->config.chroma_format);
         if (status != SVT_AV2_ERROR_NONE) {
+            svt_av2_reference_release(&context->reference);
+            svt_av2_reference_release(&context->long_reference);
             svt_av2_recon_pool_free(&context->scratch);
             svt_av2_picture_free(&context->recon);
             return status;
@@ -743,6 +1028,18 @@ SvtAv2Error svt_av2_enc_send_picture(SvtAv2Handle handle, const void* picture) {
     if (copy_err != SVT_AV2_ERROR_NONE) {
         return copy_err;
     }
+    const int is_p = context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P &&
+        context->pictures_encoded != 0u;
+    if (context->luma_compensation_scope & (is_p ? 2u : 1u))
+        compensate_luma(input, &context->frame_source);
+    /* Prefilter the owned input before prediction and quantization. No CDEF
+     * syntax is required, and reference frames still use decoder reconstruction. */
+    if ((context->source_cdef_scope & (is_p ? 2u : 1u)) &&
+        !(input->width & 7u) && !(input->height & 7u) &&
+        input->width <= 4096u && input->height <= 2160u) {
+        const SvtAv2Error error = svt_av2_cdef_luma_apply(&context->frame_source, 4u, NULL);
+        if (error != SVT_AV2_ERROR_NONE) return error;
+    }
 
     /* Source, reconstruction and scratch remain distinct owned buffers. */
     const SvtAv2Error recon_err = ensure_recon_buffers(context, input->width, input->height);
@@ -780,7 +1077,7 @@ typedef struct CcsoAuto {
 static int ccso_auto_domain(const SvtAv2EncoderContext* c) {
     const SvtAv2EncoderConfig* q=&c->config;
     return q->still_picture && q->prediction_structure==SVT_AV2_PRED_ALL_INTRA && q->rd_mode==3u &&
-        q->intra_mode_selection==4u && (q->partition_selection==5u || q->partition_selection==7u) && q->tree_refinement==2u &&
+        q->intra_mode_selection==4u && (q->partition_selection==5u || q->partition_selection==7u) && q->tree_refinement>=2u &&
         q->entropy_adaptation==1u && (q->rd_lambda_model==1u || q->rd_lambda_model==2u) && q->transform_selection==2u &&
         q->coeff_optimization==2u && q->angle_search==1u && q->mrl_search==1u &&
         q->cfl_search==1u && q->mhccp_search==1u && !q->intra_joint && !q->motion_optimization &&
@@ -806,7 +1103,7 @@ static void ccso_auto_subset(CcsoAuto* w,uint32_t mask) {
     }
     w->header.ccso64=mask?&w->plan:NULL;
 }
-static SvtAv2Error ccso_auto_prepare(SvtAv2EncoderContext* c,CcsoAuto** output,int reverse,uint32_t db,int delta,int delta_h) {
+static SvtAv2Error ccso_auto_prepare(SvtAv2EncoderContext* c,CcsoAuto** output,int reverse,uint32_t db,int delta,int delta_h,uint32_t cdef_primary) {
     *output=NULL;
     CcsoAuto* w=(CcsoAuto*)calloc(1u,sizeof(*w));
     if (!w) return SVT_AV2_ERROR_OUT_OF_MEMORY;
@@ -815,10 +1112,16 @@ static SvtAv2Error ccso_auto_prepare(SvtAv2EncoderContext* c,CcsoAuto** output,i
     w->cols=(width+63u)/64u;w->units=w->cols*((height+63u)/64u);
     w->plan.unit_flags=(const uint8_t (*)[2])w->map;w->plan.unit_count=w->units;
     svt_av2_frame_header_config_default(&w->header,width,height);
+    w->header.cdef_primary=cdef_primary;
     w->header.deblock_y=db;w->header.deblock_delta=delta;w->header.deblock_delta_h=delta_h;
     w->header.base_q_idx=(uint32_t)c->config.qp+(bd==10u?48u:0u);
     w->header.bit_depth=bd;w->header.chroma_format=1u;w->header.m5_intra_modes=4u;
     w->header.entropy_adaptation=1u;w->header.reduced_tx_set=0u;w->header.enable_mrls=w->header.enable_mhccp=1u;
+    w->header.enable_intra_ist=c->intra_ist_scope!=0u;
+    w->header.enable_ibp=c->enable_ibp;
+    w->header.uv_delta_q=c->uv_delta_q;
+    w->header.qm_level=c->path_state.qm_level;
+    w->header.enable_intra_edge_filter=c->still_edge_filter;
     w->header.partition_decisions=c->partition_decisions;w->header.partition_decision_count=c->partition_decision_count;
     clock_t start=clock();
     for (uint32_t p=0u;p<3u;++p) for (uint32_t y=0u;y<(height>>(p!=0u));++y)
@@ -917,7 +1220,7 @@ static int content_guard_domain(const SvtAv2EncoderContext* c) {
          (c->frame_width==3840u && c->frame_height==2160u));
 }
 #endif
-static SvtAv2Error pc_wiener_try(SvtAv2EncoderContext* c,CcsoAuto* w,int ccso_on,size_t* bytes) {
+static SvtAv2Error pc_wiener_try(SvtAv2EncoderContext* c,CcsoAuto* w,int ccso_on,size_t* bytes,const uint16_t* deblocked) {
     const uint32_t width=c->frame_width,height=c->frame_height,cols=width/4u;
     const uint32_t bd=(uint32_t)c->config.bit_depth,step=bd==10u?2u:1u;
     const size_t pixels=(size_t)width*height,off_bytes=*bytes;
@@ -941,8 +1244,8 @@ static SvtAv2Error pc_wiener_try(SvtAv2EncoderContext* c,CcsoAuto* w,int ccso_on
     for (uint32_t y=0u;y<height;++y) for (uint32_t x=0u;x<width;++x)
         src[(size_t)y*width+x]=svt_av2_sample_load(c->recon.planes[0]+(size_t)y*c->recon.strides[0]+x*step,bd);
     error=SVT_AV2_ERROR_INVALID_STATE;
-    if (svt_av2_pcwiener_filter_y(src,width,dst,width,width,height,bd,
-        w->header.base_q_idx,skip,cols)!=0) goto done;
+    if (svt_av2_pcwiener_filter_y_boundaries(src,width,dst,width,width,height,bd,
+        w->header.base_q_idx,skip,cols,deblocked)!=0) goto done;
     uint64_t raw[3];memcpy(raw,ccso_on?w->post:w->raw,sizeof(raw));
     const uint64_t old_y=raw[0];raw[0]=0u;
     int forced=-1;
@@ -953,10 +1256,11 @@ static SvtAv2Error pc_wiener_try(SvtAv2EncoderContext* c,CcsoAuto* w,int ccso_on
         forced=value[0]-'0';
     }
 #endif
-    const uint32_t ru_cols=(width+128u)/256u ? (width+128u)/256u : 1u;
-    const uint32_t ru_rows=(height+128u)/256u ? (height+128u)/256u : 1u;
+    const uint32_t ru=w->header.pc_wiener_unit ? w->header.pc_wiener_unit : 256u;
+    const uint32_t ru_cols=SVT_AV2_MAX((width+ru/2u)/ru,1u);
+    const uint32_t ru_rows=SVT_AV2_MAX((height+ru/2u)/ru,1u);
     uint16_t cdf[6]={19969,0,0,1,3,4};
-    uint64_t none_mask[2]={0u,0u},check_y=0u;
+    uint64_t none_mask[SVT_AV2_ARRAY_SIZE(w->header.pc_wiener_none_mask)]={0},check_y=0u;
 #if M6_CONTENT_GUARD
     /* Existing test-only forced PCW behavior stays separate from automatic
      * selection. Production activation is exclusively this API hint/domain. */
@@ -965,8 +1269,8 @@ static SvtAv2Error pc_wiener_try(SvtAv2EncoderContext* c,CcsoAuto* w,int ccso_on
     uint64_t content_edge_samples=0u,content_flat_samples=0u;
 #endif
     for (uint32_t r=0u;r<ru_rows;++r) for (uint32_t col=0u;col<ru_cols;++col) {
-        const uint32_t left=col*256u,right=col+1u==ru_cols?width:left+256u;
-        const uint32_t top=r?r*256u-8u:0u,bottom=r+1u==ru_rows?height:(r+1u)*256u-8u;
+        const uint32_t left=col*ru,right=col+1u==ru_cols?width:left+ru;
+        const uint32_t top=r?r*ru-8u:0u,bottom=r+1u==ru_rows?height:(r+1u)*ru-8u;
         uint64_t sse[2]={0u,0u},cost[2]={0u,0u};
         uint16_t states[2][6];
         for (uint32_t y=top;y<bottom;++y) for (uint32_t x=left;x<right;++x) {
@@ -1008,7 +1312,11 @@ static SvtAv2Error pc_wiener_try(SvtAv2EncoderContext* c,CcsoAuto* w,int ccso_on
                 memcpy(dst+(size_t)y*width+left,src+(size_t)y*width+left,(right-left)*sizeof(*dst));
         }
     }
-    if (check_y!=old_y) goto done;
+    if (deblocked) {
+        /* The CCSO search measured the luma before CDEF. PC-Wiener's
+         * bypass arm uses the newly filtered samples. */
+        w->raw[0]=w->post[0]=check_y;
+    } else if (check_y!=old_y) goto done;
     uint64_t old_j=0u,new_j=0u;
     if (ccso_auto_cost(c,ccso_on?w->post:w->raw,(uint64_t)off_bytes*32768u,&old_j)!=0) goto done;
     w->header.enable_pc_wiener=1u;
@@ -1028,7 +1336,7 @@ static SvtAv2Error pc_wiener_try(SvtAv2EncoderContext* c,CcsoAuto* w,int ccso_on
             svt_av2_sample_store(c->recon.planes[0]+(size_t)y*c->recon.strides[0]+x*step,bd,dst[(size_t)y*width+x]);
     } else memcpy(c->packet,packet,off_bytes);
     fprintf(stderr,"PC_WIENER accepted=%d bytes=%zu/%zu SSE=%llu/%llu J=%llu/%llu none_mask=%llu none_mask_hi=%llu\n",
-        accepted,off_bytes,new_bytes,(unsigned long long)old_y,(unsigned long long)raw[0],
+        accepted,off_bytes,new_bytes,(unsigned long long)check_y,(unsigned long long)raw[0],
         (unsigned long long)old_j,(unsigned long long)new_j,(unsigned long long)none_mask[0],(unsigned long long)none_mask[1]);
 #if M6_CONTENT_GUARD
     fprintf(stderr,"CONTENT_GUARD type=%s active=%u considered=%u vetoes=%u edge_samples=%llu flat_samples=%llu forced=%d accepted=%d\n",
@@ -1041,8 +1349,10 @@ done:
 }
 #endif
 
-static SvtAv2Error ccso_auto_encode_base(SvtAv2EncoderContext* c,size_t* bytes,uint32_t db,int delta,int delta_h) {
-    CcsoAuto* w=NULL;SvtAv2Error error=ccso_auto_prepare(c,&w,0,db,delta,delta_h);if (error!=0) return error;
+static SvtAv2Error ccso_auto_encode_base(SvtAv2EncoderContext* c,size_t* bytes,uint32_t db,int delta,int delta_h,uint32_t ru,uint32_t cdef_primary,int stack_restoration,uint32_t gdf_code) {
+    CcsoAuto* w=NULL;SvtAv2Error error=ccso_auto_prepare(c,&w,0,db,delta,delta_h,cdef_primary);if (error!=0) return error;
+    w->header.pc_wiener_unit=ru;
+    w->header.enable_gdf=gdf_code!=0u;w->header.gdf_code=gdf_code;
     const clock_t start=clock();size_t off_bytes=0u,on_bytes=0u;uint64_t off_j=0u,on_j=0u;
     int accepted=0;error=ccso_auto_packet(c,w,0,&off_bytes);if (error!=0) goto done;
     const uint64_t off_hash=ccso_auto_hash(c->packet,off_bytes);
@@ -1080,9 +1390,23 @@ static SvtAv2Error ccso_auto_encode_base(SvtAv2EncoderContext* c,size_t* bytes,u
         w->headers[w->mask].frame_bits,w->headers[w->mask].frame_bytes,(long long)w->scan_ticks,(long long)w->select_ticks,
         (long long)w->pack_ticks,(long long)w->apply_ticks,(long)CLOCKS_PER_SEC);
     fprintf(stderr,"CCSO_AUTO_MAP,");for (uint32_t u=0u;u<w->units;++u) fputc('0'+w->map[u][0]+2*w->map[u][1],stderr);fputc('\n',stderr);
+    /* CCSO chroma classification reads the deblocked luma before CDEF. */
+    uint16_t* deblocked=NULL;
+    if (cdef_primary)
+        error=svt_av2_cdef_luma_apply(&c->recon,cdef_primary,stack_restoration || gdf_code ? &deblocked : NULL);
+    uint16_t* guide = NULL;
+    if (gdf_code && error == SVT_AV2_ERROR_NONE) {
+        guide = svt_av2_gdf_copy_luma(&c->recon);
+        if (!guide) error = SVT_AV2_ERROR_OUT_OF_MEMORY;
+    }
 #if M6_PC_WIENER
-    error=pc_wiener_try(c,w,accepted,bytes);
+    if (error==SVT_AV2_ERROR_NONE && (!cdef_primary || stack_restoration))
+        error=pc_wiener_try(c,w,accepted,bytes,deblocked);
 #endif
+    if (guide && error == SVT_AV2_ERROR_NONE)
+        error = svt_av2_gdf_luma(&c->recon, guide, deblocked, w->header.base_q_idx, gdf_code, 0u);
+    free(guide);
+    free(deblocked);
 done:
     free(w);return error;
 }
@@ -1101,23 +1425,52 @@ static void db_recon_copy(SvtAv2EncoderContext* c,uint8_t* raw,int restore) {
         }
     }
 }
-static SvtAv2Error db_current_cost(SvtAv2EncoderContext* c,size_t bytes,uint64_t* cost) {
+static SvtAv2Error db_current_cost(SvtAv2EncoderContext* c,size_t bytes,int gradient_rd,uint64_t* cost) {
     uint64_t sse[3]={0u,0u,0u};
     const uint32_t bd=(uint32_t)c->config.bit_depth,step=bd>8u?2u:1u;
+    int16_t above[4096];
+    uint64_t gradient_sse=0u;
     for (uint32_t p=0u;p<3u;++p) {
         const uint32_t w=c->frame_width>>(p!=0u),h=c->frame_height>>(p!=0u);
-        for (uint32_t y=0u;y<h;++y) for (uint32_t x=0u;x<w;++x) {
-            const int d=(int)svt_av2_sample_load(c->frame_source.planes[p]+(size_t)y*c->frame_source.strides[p]+x*step,bd)-
-                (int)svt_av2_sample_load(c->recon.planes[p]+(size_t)y*c->recon.strides[p]+x*step,bd);
-            sse[p]+=(uint64_t)(d*d);
+        for (uint32_t y=0u;y<h;++y) {
+            int left=0;
+            for (uint32_t x=0u;x<w;++x) {
+                const int d=(int)svt_av2_sample_load(c->frame_source.planes[p]+(size_t)y*c->frame_source.strides[p]+x*step,bd)-
+                    (int)svt_av2_sample_load(c->recon.planes[p]+(size_t)y*c->recon.strides[p]+x*step,bd);
+                sse[p]+=(uint64_t)(d*d);
+                if (gradient_rd && p==0u) {
+                    /* The difference of two adjacent reconstruction errors equals
+                     * the error of the corresponding source gradient. */
+                    if (x) gradient_sse+=(uint64_t)((d-left)*(d-left));
+                    if (y) {
+                        const int delta=d-above[x];
+                        gradient_sse+=(uint64_t)(delta*delta);
+                    }
+                    left=d;
+                    above[x]=(int16_t)d;
+                }
+            }
         }
     }
+    sse[0]+=(gradient_sse+2u)/4u;
     if (bytes>UINT64_MAX/32768u) return SVT_AV2_ERROR_INVALID_STATE;
     return ccso_auto_cost(c,sse,(uint64_t)bytes*32768u,cost);
 }
 #endif
+static uint32_t gdf_key_code(const SvtAv2EncoderContext* c) {
+    return c->gdf_key ? (c->frame_height >= 2160u ? 14u : 12u) : 0u;
+}
+
 static SvtAv2Error ccso_auto_encode(SvtAv2EncoderContext* c,size_t* bytes) {
 #if M6_DEBLOCK
+    if (c->config.tree_refinement == 3u) {
+        uint64_t edges = 0, changed = 0;
+        const uint32_t q = (uint32_t)c->config.qp + (c->config.bit_depth == 10u ? 48u : 0u);
+        SvtAv2Error error = svt_av2_deblock_luma_apply(&c->recon, c->coded_blocks, c->coded_block_count,
+            3u, 1, 1, q, &edges, &changed);
+        if (error != SVT_AV2_ERROR_NONE) return error;
+        return ccso_auto_encode_base(c, bytes, 3u, 1, 1, 256u, 0u, 0, gdf_key_code(c));
+    }
     const size_t raw_size=(size_t)c->frame_width*c->frame_height*3u/2u*(c->config.bit_depth>8u?2u:1u);
     uint8_t* raw=(uint8_t*)malloc(raw_size);
     uint8_t* best_recon=(uint8_t*)malloc(raw_size);
@@ -1136,7 +1489,19 @@ static SvtAv2Error ccso_auto_encode(SvtAv2EncoderContext* c,size_t* bytes) {
     }
 #endif
     static const int deltas[4]={0,-1,1,-2};
-    for (uint32_t index=0u;index<25u;++index) {
+    const char* fine_ru=getenv("SVT_AV2_PCWIENER_RU");
+    const int try_fine=forced<0 && fine_ru && !strcmp(fine_ru,"rd");
+    const char* cdef=getenv("SVT_AV2_CDEF");
+    const uint32_t cdef_start=try_fine ? 27u : 25u;
+    static const uint32_t primary_strengths[]={1u,2u,4u,8u};
+    const int gradient_rd=cdef && !strcmp(cdef,"gradient");
+    const int stack_restoration=gradient_rd || (cdef && !strcmp(cdef,"stack"));
+    const int try_cdef=forced<0 && cdef && (stack_restoration || !strcmp(cdef,"rd"));
+    uint32_t best_ru=256u,best_cdef=0u;
+    for (uint32_t trial=0u;trial<cdef_start+(try_cdef ? SVT_AV2_ARRAY_SIZE(primary_strengths) : 0u);++trial) {
+        const uint32_t primary=trial<cdef_start ? 0u : primary_strengths[trial-cdef_start];
+        const uint32_t index=trial<25u ? trial : winner;
+        const uint32_t ru=trial<25u || primary ? 256u : trial==25u ? 128u : 64u;
         if (forced>=0 && index && index!=(uint32_t)forced) continue;
         const uint32_t mode=!index?0u:index<=4u?1u:index<=8u?2u:3u;
         const int delta=mode==1u?deltas[index-1u]:mode==3u?deltas[(index-9u)/4u]:0;
@@ -1147,11 +1512,12 @@ static SvtAv2Error ccso_auto_encode(SvtAv2EncoderContext* c,size_t* bytes) {
             mode,delta,delta_h,(uint32_t)c->config.qp+(c->config.bit_depth==10u?48u:0u),&edges,&changed);
         if (error!=SVT_AV2_ERROR_NONE) goto done;
         size_t trial_bytes=0u;
-        error=ccso_auto_encode_base(c,&trial_bytes,mode,delta,delta_h);
+        error=ccso_auto_encode_base(c,&trial_bytes,mode,delta,delta_h,ru,primary,stack_restoration,0u);
         if (error!=SVT_AV2_ERROR_NONE) goto done;
-        uint64_t cost=0u;error=db_current_cost(c,trial_bytes,&cost);
+        uint64_t cost=0u;error=db_current_cost(c,trial_bytes,gradient_rd,&cost);
         if (error!=SVT_AV2_ERROR_NONE) goto done;
-        if (!index) off_cost=cost;
+        if (primary) fprintf(stderr,"CDEF_TRIAL primary=%u bytes=%zu J=%llu\n",primary,trial_bytes,(unsigned long long)cost);
+        if (!trial) off_cost=cost;
         fprintf(stderr,"DEBLOCK_TRIAL index=%u mode=%u delta=%d delta_h=%d edges=%llu changed=%llu bytes=%zu J=%llu\n",
             index,mode,delta,delta_h,(unsigned long long)edges,(unsigned long long)changed,trial_bytes,(unsigned long long)cost);
         if (cost<best_cost || (forced>=0 && index==(uint32_t)forced)) {
@@ -1160,25 +1526,205 @@ static SvtAv2Error ccso_auto_encode(SvtAv2EncoderContext* c,size_t* bytes) {
             uint8_t* grown=(uint8_t*)realloc(best_packet,trial_bytes);
             if (!grown) {error=SVT_AV2_ERROR_OUT_OF_MEMORY;goto done;}
             best_packet=grown;memcpy(best_packet,c->packet,trial_bytes);
-            best_bytes=trial_bytes;best_cost=cost;winner=index;
+            best_bytes=trial_bytes;best_cost=cost;winner=index;best_ru=ru;best_cdef=primary;
             best_hash=ccso_auto_hash(best_packet,best_bytes);db_recon_copy(c,best_recon,0);
         }
     }
+    if (try_cdef) fprintf(stderr,"CDEF_FINAL primary=%u db=%u bytes=%zu\n",best_cdef,winner,best_bytes);
+    if (try_fine) fprintf(stderr,"PC_WIENER_RU winner=%u db=%u bytes=%zu\n",best_ru,winner,best_bytes);
     if (!best_packet || c->packet_capacity<best_bytes) {error=SVT_AV2_ERROR_INVALID_STATE;goto done;}
     memcpy(c->packet,best_packet,best_bytes);db_recon_copy(c,best_recon,1);*bytes=best_bytes;
-    uint64_t final_cost=0u;error=db_current_cost(c,best_bytes,&final_cost);
+    uint64_t final_cost=0u;error=db_current_cost(c,best_bytes,gradient_rd,&final_cost);
     if (error==SVT_AV2_ERROR_NONE && (final_cost!=best_cost || ccso_auto_hash(c->packet,best_bytes)!=best_hash))
         error=SVT_AV2_ERROR_INVALID_STATE;
     fprintf(stderr,"DEBLOCK_FINAL winner=%u forced=%d bytes=%zu Joff=%llu Jfinal=%llu\n",
         winner,forced,best_bytes,(unsigned long long)off_cost,(unsigned long long)best_cost);
+    if (error == SVT_AV2_ERROR_NONE && c->gdf_key) {
+        const uint32_t mode = !winner ? 0u : winner <= 4u ? 1u : winner <= 8u ? 2u : 3u;
+        const int dv = mode == 1u ? deltas[winner-1u] : mode == 3u ? deltas[(winner-9u)/4u] : 0;
+        const int dh = mode == 2u ? deltas[winner-5u] : mode == 3u ? deltas[(winner-9u)%4u] : 0;
+        uint64_t edges = 0, changed = 0;
+        db_recon_copy(c,raw,1);
+        if (mode) error = svt_av2_deblock_luma_apply(&c->recon,c->coded_blocks,c->coded_block_count,
+            mode,dv,dh,(uint32_t)c->config.qp+(c->config.bit_depth==10u?48u:0u),&edges,&changed);
+        if (error == SVT_AV2_ERROR_NONE)
+            error = ccso_auto_encode_base(c,bytes,mode,dv,dh,best_ru,best_cdef,stack_restoration,gdf_key_code(c));
+    }
 done:
     free(raw);free(best_recon);free(best_packet);return error;
 #else
-    return ccso_auto_encode_base(c,bytes,0u,0,0);
+    return ccso_auto_encode_base(c,bytes,0u,0,0,256u,0u,0,gdf_key_code(c));
 #endif
 }
 
 #include "satd_packet.inc"
+
+static uint32_t motion_precision(uint32_t motion_optimization) {
+    return motion_optimization == 5u ? 2u : motion_optimization >= 3u ? 1u : 0u;
+}
+
+static inline uint32_t anchor_difference(uint16_t a, uint16_t b) {
+    return a >= b ? (uint32_t)(a - b) : (uint32_t)(b - a);
+}
+
+/* Use only the current source, one previously committed source signature,
+ * and actual reconstructed LAST/LONG. Q8 output is in 8-bit sample units;
+ * no signal is added to the bitstream apart from the existing refresh mask. */
+static uint32_t anchor_probe(const SvtAv2EncoderContext* context, SvtAv2AnchorProbe* probe) {
+    const SvtAv2FrameBuffer* src = &context->frame_source;
+    const SvtAv2FrameBuffer* last = svt_av2_reference_view(&context->reference);
+    const SvtAv2FrameBuffer* older = svt_av2_reference_view(&context->long_reference);
+    const uint32_t bd = src->bit_depth, step = bd > 8u ? 2u : 1u;
+    const uint32_t divisor = SVT_AV2_ANCHOR_GRID_COUNT << (bd - 8u);
+    uint32_t src_sad = 0u, last_sad = 0u, long_sad = 0u;
+    for (uint32_t y = 0u, i = 0u; y < SVT_AV2_ANCHOR_GRID_Y; ++y) {
+        const uint32_t sy = ((2u * y + 1u) * src->visible_height) / (2u * SVT_AV2_ANCHOR_GRID_Y);
+        const uint8_t* in = src->planes[0] + (size_t)sy * src->strides[0];
+        const uint8_t* recent = last ? last->planes[0] + (size_t)sy * last->strides[0] : NULL;
+        const uint8_t* held = older ? older->planes[0] + (size_t)sy * older->strides[0] : NULL;
+        for (uint32_t x = 0u; x < SVT_AV2_ANCHOR_GRID_X; ++x, ++i) {
+            const uint32_t offset = step * ((2u * x + 1u) * src->visible_width / (2u * SVT_AV2_ANCHOR_GRID_X));
+            const uint16_t sample = svt_av2_sample_load(in + offset, bd);
+            probe->current[i] = sample;
+            if (context->anchor_source_valid) src_sad += anchor_difference(sample, context->anchor_source[i]);
+            if (recent) last_sad += anchor_difference(sample, svt_av2_sample_load(recent + offset, bd));
+            if (held) long_sad += anchor_difference(sample, svt_av2_sample_load(held + offset, bd));
+        }
+    }
+    probe->source_q8 = (src_sad * 256u) / divisor;
+    probe->last_q8 = (last_sad * 256u) / divisor;
+    probe->long_q8 = (long_sad * 256u) / divisor;
+    probe->age = older ? (uint32_t)(context->pictures_encoded - context->long_reference.frame_index) : 0u;
+    if (context->pictures_encoded == 0u) { probe->reason = 0u; return 0u; }
+    if (!older) {
+        const int seed = context->pictures_encoded == 4u;
+        probe->reason = seed ? 2u : 1u;
+        return seed ? 3u : 1u;
+    }
+    const int stale = long_sad >= last_sad + divisor;
+    if (probe->age >= 8u) { probe->reason = 6u; return 3u; }
+    if (probe->age >= 2u && src_sad >= 3u * divisor && long_sad >= 4u * divisor && stale) {
+        probe->reason = 4u; return 3u;
+    }
+    if (probe->age >= 4u && (2u * src_sad >= divisor || stale)) {
+        probe->reason = 5u; return 3u;
+    }
+    probe->reason = 3u;
+    return 1u;
+}
+
+static SvtAv2PictureReference picture_reference(const SvtAv2EncoderContext* context, SvtAv2AnchorProbe* probe) {
+    SvtAv2PictureReference refs = {0};
+    if (context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P) return refs;
+    refs.dual_ref = context->dual_ref_period != 0u;
+    if (context->dual_ref_cadence) refs.refresh_mask = anchor_probe(context, probe);
+    if (context->pictures_encoded == 0u) return refs; /* CLK refreshes all slots implicitly. */
+    refs.predictor = &context->reference;
+    if (refs.dual_ref) {
+        if (!context->dual_ref_cadence)
+            refs.refresh_mask = context->pictures_encoded % context->dual_ref_period ? 1u : 3u;
+        /* CLK's mask covers both slots but the decoder deduplicates the KEY
+         * buffer to slot 0. Only an explicit periodic P refresh seeds slot 1. */
+        if (context->dual_ref_policy == 3u) {
+            uint32_t distance[2];
+            /* A periodic refresh temporarily makes both slots aliases. Test
+             * before refresh and never map an alias or an empty slot to rank 1. */
+            if (context->reference.valid && context->long_reference.valid &&
+                svt_av2_mvp_two_past_distances(context->pictures_encoded, context->reference.frame_index,
+                    context->long_reference.frame_index, distance) && distance[0] == 1u && distance[1] > 1u) {
+                refs.secondary_reference = &context->long_reference;
+                refs.ref_distance[0] = distance[0];
+                refs.ref_distance[1] = distance[1];
+            }
+        } else {
+            if (context->long_reference.valid)
+                refs.reference_slot = context->dual_ref_policy ? context->dual_ref_policy - 1u :
+                    svt_av2_reference_choose_slot(&context->frame_source, &context->reference, &context->long_reference);
+            if (refs.reference_slot) refs.predictor = &context->long_reference;
+        }
+    } else {
+        refs.retain_reference = context->inter_ref_period > 1u &&
+            context->pictures_encoded % context->inter_ref_period != 0u;
+    }
+    if (!refs.secondary_reference)
+        refs.ref_distance[0] = (uint32_t)(context->pictures_encoded - refs.predictor->frame_index);
+    return refs;
+}
+
+static void record_block_ref_stats(SvtAv2EncoderContext* context, const SvtAv2PictureReference* refs) {
+    SvtAv2BlockRefStats stats = {0};
+    stats.refresh_mask = refs->refresh_mask;
+    if (refs->predictor != NULL) {
+        const int two = refs->secondary_reference != NULL;
+        stats.logical_ref_count = two ? 2u : 1u;
+        stats.ref_distance[0] = refs->ref_distance[0];
+        stats.ref_distance[1] = refs->ref_distance[1];
+        for (size_t i = 0u; i < context->coded_block_count / 3u; ++i) {
+            const SvtAv2TileBlockMode* mode = &context->coded_modes[i];
+            if (!mode->is_inter) continue;
+            /* The formal writer has already validated both the bitstream and rank. */
+            const uint32_t rank = two ? mode->reference_rank : 0u;
+            ++stats.rank_leaves[rank];
+            if (two && (mode->mv_x % 2 != 0 || mode->mv_y % 2 != 0))
+                ++stats.odd_mv_leaves[rank];
+        }
+    }
+    context->block_ref_stats = stats;
+}
+
+/* Compare against the last coded source so gradual drawing changes accumulate.
+ * Guard local luma changes and test chroma against the actual displayed pixels. */
+static int can_show_last(const SvtAv2EncoderContext* c, const SvtAv2AnchorProbe* probe) {
+    if (c->pictures_encoded < 5u || c->held_pictures >= 8u || probe->source_q8 >= 192u)
+        return 0;
+    const SvtAv2FrameBuffer* src = &c->frame_source;
+    const uint32_t scale = 1u << (src->bit_depth - 8u);
+    uint32_t changed = 0u;
+    for (uint32_t i = 0; i < SVT_AV2_ANCHOR_GRID_COUNT; ++i) {
+        if (anchor_difference(probe->current[i], c->anchor_source[i]) > 6u * scale && ++changed > 9u)
+            return 0;
+    }
+    for (uint32_t p = 1u; p < 3u; ++p) {
+        uint32_t sad = 0u;
+        const uint32_t width = svt_av2_picture_plane_width(src, p);
+        const uint32_t height = svt_av2_picture_plane_height(src, p);
+        for (uint32_t y = 0; y < 18u; ++y) for (uint32_t x = 0; x < 32u; ++x) {
+            const uint32_t row = (2u * y + 1u) * height / 36u;
+            const size_t col = (2u * x + 1u) * width / 64u * (src->bit_depth > 8u ? 2u : 1u);
+            const uint32_t d = anchor_difference(
+                svt_av2_sample_load(src->planes[p] + row * (size_t)src->strides[p] + col, src->bit_depth),
+                svt_av2_sample_load(c->recon.planes[p] + row * (size_t)c->recon.strides[p] + col, src->bit_depth));
+            if (d > 16u * scale) return 0;
+            sad += d;
+        }
+        if (sad > 2u * scale * 18u * 32u) return 0;
+    }
+    return 1;
+}
+
+static SvtAv2Error show_last(SvtAv2EncoderContext* c) {
+    /* MFH and sequence IDs 0 (two uvlc(0)); LAST slot 0, explicit 8-bit hint. */
+    uint8_t payload[2];
+    SvtAv2BitWriter header, packet;
+    svt_av2_bit_writer_init(&header, payload, sizeof(payload));
+    svt_av2_bit_writer_init(&packet, c->packet, c->packet_capacity);
+    if (svt_av2_bit_writer_write_bits(&header, 12u, 4u) ||
+        svt_av2_bit_writer_write_bits(&header, c->pictures_encoded & 255u, 8u) ||
+        svt_av2_obu_payload_finalize(&header) ||
+        svt_av2_obu_write(&packet, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0u, NULL, 0u) ||
+        svt_av2_obu_write(&packet, SVT_AV2_OBU_REGULAR_SEF, 0u, payload, sizeof(payload)))
+        return SVT_AV2_ERROR_INTERNAL;
+    memset(&c->block_ref_stats, 0, sizeof(c->block_ref_stats));
+    memset(&c->rd_stats, 0, sizeof(c->rd_stats));
+    c->inter_skip_trials = c->inter_skip_accepts = 0;
+    c->inter_fine_trials = c->inter_fine_accepts = 0;
+    c->packet_size = svt_av2_bit_writer_bytes_written(&packet);
+    c->recon_frame_index = c->pictures_encoded++;
+    c->packet_pending = 1;
+    c->frame_pending = 0;
+    ++c->held_pictures;
+    return SVT_AV2_ERROR_NONE;
+}
 
 static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
     if (context->packet_pending || !context->frame_pending) {
@@ -1186,14 +1732,68 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
     }
 
     if (context->fatal_error) return SVT_AV2_ERROR_INTERNAL;
+    SVT_AV2_IP_START(profile_start);
     const uint32_t width = context->frame_width, height = context->frame_height;
-    const SvtAv2Error recon_err = encode_reconstruction(context, width, height);
+    SvtAv2AnchorProbe anchor;
+    const SvtAv2PictureReference refs = picture_reference(context, &anchor);
+    const uint32_t retain_reference = refs.retain_reference;
+    int32_t qp = context->config.qp;
+    if (context->pictures_encoded == 0u && context->video_key_qp)
+        qp = context->video_key_qp;
+    else if ((refs.refresh_mask & 2u) && context->video_anchor_qp)
+        qp = context->video_anchor_qp;
+    int clean = 0;
+    if (context->motion_q >= 3u && refs.predictor) {
+        const int mask_motion = context->motion_q == 4u;
+        const int can_hold = can_show_last(context, &anchor);
+        clean = mask_motion && can_hold && context->previous_motion_q8 >= 5u * 256u &&
+            anchor.last_q8 >= 384u && context->pictures_encoded - context->last_clean_frame >= 8u;
+        if (can_hold && !clean) return show_last(context);
+        if (mask_motion && anchor.source_q8 >= 5u * 256u)
+            qp = context->config.qp;
+        else if (clean || context->held_pictures || anchor.source_q8 >= 384u)
+            qp = context->video_anchor_qp;
+    }
+    if (context->motion_q == 1u && refs.predictor) {
+        /* Spend the first quiet frame after motion on a clean prediction anchor.
+         * Do not spend the same anchor budget on every refresh in a held shot. */
+        const uint32_t motion = anchor.source_q8;
+        if (motion < 384u && context->previous_motion_q8 >= 384u)
+            qp = SVT_AV2_MAX(1, context->video_anchor_qp - 18);
+        else if (motion < 192u)
+            qp = SVT_AV2_MIN(255, context->config.qp + 12);
+        else if (motion >= 5u * 256u)
+            qp = SVT_AV2_MIN(255, context->config.qp + 18);
+    }
+    if (context->motion_q == 2u && refs.predictor) {
+        const uint32_t motion = anchor.source_q8;
+        /* A changed animation drawing may be followed by several holds. Spend
+         * on the change itself, and avoid buying a second expensive anchor
+         * for the next, nearly identical drawing. */
+        clean = motion < 384u && context->quiet_frames == 3u &&
+            context->pictures_encoded - context->last_clean_frame >= 16u;
+        if (clean)
+            qp = SVT_AV2_MAX(1, context->video_anchor_qp - 12);
+        else if (motion < 192u)
+            qp = SVT_AV2_MIN(255, context->config.qp + 16);
+        else if (motion >= 384u && context->previous_motion_q8 < 384u)
+            qp = context->video_anchor_qp;
+        else if (motion >= 5u * 256u)
+            qp = context->config.qp;
+    }
+    const uint32_t base_q_idx = (uint32_t)qp + (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u);
+    const int use_ccso_search = ccso_auto_domain(context);
+    if (context->gdf_key && !use_ccso_search && !context->video_cdf)
+        return SVT_AV2_ERROR_UNSUPPORTED;
+    SVT_AV2_IP_START(profile_recon);
+    const SvtAv2Error recon_err = encode_reconstruction(context, width, height, base_q_idx, &refs);
+    SVT_AV2_IP_START(profile_writer);
     if (recon_err != SVT_AV2_ERROR_NONE) {
         context->fatal_error = 1;
         return recon_err;
     }
     size_t stream_size = 0;
-    if (ccso_auto_domain(context)) {
+    if (use_ccso_search) {
         const SvtAv2Error error=ccso_auto_encode(context,&stream_size);
         if (error!=SVT_AV2_ERROR_NONE) {context->fatal_error=1;return error;}
 #if M6_SATD_ANGLES
@@ -1211,20 +1811,73 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
             context->packet = grown;
             context->packet_capacity = capacity;
         }
-        if (context->config.still_picture) {
+        if (context->video_cdf != NULL) {
+            SvtAv2VideoCdfState* cdf = context->video_cdf;
+            const SvtAv2TileBlockMode* modes = refs.predictor ? context->coded_modes : NULL;
+            status = svt_av2_encode_packet_video_models(&cdf->frame_header, context->pictures_encoded,
+                context->coded_blocks, context->coded_block_count, modes,
+                modes ? context->coded_block_count / 3u : 0u,
+                context->packet, context->packet_capacity, &stream_size, &cdf->writer_end);
+        } else if (context->config.still_picture && (context->intra_ist_scope || context->still_edge_filter || context->enable_ibp || context->uv_delta_q || context->path_state.qm_level)) {
+            status = svt_av2_encode_still_picture_ccso64_packet(&context->still_tools_header,
+                context->coded_blocks, context->coded_block_count, context->packet,
+                context->packet_capacity, &stream_size);
+        } else if (context->config.still_picture) {
             status = svt_av2_encode_still_picture_mhccp(width, height,
                 (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
-                (uint32_t)context->config.qp + (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u),
+                base_q_idx,
                 context->coded_blocks, context->coded_block_count, context->config.intra_mode_selection,
                 context->partition_decision_count ? context->partition_decisions : NULL,
                 context->partition_decision_count, context->config.entropy_adaptation,
                 context->config.transform_selection, context->config.mrl_search,
                 context->config.mhccp_search, context->packet, context->packet_capacity, &stream_size);
+        } else if (refs.secondary_reference != NULL) {
+            status = svt_av2_encode_packet_two_refs_projected(width, height,
+                (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
+                base_q_idx, context->pictures_encoded, context->coded_blocks, context->coded_block_count,
+                context->coded_modes, context->coded_block_count / 3u, context->config.intra_mode_selection,
+                context->config.partition_selection ? context->partition_decisions : NULL,
+                context->config.partition_selection ? context->partition_decision_count : 0u,
+                context->config.entropy_adaptation, motion_precision(context->config.motion_optimization),
+                1u, refs.refresh_mask, refs.ref_distance,
+                context->packet, context->packet_capacity, &stream_size);
+        } else if (refs.dual_ref) {
+            const int inter = refs.predictor != NULL;
+            status = svt_av2_encode_packet_dual_ref(width, height,
+                (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
+                base_q_idx, context->pictures_encoded, context->coded_blocks, context->coded_block_count,
+                inter ? context->coded_modes : NULL, inter ? context->coded_block_count / 3u : 0u,
+                context->config.intra_mode_selection,
+                context->config.partition_selection ? context->partition_decisions : NULL,
+                context->config.partition_selection ? context->partition_decision_count : 0u,
+                context->config.entropy_adaptation, inter ? motion_precision(context->config.motion_optimization) : 0u,
+                inter ? 1u : 0u, refs.refresh_mask, refs.reference_slot,
+                context->packet, context->packet_capacity, &stream_size);
+        } else if (retain_reference || (context->config.motion_optimization >= 4u && context->pictures_encoded != 0u)) {
+            status = svt_av2_encode_packet_inter_profile(width, height,
+                (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
+                base_q_idx,
+                context->pictures_encoded, context->coded_blocks, context->coded_block_count,
+                context->coded_modes, context->coded_block_count / 3u, context->config.intra_mode_selection,
+                context->config.partition_selection ? context->partition_decisions : NULL,
+                context->config.partition_selection ? context->partition_decision_count : 0u,
+                context->config.entropy_adaptation, motion_precision(context->config.motion_optimization),
+                retain_reference, context->config.motion_optimization >= 4u ? 1u : 0u,
+                context->packet, context->packet_capacity, &stream_size);
+        } else if (context->config.motion_optimization == 3u && context->pictures_encoded != 0u) {
+            status = svt_av2_encode_packet_tools_half_entropy(width, height,
+                (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
+                base_q_idx,
+                context->pictures_encoded, context->coded_blocks, context->coded_block_count,
+                context->coded_modes, context->coded_block_count / 3u, 1u, context->config.intra_mode_selection,
+                context->config.partition_selection ? context->partition_decisions : NULL,
+                context->config.partition_selection ? context->partition_decision_count : 0u,
+                context->config.entropy_adaptation, context->packet, context->packet_capacity, &stream_size);
         } else if (context->config.entropy_adaptation) {
             const uint32_t low_delay = context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P;
             status = svt_av2_encode_packet_tools_entropy(width, height,
                 (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
-                (uint32_t)context->config.qp + (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u),
+                base_q_idx,
                 context->pictures_encoded, context->coded_blocks, context->coded_block_count,
                 low_delay ? context->coded_modes : NULL, low_delay ? context->coded_block_count / 3u : 0u,
                 low_delay, context->config.intra_mode_selection,
@@ -1235,7 +1888,7 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
             const uint32_t low_delay = context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P;
             status = svt_av2_encode_packet_tools(width, height,
                 (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
-                (uint32_t)context->config.qp + (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u),
+                base_q_idx,
                 context->pictures_encoded, context->coded_blocks, context->coded_block_count,
                 low_delay ? context->coded_modes : NULL, low_delay ? context->coded_block_count / 3u : 0u,
                 low_delay, context->config.intra_mode_selection, context->partition_decisions,
@@ -1243,7 +1896,7 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
         } else if (context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P) {
             status = svt_av2_encode_low_delay_packet_modes(width, height,
                 (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
-                (uint32_t)context->config.qp + (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u),
+                base_q_idx,
                 context->pictures_encoded, context->coded_blocks, context->coded_block_count,
                 context->coded_modes, context->coded_block_count / 3u,
                 context->config.intra_mode_selection,
@@ -1251,12 +1904,12 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
         } else if (context->config.intra_mode_selection) {
             status = svt_av2_encode_intra_packet_modes(width, height,
                 (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
-                (uint32_t)context->config.qp + (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u),
+                base_q_idx,
                 context->pictures_encoded, context->coded_blocks, context->coded_block_count,
                 context->packet, context->packet_capacity, &stream_size);
         } else status = svt_av2_encode_intra_packet_ex(width, height,
             (uint32_t)context->config.bit_depth, (uint32_t)context->config.chroma_format,
-            (uint32_t)context->config.qp + (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u),
+            base_q_idx,
             context->pictures_encoded, context->coded_blocks, context->coded_block_count,
             context->packet, context->packet_capacity, &stream_size);
         if (status != SVT_AV2_BW_ERROR_NO_SPACE) break;
@@ -1269,18 +1922,96 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
     }
 
     }
-    if (context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P) {
-        SvtAv2Error ref_status = svt_av2_reference_prepare(&context->reference, &context->recon,
-            context->pictures_encoded);
-        if (ref_status == SVT_AV2_ERROR_NONE) ref_status = svt_av2_reference_commit(&context->reference);
-        if (ref_status != SVT_AV2_ERROR_NONE) { context->fatal_error = 1; return ref_status; }
+    SvtAv2VideoCdfState* cdf = context->video_cdf;
+    int64_t cdf_seed_frame = -1;
+    if (cdf != NULL) {
+        if (memcmp(&cdf->rd_end, &cdf->writer_end, sizeof(cdf->rd_end)) != 0) {
+            context->fatal_error = 1;
+            return SVT_AV2_ERROR_INVALID_STATE;
+        }
+        if (refs.predictor) cdf_seed_frame = (int64_t)refs.predictor->frame_index;
+        svt_av2_entropy_models_decay(&cdf->writer_end);
     }
+    if (context->video_cdf && context->video_cdf->frame_header.gdf_code) {
+        uint16_t* guide = svt_av2_gdf_copy_luma(&context->recon);
+        const uint32_t distance = !refs.predictor ? 0u : refs.secondary_reference ? refs.ref_distance[1] :
+            (uint32_t)(context->pictures_encoded - refs.predictor->frame_index);
+        const SvtAv2Error filtered = guide ? svt_av2_gdf_luma(&context->recon, guide, guide,
+            base_q_idx, context->video_cdf->frame_header.gdf_code, distance) : SVT_AV2_ERROR_OUT_OF_MEMORY;
+        free(guide);
+        if (filtered != SVT_AV2_ERROR_NONE) { context->fatal_error = 1; return filtered; }
+    }
+    SVT_AV2_IP_START(profile_dpb);
+    SvtAv2Error ref_status = SVT_AV2_ERROR_NONE;
+    if (refs.dual_ref) {
+        ref_status = context->dual_ref_cadence ?
+            svt_av2_reference_refresh_after_holds(&context->reference, &context->long_reference,
+                &context->recon, context->pictures_encoded, refs.refresh_mask, context->held_pictures) :
+            svt_av2_reference_refresh_pair(&context->reference, &context->long_reference,
+                &context->recon, context->pictures_encoded, context->dual_ref_period);
+    } else if (context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P && !retain_reference) {
+        ref_status = svt_av2_reference_prepare_interval(&context->reference, &context->recon,
+            context->pictures_encoded, context->inter_ref_period);
+        if (ref_status == SVT_AV2_ERROR_NONE) ref_status = svt_av2_reference_commit(&context->reference);
+    }
+    SVT_AV2_IP_START(profile_publish);
+    if (ref_status != SVT_AV2_ERROR_NONE) { context->fatal_error = 1; return ref_status; }
+    if (cdf != NULL) {
+        /* The existing pixel transaction has succeeded. A held slot keeps
+         * both its pixels and CDF; the initial KEY has only native slot 0. */
+        const uint32_t frame = context->pictures_encoded;
+        if (!retain_reference) {
+            cdf->slots[0] = cdf->writer_end;
+            cdf->slot_frame[0] = frame;
+        }
+        if (refs.dual_ref && (refs.refresh_mask & 2u)) {
+            cdf->slots[1] = cdf->writer_end;
+            cdf->slot_frame[1] = frame;
+        }
+        if (cdf->trace)
+            fprintf(stderr, "inter_cdf frame=%u seed=%lld slot0=%lld slot1=%lld\n", frame,
+                (long long)cdf_seed_frame, (long long)cdf->slot_frame[0], (long long)cdf->slot_frame[1]);
+    }
+    if (context->dual_ref_cadence) {
+        memcpy(context->anchor_source, anchor.current, sizeof(context->anchor_source));
+        context->anchor_source_valid = 1u;
+        context->held_pictures = 0u;
+        context->previous_motion_q8 = refs.predictor ? anchor.source_q8 : UINT32_MAX;
+        if (context->motion_q == 2u) {
+            context->quiet_frames = refs.predictor && anchor.source_q8 < 384u ?
+                (uint8_t)SVT_AV2_MIN(4u, context->quiet_frames + 1u) : 0u;
+        }
+        if (clean) context->last_clean_frame = context->pictures_encoded;
+        const char* trace = getenv("SVT_AV2_ANCHOR_TRACE");
+        if (trace && trace[0] == '1' && trace[1] == '\0')
+            fprintf(stderr, "anchor_cadence frame=%u age=%u reason=%u mask=%u src_q8=%u last_q8=%u long_q8=%u qp=%d\n",
+                context->pictures_encoded, anchor.age, anchor.reason, refs.refresh_mask,
+                anchor.source_q8, anchor.last_q8, anchor.long_q8, qp);
+    }
+    if (context->dual_ref_policy == 3u) record_block_ref_stats(context, &refs);
     context->recon_frame_index = context->pictures_encoded;
 
     context->packet_size = stream_size;
     context->packet_pending = 1;
     context->frame_pending = 0;
     context->pictures_encoded++;
+#if SVT_AV2_INTER_PROFILE
+    /* The outer phases partition this synchronous API, not source I/O. The
+     * formal writer phase includes packet growth/retries (and, for special
+     * still profiles only, alternate-packet/restoration trials). RD has its
+     * own nested report; do not add its times to these outer phases. */
+    const uint64_t profile_end = svt_av2_ip_now(), hz = svt_av2_ip_hz();
+    if (hz && profile_start && profile_end)
+        fprintf(stderr, "inter_profile_frame kind=%s frame=%u clock=%s units=ns total=%llu refs_qp=%llu recon_rd=%llu formal_writer=%llu dpb=%llu publish=%llu\n",
+            context->config.still_picture ? "STILL" : refs.predictor ? "P" : "KEY",
+            context->pictures_encoded - 1u, SVT_AV2_IP_CLOCK_NAME,
+            svt_av2_ip_ns(svt_av2_ip_delta(profile_start, profile_end), hz),
+            svt_av2_ip_ns(svt_av2_ip_delta(profile_start, profile_recon), hz),
+            svt_av2_ip_ns(svt_av2_ip_delta(profile_recon, profile_writer), hz),
+            svt_av2_ip_ns(svt_av2_ip_delta(profile_writer, profile_dpb), hz),
+            svt_av2_ip_ns(svt_av2_ip_delta(profile_dpb, profile_publish), hz),
+            svt_av2_ip_ns(svt_av2_ip_delta(profile_publish, profile_end), hz));
+#endif
     return SVT_AV2_ERROR_NONE;
 }
 
@@ -1325,7 +2056,9 @@ static int m5_collect_intra_mode(void* user, uint32_t mode) {
 /* The hook retains exactly the qcoeff used by this reconstruction. */
 static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
                                          uint32_t width,
-                                         uint32_t height) {
+                                         uint32_t height,
+                                         uint32_t base_q_idx,
+                                         const SvtAv2PictureReference* refs) {
     if (!context->recon_ready) {
         return SVT_AV2_ERROR_INVALID_STATE;
     }
@@ -1351,6 +2084,8 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
     context->coded_block_count = context->coded_coeff_count = 0;
     context->partition_decision_count = 0;
     memset(&context->rd_stats, 0, sizeof(context->rd_stats));
+    context->inter_skip_trials = context->inter_skip_accepts = 0u;
+    context->inter_fine_trials = context->inter_fine_accepts = 0u;
     if (context->config.partition_selection || context->config.rd_mode) {
         SvtAv2FrameGeometry geometry;
         SvtAv2Error error = svt_av2_frame_geometry_init_ex(&geometry, width, height, 64u,
@@ -1372,8 +2107,7 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
     }
     SvtAv2IntraFrameConfig config;
     memset(&config, 0, sizeof(config));
-    config.base_q_idx = (uint32_t)context->config.qp +
-        (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u);
+    config.base_q_idx = base_q_idx;
     config.sb_size = 64u;
     config.frame_reset_value = (uint16_t)(1u << ((uint32_t)context->config.bit_depth - 1u));
     config.block_hook = collect_coefficients;
@@ -1389,6 +2123,23 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
     if (path_err != SVT_AV2_ERROR_NONE) {
         return path_err;
     }
+    const int qm_is_p = context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P &&
+        context->pictures_encoded != 0u;
+    const char* prune = getenv("SVT_AV2_AC_PRUNE");
+    context->path_state.ac_prune = prune && !strcmp(prune, "strong") ? 3u :
+        prune && !strcmp(prune, "medium") ? 2u : prune && !strcmp(prune, "mild") ? 1u : 0u;
+    const char* fp_round = getenv("SVT_AV2_FP_ROUND");
+    context->path_state.avm_fp_round = fp_round &&
+        (!strcmp(fp_round, "all") || !strcmp(fp_round, qm_is_p ? "p" : "key"));
+    context->path_state.uv_delta_q = context->uv_delta_q;
+    context->path_state.qm_level = (context->qm_scope & (qm_is_p ? 2u : 1u)) ? context->qm_level : 0u;
+#if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
+    const char* dct64_scope = getenv("SVT_AV2_DCT64_MATCH");
+    const int dct64_p = context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P &&
+        context->pictures_encoded != 0u;
+    context->path_state.match_dct64 = dct64_scope && (strcmp(dct64_scope, "all") == 0 ||
+        strcmp(dct64_scope, dct64_p ? "p" : "key") == 0);
+#endif
 
     /* All-Intra has no inter reference; the intra neighbour state is per frame.
      * The core overwrites every visited sample, but resetting makes the initial
@@ -1402,15 +2153,20 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         SvtAv2RdFrameConfig rd;
         memset(&rd, 0, sizeof(rd));
         rd.transform = config.transform;
+        rd.avm_fp_round = context->path_state.avm_fp_round;
         rd.rd_mode = context->config.rd_mode;
         rd.coeff_optimization = context->config.coeff_optimization;
-        rd.motion_optimization = context->config.motion_optimization;
+        rd.motion_optimization = context->config.motion_optimization >= 3u &&
+            context->pictures_encoded == 0u ? 0u : context->config.motion_optimization;
         rd.transform_selection = context->config.transform_selection;
         rd.tree_finalists = context->config.tree_refinement == 2u ?
             (context->config.partition_selection >= 10u ? 10u :
              context->config.partition_selection >= 8u ? 8u : 4u) :
             context->config.tree_refinement ? 2u : 0u;
+        rd.screen_trees = context->config.tree_refinement == 3u;
+        if (rd.screen_trees) rd.tree_finalists = 0u;
         rd.rd_lambda_model = context->config.rd_lambda_model;
+        rd.rd_lambda_scale = context->rd_lambda_scale;
         rd.cfl_search = context->config.cfl_search;
         rd.mhccp_search = context->config.mhccp_search;
         rd.intra_joint = context->config.intra_joint;
@@ -1422,6 +2178,22 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         rd.frame_header.multi_frame = !context->config.still_picture;
         rd.frame_header.inter_frame = context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P &&
             context->pictures_encoded != 0u;
+        rd.frame_header.mv_half = motion_precision(rd.motion_optimization);
+        rd.frame_header.sharp_filter = rd.frame_header.inter_frame && rd.motion_optimization >= 4u;
+        rd.inter_skip_search = rd.frame_header.inter_frame ? context->inter_skip_search : 0u;
+        rd.inter_fine = rd.frame_header.inter_frame ? context->inter_fine : 0u;
+        rd.inter_tail = rd.frame_header.inter_frame ? context->inter_tail : 0u;
+        rd.inter_near = rd.frame_header.inter_frame ? context->inter_near : 0u;
+        rd.frame_header.retain_reference = refs->retain_reference;
+        rd.frame_header.dual_ref = refs->dual_ref;
+        rd.frame_header.refresh_mask = refs->refresh_mask;
+        rd.frame_header.reference_slot = refs->reference_slot;
+        rd.secondary_reference = refs->secondary_reference;
+        if (refs->secondary_reference != NULL) {
+            rd.frame_header.logical_ref_count = 2u;
+            rd.frame_header.ref_distance[0] = refs->ref_distance[0];
+            rd.frame_header.ref_distance[1] = refs->ref_distance[1];
+        }
         rd.frame_header.order_hint = context->pictures_encoded & 255u;
         rd.frame_header.reduced_tx_set = context->config.transform_selection == 2u ? 0u : context->config.transform_selection ? 1u : 2u;
         rd.frame_header.enable_mrls = context->config.mrl_search;
@@ -1430,6 +2202,31 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         rd.frame_header.chroma_format = (uint32_t)context->config.chroma_format;
         rd.frame_header.m5_intra_modes = context->config.intra_mode_selection;
         rd.frame_header.entropy_adaptation = context->config.entropy_adaptation;
+        rd.frame_header.enable_intra_ist = context->intra_ist_scope != 0u;
+        rd.frame_header.uv_delta_q = context->uv_delta_q;
+        rd.frame_header.qm_level = context->path_state.qm_level;
+        rd.frame_header.enable_ibp = context->enable_ibp;
+        if (context->video_cdf && context->gdf_key) {
+            rd.frame_header.enable_gdf = 1u;
+            rd.frame_header.gdf_code = rd.frame_header.inter_frame ? (context->gdf_inter ? 8u : 0u) : gdf_key_code(context);
+        }
+        rd.frame_header.enable_intra_edge_filter = context->still_edge_filter;
+        rd.intra_ist_search = (context->intra_ist_scope &
+            (rd.frame_header.inter_frame ? 4u : 2u)) != 0u;
+        SvtAv2VideoCdfState* cdf = context->video_cdf;
+        if (cdf != NULL) {
+            rd.end_models = &cdf->rd_end;
+#if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
+            rd.frame_header.enable_cfl_intra = cdf->cfl_sequence;
+            rd.video_cfl_search = rd.frame_header.inter_frame ? cdf->cfl_p : cdf->cfl_key;
+#endif
+            if (refs->predictor != NULL) {
+                const uint32_t slot = refs->reference_slot; /* Physical backing of rank 0. */
+                if (!refs->predictor->valid || cdf->slot_frame[slot] != (int64_t)refs->predictor->frame_index)
+                    return SVT_AV2_ERROR_INVALID_STATE;
+                rd.frame_header.primary_models = &cdf->slots[slot];
+            }
+        }
         SvtAv2RdFrameOutput output;
         memset(&output, 0, sizeof(output));
         output.blocks = context->coded_blocks; output.block_capacity = context->coded_block_capacity;
@@ -1439,8 +2236,15 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         SvtAv2RdFrameStats stats;
         memset(&stats, 0, sizeof(stats));
         status = svt_av2_rd_frame_encode(&context->frame_source, &context->recon,
-            rd.frame_header.inter_frame ? &context->reference : NULL, &rd, &context->scratch, &output, &stats);
+            refs->predictor, &rd, &context->scratch, &output, &stats);
         if (status != SVT_AV2_ERROR_NONE) return status;
+        if (rd.partition_selection) {
+            rd.frame_header.partition_decisions = output.decisions;
+            rd.frame_header.partition_decision_count = output.decision_count;
+        }
+        if (cdf != NULL) cdf->frame_header = rd.frame_header;
+        else if (context->intra_ist_scope || context->still_edge_filter || context->enable_ibp || context->uv_delta_q || context->path_state.qm_level)
+            context->still_tools_header = rd.frame_header;
         context->coded_block_count = output.block_count;
         context->coded_coeff_count = output.coeff_count;
         context->partition_decision_count = output.decision_count;
@@ -1461,6 +2265,10 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         context->rd_stats.motion_accepts = stats.motion_accepts;
         context->rd_stats.wide_trials = stats.wide_trials;
         context->rd_stats.wide_accepts = stats.wide_accepts;
+        context->inter_skip_trials = stats.inter_skip_trials;
+        context->inter_skip_accepts = stats.inter_skip_accepts;
+        context->inter_fine_trials = stats.inter_fine_trials;
+        context->inter_fine_accepts = stats.inter_fine_accepts;
         return SVT_AV2_ERROR_NONE;
     }
     if (context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P && context->pictures_encoded != 0u) {
@@ -1500,6 +2308,41 @@ SvtAv2Error svt_av2_enc_get_rd_stats(SvtAv2Handle handle, SvtAv2RdStats* stats) 
         return SVT_AV2_ERROR_INVALID_STATE;
     if (context->fatal_error) return SVT_AV2_ERROR_INTERNAL;
     *stats = context->rd_stats;
+    return SVT_AV2_ERROR_NONE;
+}
+
+SvtAv2Error svt_av2_enc_get_inter_skip_stats(SvtAv2Handle handle, uint64_t* trials, uint64_t* accepts) {
+    const SvtAv2EncoderContext* context = context_from_handle(handle);
+    if (context == NULL) return SVT_AV2_ERROR_INVALID_HANDLE;
+    if (trials == NULL || accepts == NULL || trials == accepts) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (context->state != SVT_AV2_STATE_INITIALIZED || context->pictures_encoded == 0u)
+        return SVT_AV2_ERROR_INVALID_STATE;
+    if (context->fatal_error) return SVT_AV2_ERROR_INTERNAL;
+    *trials = context->inter_skip_trials;
+    *accepts = context->inter_skip_accepts;
+    return SVT_AV2_ERROR_NONE;
+}
+
+SvtAv2Error svt_av2_enc_get_inter_fine_stats(SvtAv2Handle handle, uint64_t* trials, uint64_t* accepts) {
+    const SvtAv2EncoderContext* context = context_from_handle(handle);
+    if (context == NULL) return SVT_AV2_ERROR_INVALID_HANDLE;
+    if (trials == NULL || accepts == NULL || trials == accepts) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (context->state != SVT_AV2_STATE_INITIALIZED || context->pictures_encoded == 0u)
+        return SVT_AV2_ERROR_INVALID_STATE;
+    if (context->fatal_error) return SVT_AV2_ERROR_INTERNAL;
+    *trials = context->inter_fine_trials;
+    *accepts = context->inter_fine_accepts;
+    return SVT_AV2_ERROR_NONE;
+}
+
+SvtAv2Error svt_av2_enc_get_block_ref_stats(SvtAv2Handle handle, SvtAv2BlockRefStats* stats) {
+    const SvtAv2EncoderContext* context = context_from_handle(handle);
+    if (context == NULL) return SVT_AV2_ERROR_INVALID_HANDLE;
+    if (stats == NULL) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (context->state != SVT_AV2_STATE_INITIALIZED || context->pictures_encoded == 0u)
+        return SVT_AV2_ERROR_INVALID_STATE;
+    if (context->fatal_error) return SVT_AV2_ERROR_INTERNAL;
+    *stats = context->block_ref_stats;
     return SVT_AV2_ERROR_NONE;
 }
 

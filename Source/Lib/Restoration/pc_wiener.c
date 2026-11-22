@@ -24,20 +24,16 @@ static int32_t round_signed(int32_t x, unsigned shift) {
     return x < 0 ? -((-x + half) >> shift) : (x + half) >> shift;
 }
 
-/* No CDEF: a virtual stripe boundary repeats the outer of two deblocked
- * context lines. At frame edges, replicate the outermost visible sample. */
-static int sample(const uint16_t* src, ptrdiff_t stride, int x, int y,
-    int width, int height, int top, int bottom) {
-    y = clamp_int(y, top - 2, bottom + 1);
-    y = clamp_int(y, 0, height - 1);
-    x = clamp_int(x, 0, width - 1);
-    return src[(ptrdiff_t)y * stride + x];
+/* Before each stripe, map its two halo rows to the decoder's saved
+ * pre-CDEF lines. At frame edges the outermost post-CDEF row is repeated. */
+static int sample(const uint16_t* const* lines, int x, int y, int width, int top, int bottom) {
+    return lines[clamp_int(y-top+2,0,bottom-top+3)][clamp_int(x,0,width-1)];
 }
 
-int svt_av2_pcwiener_filter_y(const uint16_t* src, ptrdiff_t src_stride,
+int svt_av2_pcwiener_filter_y_boundaries(const uint16_t* src, ptrdiff_t src_stride,
     uint16_t* dst, ptrdiff_t dst_stride, uint32_t width, uint32_t height,
     uint32_t bit_depth, uint32_t base_q_idx, const uint8_t* tskip,
-    ptrdiff_t tskip_stride) {
+    ptrdiff_t tskip_stride, const uint16_t* deblocked) {
     if (!src || !dst || src == dst || !tskip || !width || !height ||
         width % 8u || height % 8u || width > 16384u || height > 16384u ||
         src_stride < (ptrdiff_t)width || dst_stride < (ptrdiff_t)width ||
@@ -76,6 +72,12 @@ int svt_av2_pcwiener_filter_y(const uint16_t* src, ptrdiff_t src_stride,
     for (int top = 0;top < h;) {
         const int stripe_h = top == 0 ? 56 : 64;
         const int bottom = top + stripe_h < h ? top + stripe_h : h;
+        const uint16_t* lines[68];
+        for (int y = top-2; y < bottom+2; ++y) {
+            const int inside_frame = y >= 0 && y < h;
+            const uint16_t* plane = deblocked && inside_frame && (y < top || y >= bottom) ? deblocked : src;
+            lines[y-top+2] = plane + (ptrdiff_t)clamp_int(y,0,h-1) * src_stride;
+        }
         for (int left = 0;left < w;left += 64) {
             const int right = left + 64 < w ? left + 64 : w;
             for (int by = top;by < bottom;by += 4) {
@@ -84,14 +86,14 @@ int svt_av2_pcwiener_filter_y(const uint16_t* src, ptrdiff_t src_stride,
                     int skipped = 0;
                     for (int fy = by - 1;fy <= by + 4;++fy) {
                         for (int fx = bx - 1;fx <= bx + 4;++fx) {
-                            const int center = 2 * sample(src,src_stride,fx,fy,w,h,top,bottom);
-                            const int up = sample(src,src_stride,fx,fy-1,w,h,top,bottom);
-                            const int down = sample(src,src_stride,fx,fy+1,w,h,top,bottom);
+                            const int center = 2 * sample(lines,fx,fy,w,top,bottom);
+                            const int up = sample(lines,fx,fy-1,w,top,bottom);
+                            const int down = sample(lines,fx,fy+1,w,top,bottom);
                             features[1] += abs(up + down - center);
-                            features[2] += abs(sample(src,src_stride,fx+1,fy-1,w,h,top,bottom) +
-                                sample(src,src_stride,fx-1,fy+1,w,h,top,bottom) - center);
-                            features[3] += abs(sample(src,src_stride,fx-1,fy-1,w,h,top,bottom) +
-                                sample(src,src_stride,fx+1,fy+1,w,h,top,bottom) - center);
+                            features[2] += abs(sample(lines,fx+1,fy-1,w,top,bottom) +
+                                sample(lines,fx-1,fy+1,w,top,bottom) - center);
+                            features[3] += abs(sample(lines,fx-1,fy-1,w,top,bottom) +
+                                sample(lines,fx+1,fy+1,w,top,bottom) - center);
                             const int tx = clamp_int(fx,left,right-1) / 4;
                             const int ty = clamp_int(fy,top,bottom-1) / 4;
                             const uint8_t skip = tskip[(ptrdiff_t)ty * tskip_stride + tx];
@@ -110,10 +112,10 @@ int svt_av2_pcwiener_filter_y(const uint16_t* src, ptrdiff_t src_stride,
                     const int16_t* filter = filters[selector[pc_wiener_lut_to_class_index[lut]]];
                     for (int y = by;y < by + 4;++y) {
                         for (int x = bx;x < bx + 4;++x) {
-                            int32_t v = (128 + filter[12]) * sample(src,src_stride,x,y,w,h,top,bottom);
+                            int32_t v = (128 + filter[12]) * sample(lines,x,y,w,top,bottom);
                             for (int k = 0;k < 12;++k)
-                                v += filter[k] * (sample(src,src_stride,x+dx[k],y+dy[k],w,h,top,bottom) +
-                                    sample(src,src_stride,x-dx[k],y-dy[k],w,h,top,bottom));
+                                v += filter[k] * (sample(lines,x+dx[k],y+dy[k],w,top,bottom) +
+                                    sample(lines,x-dx[k],y-dy[k],w,top,bottom));
                             dst[(ptrdiff_t)y * dst_stride + x] = (uint16_t)clamp_int(round_signed(v,7u),0,max_sample);
                         }
                     }
@@ -123,4 +125,12 @@ int svt_av2_pcwiener_filter_y(const uint16_t* src, ptrdiff_t src_stride,
         top = bottom;
     }
     return 0;
+}
+
+int svt_av2_pcwiener_filter_y(const uint16_t* src, ptrdiff_t src_stride,
+    uint16_t* dst, ptrdiff_t dst_stride, uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t base_q_idx, const uint8_t* tskip,
+    ptrdiff_t tskip_stride) {
+    return svt_av2_pcwiener_filter_y_boundaries(src,src_stride,dst,dst_stride,width,height,
+        bit_depth,base_q_idx,tskip,tskip_stride,NULL);
 }

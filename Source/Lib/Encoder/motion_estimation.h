@@ -9,6 +9,10 @@ typedef struct SvtAv2MotionSearchResult {
     uint64_t sad;
     uint32_t candidates;
 } SvtAv2MotionSearchResult;
+/* Extend a successful integer search on high-residual blocks, within the
+ * projected Q3 predictor's +/-16 pixel range. */
+void svt_av2_motion_extend(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* reference,
+    const SvtAv2BlockView* block, SvtAv2MotionSearchResult* result);
 SvtAv2Error svt_av2_motion_estimate(const SvtAv2FrameBuffer* source,
     const SvtAv2FrameBuffer* reference, const SvtAv2BlockView* luma_block,
     SvtAv2MotionSearchResult* result);

@@ -68,6 +68,8 @@ extern "C" {
 /* Bit depth idc for 8-bit (spec Table 6.3). */
 #define SVT_AV2_FRAME_BIT_DEPTH_IDC_8 1u
 
+#define SVT_AV2_PC_WIENER_MASK_WORDS 34u /* 64 x 34 units at the largest supported size. */
+
 typedef struct SvtAv2FrameHeaderConfig {
     /* Frame dimensions (informational for M1; the decoder derives them from
      * the sequence header because frame_size_override_flag is 0). */
@@ -92,7 +94,7 @@ typedef struct SvtAv2FrameHeaderConfig {
     uint32_t multi_frame;
     uint32_t order_hint; /* eight-bit multi-frame order, ignored for still pictures */
     uint32_t reduced_tx_set; /* M2=2 forces DCT_DCT; M1 regression=0 */
-    uint32_t inter_frame;               /* M4 OBU_REGULAR_TILE_GROUP, DPB size 1 */
+    uint32_t inter_frame;               /* OBU_REGULAR_TILE_GROUP with one logical reference. */
     uint32_t bit_depth;
     uint32_t chroma_format;
     uint32_t m5_intra_modes; /* private selector, no frame header bits */
@@ -100,14 +102,54 @@ typedef struct SvtAv2FrameHeaderConfig {
     size_t partition_decision_count;
     uint32_t entropy_adaptation;
     uint32_t enable_mrls; /* Private sequence-matching selector, default off. */
+    uint32_t enable_cfl_intra; /* Experimental video sequence bit; not a frame-header bit. */
+    uint32_t enable_intra_ist; /* Sequence bit shared by KEY and P-intra. */
+    uint32_t enable_ibp;
+    int8_t uv_delta_q;
+    uint32_t qm_level;
+    uint32_t enable_intra_edge_filter; /* Sequence bit, still prediction tool. */
     uint32_t enable_mhccp; /* Optional filter0 multi-parameter chroma-from-luma syntax. */
     const SvtAv2Ccso64Plan* ccso64; /* Borrowed immutable 64-unit plan; NULL is oldoff. */
-    uint32_t enable_pc_wiener; /* Luma PC-Wiener, RU256. */
-    uint64_t pc_wiener_none_mask[2]; /* Up to 16x8 raster RUs: bit 1 selects NONE. */
+    uint32_t cdef_primary;
+    uint32_t enable_gdf, gdf_code; /* 1..16 = frame-wide KEY model/scale, zero = bypass. */
+    uint32_t enable_pc_wiener;
+    uint32_t pc_wiener_unit; /* Zero uses the original 256-pixel units. */
+    uint64_t pc_wiener_none_mask[SVT_AV2_PC_WIENER_MASK_WORDS];
     uint32_t deblock_y; /* bit0 vertical, bit1 horizontal. UV off. */
     int32_t deblock_delta; /* vertical, df_par_bits=2: -2..1, scale 8. */
     int32_t deblock_delta_h; /* horizontal, inherits V when not signaled. */
+    uint32_t mv_half; /* MV precision: 0=integer, 1=half, 2=quarter; P only. */
+    uint32_t sharp_filter; /* 1: fixed MULTITAP_SHARP in fractional P. */
+    uint32_t retain_reference; /* Single-slot P only: 1 leaves the slot intact. */
+    uint32_t dual_ref; /* 1: two physical DPB slots, as signaled by the sequence. */
+    uint32_t refresh_mask; /* Dual P only: bit n refreshes slot n. KEY infers both. */
+    uint32_t reference_slot; /* Dual P only: slot backing logical reference 0. */
+    uint32_t logical_ref_count; /* 0/1: legacy single; 2: explicit physical map [0,1]. */
+    uint32_t ref_distance[2]; /* Only estimator/writer state, not coded: 0/0=zero-MV gate. */
+    /* Non-NULL enables explicit logical primary rank 0 on adaptive P. The
+     * bank is the immutable, already-decayed end context of that reference. */
+    const struct SvtAv2EntropyModels* primary_models;
 } SvtAv2FrameHeaderConfig;
+
+/* The still selector keeps its legacy sequence syntax. The independent video
+ * flag reflects the first packet's sequence bit on every KEY/P tile. */
+static inline uint32_t svt_av2_frame_header_use_cfl(const SvtAv2FrameHeaderConfig* cfg) {
+    return cfg->m5_intra_modes == 4u || cfg->enable_cfl_intra == 1u;
+}
+
+/* Limit the new flag to the adaptive low-delay path: KEY seeds the bank, P
+ * starts from an inherited bank. Still callers leave the field zero. */
+static inline int svt_av2_frame_header_video_cfl_valid(const SvtAv2FrameHeaderConfig* cfg) {
+    if (!cfg->enable_cfl_intra) return 1;
+#if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
+    return cfg->enable_cfl_intra == 1u && cfg->multi_frame == 1u &&
+        cfg->m5_intra_modes == 1u && cfg->chroma_format == 1u && cfg->sb_shift == 4u &&
+        !cfg->enable_mhccp && !cfg->enable_mrls && cfg->entropy_adaptation == 1u &&
+        (!cfg->inter_frame || cfg->primary_models != NULL);
+#else
+    return 0;
+#endif
+}
 
 /* Superblock shift values for the three AV2 superblock sizes. */
 #define SVT_AV2_FRAME_SB_SHIFT_64  4u

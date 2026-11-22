@@ -12,7 +12,8 @@
 #    tests/CMakeLists.txt -> add test_transform, linking svt_av2_transform
 # =============================================================================
 add_library(svt_av2_transform STATIC
-    transform.c)
+    transform.c
+    intra_ist_transform.c)
 
 target_include_directories(svt_av2_transform
     PUBLIC

@@ -2,6 +2,7 @@
 #include "transform_path.h"
 #include "keyframe.h"
 #include "deblock_luma.h"
+#include "cdef_luma.h"
 #include "pc_wiener.h"
 #include "test_util.h"
 #include <stdlib.h>
@@ -49,7 +50,38 @@ static void save(const char* folder,const char* label,const char* suffix,const v
     if(fp){SVT_TEST_CHECK_EQ_INT(fwrite(data,1u,size,fp),size);fclose(fp);}
 }
 
-static void run(const char* folder,uint32_t w,uint32_t h,uint32_t bd,uint32_t adaptive,uint32_t mixed) {
+/* Reconstruct the same deblocked frame with chroma CCSO and four CDEF strengths.
+ * When a directory is supplied, export complete packets and raw reconstructions
+ * for byte comparison with the frozen AVM decoder. */
+static void check_cdef(Fixture* f, SvtAv2FrameHeaderConfig cfg, const char* folder) {
+    const size_t y_size = (size_t)f->recon.strides[0] * f->recon.visible_height;
+    const size_t capacity = 80u * 80u * 16u;
+    uint8_t* unfiltered = (uint8_t*)malloc(y_size);
+    uint8_t* packet = (uint8_t*)malloc(capacity);
+    uint8_t* raw = (uint8_t*)malloc(capacity);
+    if (!unfiltered || !packet || !raw) exit(2);
+    memcpy(unfiltered, f->recon.planes[0], y_size);
+    for (uint32_t primary = 1u; primary <= 8u; primary *= 2u) {
+        memcpy(f->recon.planes[0], unfiltered, y_size);
+        cfg.cdef_primary = primary;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_cdef_luma_apply(&f->recon, primary, NULL), 0);
+        if (primary == 8u) SVT_TEST_CHECK(memcmp(f->recon.planes[0], unfiltered, y_size) != 0);
+        size_t bytes = 0, raw_size = 0;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_encode_still_picture_ccso64_packet(&cfg, f->blocks, f->count,
+                                                                          packet, capacity, &bytes), 0);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_picture_export_raw(&f->recon, raw, capacity, &raw_size), 0);
+        if (folder) {
+            char label[64];
+            snprintf(label, sizeof(label), "cdef-b%u-primary%u", cfg.bit_depth, primary);
+            save(folder, label, "av2", packet, bytes);
+            save(folder, label, "yuv", raw, raw_size);
+        }
+    }
+    memcpy(f->recon.planes[0], unfiltered, y_size);
+    free(raw); free(packet); free(unfiltered);
+}
+
+static void run(const char* folder,uint32_t w,uint32_t h,uint32_t bd,uint32_t adaptive,uint32_t mixed,uint32_t ru,uint32_t cdef) {
     Fixture* f=(Fixture*)calloc(1u,sizeof(*f));SVT_TEST_CHECK(f!=NULL);if(!f)return;
     const uint32_t q=110u+(bd==10u?48u:0u),step=bd>8u?2u:1u;
     const size_t pixels=(size_t)w*h,sbs=(size_t)((w+63u)/64u)*((h+63u)/64u);
@@ -83,6 +115,7 @@ static void run(const char* folder,uint32_t w,uint32_t h,uint32_t bd,uint32_t ad
     for(size_t u=0;u<sbs;++u){flags[u][0]=(uint8_t)(u&1u);flags[u][1]=(uint8_t)((u/3u)&1u);}
     ccso.unit_flags=(const uint8_t (*)[2])flags;ccso.unit_count=sbs;cfg.ccso64=&ccso;
     SVT_TEST_CHECK_EQ_INT(svt_av2_ccso64_picture_validate(&ccso,&f->recon),0);svt_av2_ccso64_apply(&ccso,&f->recon);
+    if (w==80u && h==80u && adaptive) check_cdef(f,cfg,folder);
     uint16_t* src=(uint16_t*)malloc(pixels*sizeof(*src));uint16_t* dst=(uint16_t*)malloc(pixels*sizeof(*dst));
     uint8_t* skip=(uint8_t*)calloc(pixels/16u,1u);SVT_TEST_CHECK(src && dst && skip);if(!src || !dst || !skip)exit(2);
     for(size_t i=0;i<f->count;++i) {
@@ -91,16 +124,22 @@ static void run(const char* folder,uint32_t w,uint32_t h,uint32_t bd,uint32_t ad
         for(size_t j=0;j<n;++j)if(b->qcoeff[j]){zero=0u;break;}
         for(uint32_t y=b->y/4u;y<(b->y+b->height)/4u;++y)for(uint32_t x=b->x/4u;x<(b->x+b->width)/4u;++x)skip[(size_t)y*(w/4u)+x]=zero;
     }
+    uint16_t* deblocked=NULL;
+    if (cdef) {
+        cfg.cdef_primary=cdef;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_cdef_luma_apply(&f->recon,cdef,&deblocked),0);
+    }
     for(uint32_t y=0;y<h;++y)for(uint32_t x=0;x<w;++x)src[(size_t)y*w+x]=svt_av2_sample_load(f->recon.planes[0]+(size_t)y*f->recon.strides[0]+x*step,bd);
-    SVT_TEST_CHECK_EQ_INT(svt_av2_pcwiener_filter_y(src,w,dst,w,w,h,bd,q,skip,w/4u),0);
-    const uint32_t cols=SVT_AV2_MAX((w+128u)/256u,1u),rows=SVT_AV2_MAX((h+128u)/256u,1u);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_pcwiener_filter_y_boundaries(src,w,dst,w,w,h,bd,q,skip,w/4u,deblocked),0);
+    const uint32_t cols=SVT_AV2_MAX((w+ru/2u)/ru,1u),rows=SVT_AV2_MAX((h+ru/2u)/ru,1u);
+    cfg.pc_wiener_unit=ru;
     cfg.enable_pc_wiener=1u;
     for(uint32_t r=0;r<rows;++r)for(uint32_t c=0;c<cols;++c) {
         const uint32_t unit=r*cols+c;
         if(mixed && ((r+c)&1u)==0u && !(mixed==2u && unit==0u)) {
             cfg.pc_wiener_none_mask[unit/64u]|=UINT64_C(1)<<(unit&63u);
-            const uint32_t top=r?r*256u-8u:0u,bottom=r+1u==rows?h:(r+1u)*256u-8u;
-            const uint32_t left=c*256u,right=c+1u==cols?w:left+256u;
+            const uint32_t top=r?r*ru-8u:0u,bottom=r+1u==rows?h:(r+1u)*ru-8u;
+            const uint32_t left=c*ru,right=c+1u==cols?w:left+ru;
             for(uint32_t y=top;y<bottom;++y)memcpy(dst+(size_t)y*w+left,src+(size_t)y*w+left,(right-left)*sizeof(*dst));
         }
     }
@@ -115,16 +154,22 @@ static void run(const char* folder,uint32_t w,uint32_t h,uint32_t bd,uint32_t ad
     SVT_TEST_CHECK_EQ_INT(svt_av2_encode_still_picture_ccso64_packet(&cfg,f->blocks,f->count,packet,capacity,&bytes),0);
     SVT_TEST_CHECK_EQ_INT(svt_av2_picture_export_raw(&f->recon,raw,pixels*3u,&raw_size),0);
     char label[100];snprintf(label,sizeof(label),"w%u-h%u-b%u-a%u-m%u",w,h,bd,adaptive,mixed);
+    if(ru!=256u) snprintf(label+strlen(label),sizeof(label)-strlen(label),"-ru%u",ru);
+    if(cdef) snprintf(label+strlen(label),sizeof(label)-strlen(label),"-cdef%u",cdef);
     if(folder){save(folder,label,"av2",packet,bytes);save(folder,label,"yuv",raw,raw_size);}
     printf("UHD %s blocks=%zu sb=%zu ru=%u mask=%llu,%llu bytes=%zu\n",label,f->count,sbs,cols*rows,(unsigned long long)cfg.pc_wiener_none_mask[0],(unsigned long long)cfg.pc_wiener_none_mask[1],bytes);
-    free(packet);free(raw);free(flags);free(src);free(dst);free(skip);free(f->blocks);free(f->coeff);free(plan);
+    free(deblocked);free(packet);free(raw);free(flags);free(src);free(dst);free(skip);free(f->blocks);free(f->coeff);free(plan);
     svt_av2_recon_pool_free(&f->scratch);svt_av2_picture_free(&f->source);svt_av2_picture_free(&f->recon);free(f);
 }
 
 int main(int argc,char** argv) {
-    if(argc>2) {run(argv[1],4096u,2160u,10u,1u,2u);SVT_TEST_REPORT("test_uhd_max");}
+    if(argc>2) {run(argv[1],4096u,2160u,10u,1u,2u,256u,0u);SVT_TEST_REPORT("test_uhd_max");}
     static const uint32_t sizes[][2]={{80u,80u},{4096u,128u},{128u,2160u},{4096u,1152u}};
     for(size_t s=0;s<SVT_AV2_ARRAY_SIZE(sizes);++s)for(uint32_t bd=8u;bd<=10u;bd+=2u)
-        for(uint32_t adaptive=0u;adaptive<2u;++adaptive)run(argc>1?argv[1]:NULL,sizes[s][0],sizes[s][1],bd,adaptive,1u);
+        for(uint32_t adaptive=0u;adaptive<2u;++adaptive)run(argc>1?argv[1]:NULL,sizes[s][0],sizes[s][1],bd,adaptive,1u,256u,0u);
+    for(uint32_t ru=64u;ru<=128u;ru*=2u)
+        run(argc>1?argv[1]:NULL,1024u,1080u,10u,1u,1u,ru,0u);
+    for(uint32_t bd=8u;bd<=10u;bd+=2u)
+        run(argc>1?argv[1]:NULL,320u,144u,bd,1u,1u,64u,4u);
     SVT_TEST_REPORT("test_uhd");
 }

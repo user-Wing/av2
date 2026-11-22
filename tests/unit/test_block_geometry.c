@@ -826,7 +826,82 @@ static void test_mixed_plan_geometry(void) {
         }
     }
 }
+static void test_mixed_rect32_geometry(void) {
+    SvtAv2FrameGeometry geometry;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_frame_geometry_init_ex(&geometry, 64u, 64u, 64u,
+        SVT_AV2_CHROMA_420), SVT_AV2_ERROR_NONE);
+    const uint16_t plan = SVT_AV2_MIXED_RECT32_BASE + 5u + 6u * 7u + 1u * 49u + 4u * 343u;
+    static const uint32_t widths[] = {32u,16u,8u,32u}, heights[] = {16u,32u,8u,32u};
+    VisitLog log = {0};
+    log.abort_after = -1;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_partition_traverse_coded_plan(&geometry, &plan, 1u,
+        record_block, &log), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(log.count, 21u);
+    check_coverage(&geometry, &log);
+    for (uint32_t i = 0u; i < log.count; ++i) {
+        const VisitRecord* b = log.records + i;
+        const uint32_t quadrant = 2u * (b->y / 32u) + b->x / 32u;
+        SVT_TEST_CHECK_EQ_INT(b->w, widths[quadrant]);
+        SVT_TEST_CHECK_EQ_INT(b->h, heights[quadrant]);
+    }
+    SVT_TEST_CHECK_EQ_INT(svt_av2_partition_plan_validate_sb(&geometry, 0u,
+        SVT_AV2_MIXED_RECT32_BASE + SVT_AV2_MIXED_RECT32_COUNT), SVT_AV2_ERROR_INVALID_PARAMETER);
+}
+
+static void test_half_rect_geometry(void) {
+    SvtAv2FrameGeometry geometry;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_frame_geometry_init(&geometry, 64u, 64u, 64u), SVT_AV2_ERROR_NONE);
+    for (uint32_t variant = 0u; variant < 16u; ++variant) {
+        const uint16_t plan = (uint16_t)(SVT_AV2_HALF_RECT_BASE + variant * 343u + 4u + 7u * 5u + 49u * 6u);
+        VisitLog log = {0};
+        log.abort_after = -1;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_partition_traverse_coded_plan(&geometry, &plan, 1u,
+            record_block, &log), SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK_EQ_INT(log.count, 8u);
+        check_coverage(&geometry, &log);
+        for (uint32_t i = 0u; i < log.count; ++i) {
+            const VisitRecord* b = log.records + i;
+            const uint32_t q = 2u * (b->y / 32u) + b->x / 32u;
+            if (q == variant / 4u) {
+                const int vertical = (variant & 2u) != 0u;
+                const int keep = (((vertical ? b->x : b->y) % 32u) / 16u) == (variant & 1u);
+                SVT_TEST_CHECK_EQ_INT(b->w, keep && !vertical ? 32u : 16u);
+                SVT_TEST_CHECK_EQ_INT(b->h, keep && vertical ? 32u : 16u);
+            } else {
+                const uint32_t slot = q - (q > variant / 4u);
+                SVT_TEST_CHECK_EQ_INT(b->w, slot == 2u ? 16u : 32u);
+                SVT_TEST_CHECK_EQ_INT(b->h, slot == 1u ? 16u : 32u);
+            }
+        }
+    }
+}
+
+static void test_rect16_geometry(void) {
+    SvtAv2FrameGeometry geometry;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_frame_geometry_init(&geometry, 64u, 64u, 64u), SVT_AV2_ERROR_NONE);
+    for (uint32_t variant = 0u; variant < 32u; ++variant) {
+        const uint16_t plan = (uint16_t)(SVT_AV2_RECT16_BASE + variant * 343u + 4u * (1u + 7u + 49u));
+        VisitLog log = {0};
+        log.abort_after = -1;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_partition_traverse_coded_plan(&geometry, &plan, 1u,
+            record_block, &log), SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK_EQ_INT(log.count, 8u);
+        check_coverage(&geometry, &log);
+        for (uint32_t i = 0u; i < log.count; ++i) {
+            const VisitRecord* b = log.records + i;
+            const uint32_t q = 2u * (b->y / 32u) + b->x / 32u;
+            const uint32_t cell = 2u * (b->y % 32u / 16u) + b->x % 32u / 16u;
+            const int split = q == variant / 8u && cell == (variant / 2u) % 4u;
+            SVT_TEST_CHECK_EQ_INT(b->w, q != variant / 8u ? 32u : split && (variant & 1u) ? 8u : 16u);
+            SVT_TEST_CHECK_EQ_INT(b->h, q != variant / 8u ? 32u : split && !(variant & 1u) ? 8u : 16u);
+        }
+    }
+}
+
 int main(void) {
+    test_rect16_geometry();
+    test_half_rect_geometry();
+    test_mixed_rect32_geometry();
     test_mixed_plan_geometry();
     test_single_sb_traversal();
     test_content_selector();

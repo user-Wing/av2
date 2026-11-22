@@ -119,14 +119,16 @@ typedef struct SvtAv2EncoderConfig {
     uint32_t partition_selection; /* 0=fixed, 1=64/32, 2=64/32/16, 3=mixed 32/16/8 quadrants, 4=also 16x8/8x16, 5=also six larger rectangles, 6=also mixed 32-quadrant rectangles, 7=also mixed small rectangles, 8=also uniform 8x32/32x8, 9=also mixed thin rectangles, 10=also uniform 8x64/64x8 (2..10 require still + basic/directional + RD) */
     uint32_t rd_mode; /* M6 experimental: 0=off, 1=bounded exhaustive, 2=pruned, 3=fast still intra. */
     uint32_t coeff_optimization; /* Experimental: 0=off, 1=legacy tail RD, 2=bounded level/EOB RDOQ (still + basic/directional/CfL + RD). */
-    uint32_t motion_optimization; /* 0=off, 1=integer MV RD, 2=bounded wide RD; excludes coefficient RD. */
-    uint32_t entropy_adaptation; /* Frame-local CDF updates; RD combination requires still_picture, motion off and coeff 0/2. */
+    uint32_t motion_optimization; /* 0=off, 1=integer MV RD, 2=wide RD, 3=bilinear half-pel P, 4=sharp half-pel P, 5=sharp quarter-pel P (pruned RD, partition <= 1); excludes coefficient RD. */
+    /* Frame-local CDF updates. With RD: still picture (motion off, coeff 0/2),
+     * or low-delay P (pruned, intra/partition <= 1, coeff off). */
+    uint32_t entropy_adaptation;
     uint32_t still_picture; /* Single-picture header; exactly one input picture, All-Intra only. */
     uint32_t transform_selection; /* Appended: 0=DCT-only, 1=binary Y DCT/ADST_ADST, 2=full syntax four-type Y subset; still + basic/directional + RD. */
     uint32_t angle_search; /* Appended: nonzero Y deltas with inherited UV V/H; still + directional/CfL + RD. */
     uint32_t mrl_search; /* Appended: bounded square/rectangle Y multiple-reference-line RD, still + directional/CfL + RD. */
-    uint32_t tree_refinement; /* Appended: 1=refine best two basic trees, 2=also preserve seeds before long rectangles; with partition>=8, global four plus two before long and two before thin rectangles. */
-    uint32_t rd_lambda_model; /* Appended: 0=original, 1=AVM AI with compile-time scale, 2=AVM AI base x6/4; still + RD. */
+    uint32_t tree_refinement; /* Appended: 1=refine best two basic trees, 3=screen mixed8 still trees by quadrant, 2=also preserve seeds before long rectangles; with partition>=8, global four plus two before long and two before thin rectangles. */
+    uint32_t rd_lambda_model; /* Appended: 0=original, 1=AVM AI with compile-time scale, 2=AVM AI base x6/4; still RD or pruned low-delay P. */
     uint32_t cfl_search; /* Appended: 0=implicit only, 1=also bounded classic explicit alpha RD; still + cfl + RD. */
     uint32_t mhccp_search; /* Appended: 0=off, 1=also causal multi-hypothesis cross-component RD; still + cfl + RD. */
     uint32_t intra_joint; /* Appended: 0=off, 1=bounded Y mode/TX joint RD; still + directional/cfl + RD + full TX. */
@@ -214,6 +216,50 @@ typedef enum SvtAv2Parameter {
      * INVALID_STATE. Stored privately; get_config() retains its old layout.
      * Macro-off builds accept the hint but do not change encoding decisions. */
     SVT_AV2_PARAM_CONTENT_TYPE,
+    /* Experimental uint32_t parameters, stored privately (no config ABI change).
+     * Both require low-delay P, pruned RD and fixed/64-32 partitions.
+     * Skip search: 0=off (default), 1=try predictor-only inter. No coefficient RD.
+     * Refresh period: 1=every picture (default), or 2/4/8. Immediate-output P
+     * at a nonmultiple of the period leaves the single reference slot intact. */
+    SVT_AV2_PARAM_INTER_SKIP_SEARCH,
+    SVT_AV2_PARAM_INTER_REF_PERIOD,
+    /* Private int32_t QP override for the first KEY of a low-delay P stream.
+     * 0 inherits SVT_AV2_PARAM_QP (default); 1..255 override. Same native
+     * bit-depth offset as a regular QP. Not accepted for still/all-intra. */
+    SVT_AV2_PARAM_VIDEO_KEY_QP,
+    /* Private uint32_t: 0=off, 1=refine 32 to 16 on eligible quarter-pel P
+     * blocks. Requires adaptive partitions and cannot combine with skip RD. */
+    SVT_AV2_PARAM_INTER_FINE,
+    /* Experimental private uint32_t: 0=off, 2/4/8=long-slot refresh period.
+     * Slot 0 still refreshes every frame. Requires quarter-pel pruned LD P
+     * and the legacy single-slot refresh period to remain 1. */
+    SVT_AV2_PARAM_DUAL_REF_PERIOD,
+    /* Private uint32_t: 0=auto (default), 1=force last, 2=force long,
+     * 3=experimental block selection. Nonzero policies require DUAL_REF_PERIOD.
+     * Block mode supports inter fine under its adaptive partition requirement;
+     * explicit skip RD is unsupported. Two logical references are exposed
+     * only when LAST and LONG hold distinct previous pictures. */
+    SVT_AV2_PARAM_DUAL_REF_POLICY,
+    /* Private int32_t: 0=inherited, otherwise override QP of periodic P
+     * pictures refreshing the long slot. Requires DUAL_REF_PERIOD. First KEY
+     * uses VIDEO_KEY_QP (or the ordinary QP), never this option. */
+    SVT_AV2_PARAM_VIDEO_ANCHOR_QP,
+    /* Private uint32_t: 0=fixed (default), 1=adaptive long-slot refresh.
+     * Adaptive requires DUAL_REF_PERIOD=4 and DUAL_REF_POLICY=3 (block).
+     * VIDEO_ANCHOR_QP applies whenever the long slot is actually refreshed. */
+    SVT_AV2_PARAM_DUAL_REF_CADENCE,
+    /* Experimental private uint32_t: 0=off (default), 1=RD inter residual
+     * tail pruning. Requires quarter-pel pruned low-delay P with fixed 64
+     * or adaptive partitions, and is incompatible with explicit skip RD. */
+    SVT_AV2_PARAM_INTER_TAIL,
+    /* Experimental private uint32_t: 0=off (default), 1=inherit adaptive
+     * probabilities from logical reference rank 0 in low-delay P. */
+    SVT_AV2_PARAM_CDF_INHERIT,
+    /* Experimental private uint32_t: 0=off, 1=exact RD for a bounded DRL0
+     * predictor target on incumbent quarter-pel inter leaves. */
+    SVT_AV2_PARAM_INTER_NEAR,
+    /* Percent of the selected AVM RD lambda, 0=default or 50..250. */
+    SVT_AV2_PARAM_RD_LAMBDA_SCALE,
     SVT_AV2_PARAM_COUNT
 } SvtAv2Parameter;
 
@@ -258,6 +304,28 @@ SVT_AV2_API SvtAv2Error svt_av2_enc_get_packet_ex(SvtAv2Handle handle, SvtAv2Pac
 
 SVT_AV2_API SvtAv2Error svt_av2_enc_deinit(SvtAv2Handle* handle);
 SVT_AV2_API SvtAv2Error svt_av2_enc_get_rd_stats(SvtAv2Handle handle, SvtAv2RdStats* stats);
+/* Explicit inter-skip trials and accepted leaves of the last encoded frame. */
+SVT_AV2_API SvtAv2Error svt_av2_enc_get_inter_skip_stats(SvtAv2Handle handle,
+    uint64_t* trials, uint64_t* accepts);
+/* Full small-block RD trials and won superblocks of the last encoded frame. */
+SVT_AV2_API SvtAv2Error svt_av2_enc_get_inter_fine_stats(SvtAv2Handle handle,
+    uint64_t* trials, uint64_t* accepts);
+
+/* Block-policy diagnostics for the last successfully encoded frame. For other
+ * policies the fields are zero. The KEY has no logical references and an
+ * implicit refresh (mask 0 here). Distances use expanded display indices;
+ * rank_leaves counts only inter groups, and odd_mv_leaves counts groups with
+ * at least one odd eighth-luma MV component on the two-reference path. */
+typedef struct SvtAv2BlockRefStats {
+    uint32_t logical_ref_count;
+    uint32_t refresh_mask;
+    uint32_t ref_distance[2];
+    uint32_t rank_leaves[2];
+    uint32_t odd_mv_leaves[2];
+} SvtAv2BlockRefStats;
+
+SVT_AV2_API SvtAv2Error svt_av2_enc_get_block_ref_stats(SvtAv2Handle handle,
+    SvtAv2BlockRefStats* stats);
 
 /* --- reconstruction export (M2, T013) ------------------------------------- */
 

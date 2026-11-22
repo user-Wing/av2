@@ -13,6 +13,10 @@
 
 #include <string.h>
 
+#ifndef SVT_AV2_DCT_PACKED_FWD
+#define SVT_AV2_DCT_PACKED_FWD 1
+#endif
+
 /* --- kernel matrices ------------------------------------------------------- */
 
 /*
@@ -346,7 +350,8 @@ int32_t svt_av2_tx_round_shift(int64_t value, int bit) {
  * `add = (shift > 0) ? (1 << (shift - 1)) : 0` mirrors AVM, and the shift is an
  * arithmetic right shift. There is NO clamp in the forward direction.
  */
-void svt_av2_tx_fwd_1d(const int* src, int* dst, int shift, uint32_t size, uint32_t count) {
+static void tx_fwd_retained(const int* src, int* dst, int shift, uint32_t size,
+                            uint32_t count, uint32_t retained) {
     const int* matrix = dct2_matrix_for(size);
     const int add = (shift > 0) ? (1 << (shift - 1)) : 0;
     if (size == 4u) {
@@ -373,15 +378,19 @@ void svt_av2_tx_fwd_1d(const int* src, int* dst, int shift, uint32_t size, uint3
                 odd[k] = a - b;
                 even[k] = a + b;
             }
-            for (uint32_t freq = step; freq < size; freq += 2u * step) {
+            for (uint32_t freq = step; freq < retained; freq += 2u * step) {
                 int64_t sum = 0;
                 for (uint32_t k = 0; k < half; ++k)
                     sum += matrix[freq * size + k] * odd[k];
-                dst[i * size + freq] = (int)((sum + add) >> shift);
+                dst[i * retained + freq] = (int)((sum + add) >> shift);
             }
         }
-        dst[i * size] = (int)((matrix[0] * even[0] + add) >> shift);
+        dst[i * retained] = (int)((matrix[0] * even[0] + add) >> shift);
     }
+}
+
+void svt_av2_tx_fwd_1d(const int* src, int* dst, int shift, uint32_t size, uint32_t count) {
+    tx_fwd_retained(src, dst, shift, size, count, size);
 }
 
 /* Build mirrored output pairs from even and odd frequencies. The partial
@@ -782,10 +791,16 @@ SvtAv2TransformStatus svt_av2_fwd_transform(const int16_t* residual,
     return svt_av2_fwd_transform_bd(residual, coeff, width, height, 8);
 }
 
+#if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
+SvtAv2TransformStatus svt_av2_fwd_transform_dct64_bd(const int16_t* residual,
+                                            int32_t* coeff, uint32_t width,
+                                            uint32_t height, uint32_t bit_depth, int match_dct64) {
+#else
 SvtAv2TransformStatus svt_av2_fwd_transform_bd(const int16_t* residual,
                                             int32_t* coeff,
                                             uint32_t width,
                                             uint32_t height, uint32_t bit_depth) {
+#endif
     if (residual == NULL || coeff == NULL) {
         return SVT_AV2_TX_ERR_NULL;
     }
@@ -803,6 +818,41 @@ SvtAv2TransformStatus svt_av2_fwd_transform_bd(const int16_t* residual,
         }
         variation |= (unsigned)(residual[i] ^ residual[0]);
     }
+#if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
+    if (match_dct64 && variation && (width == 64u || height == 64u)) {
+        /* AVM 71b3f02: the decoder replicates each 32-point inverse sample
+         * along a 64-side. Project the residual onto that same basis by
+         * summing the pairs (not averaging). Keep the original TX shifts,
+         * normalization and 32-wide packed coefficient layout. */
+        const uint32_t dx = width == 64u ? 2u : 1u, dy = height == 64u ? 2u : 1u;
+        const uint32_t w = width / dx, h = height / dy;
+        int tmp[32u * 32u], vec[32u];
+        int first, second;
+        svt_av2_tx_fwd_shifts(width, height, &first, &second);
+        for (uint32_t x = 0u; x < w; ++x) {
+            for (uint32_t y = 0u; y < h; ++y) {
+                const int16_t* src = residual + (y * dy) * width + x * dx;
+                int sum = src[0];
+                if (dx == 2u) sum += src[1];
+                if (dy == 2u) {
+                    sum += src[width];
+                    if (dx == 2u) sum += src[width + 1u];
+                }
+                vec[y] = sum;
+            }
+            svt_av2_tx_fwd_1d(vec, tmp + x * h, first, h, 1u);
+        }
+        for (uint32_t y = 0u; y < h; ++y) {
+            for (uint32_t x = 0u; x < w; ++x) vec[x] = tmp[x * h + y];
+            svt_av2_tx_fwd_1d(vec, coeff + y * w, second, w, 1u);
+        }
+        if ((tx_log2(width) + tx_log2(height)) & 1)
+            for (uint32_t i = 0u; i < w * h; ++i)
+                coeff[i] = svt_av2_tx_round_shift((int64_t)coeff[i] * SVT_AV2_TX_NEW_SQRT2,
+                    SVT_AV2_TX_SQRT2_BITS);
+        return SVT_AV2_TX_OK;
+    }
+#endif
     if (!variation) {
         int vector[64], vertical[64], horizontal[64];
         int first, second;
@@ -828,6 +878,27 @@ SvtAv2TransformStatus svt_av2_fwd_transform_bd(const int16_t* residual,
         return SVT_AV2_TX_OK;
     }
 
+#if SVT_AV2_DCT_PACKED_FWD
+    /* The discarded frequencies of a 64-wide/tall transform never feed a
+     * retained frequency on the other axis. Still read all 64 spatial input
+     * samples; preserve each pass's exact sum and rounding. The first pass
+     * uses packed column stride, and the second writes the final raster
+     * directly. No out-of-band coefficients or copy-back scratch. */
+    const uint32_t cw = width > 32u ? 32u : width;
+    const uint32_t ch = height > 32u ? 32u : height;
+    int buf[64u * 32u], vec[64u];
+    int shift_1st = 0, shift_2nd = 0;
+    svt_av2_tx_fwd_shifts(width, height, &shift_1st, &shift_2nd);
+    for (uint32_t x = 0u; x < width; ++x) {
+        for (uint32_t y = 0u; y < height; ++y) vec[y] = residual[y * width + x];
+        tx_fwd_retained(vec, buf + x * ch, shift_1st, height, 1u, ch);
+    }
+    for (uint32_t fy = 0u; fy < ch; ++fy) {
+        for (uint32_t x = 0u; x < width; ++x) vec[x] = buf[x * ch + fy];
+        tx_fwd_retained(vec, coeff + fy * cw, shift_2nd, width, 1u, cw);
+    }
+    const size_t out_count = (size_t)cw * ch;
+#else
     int buf[SVT_AV2_TX_MAX_PELS];
     int out[SVT_AV2_TX_MAX_PELS];
     int coeff_buf[SVT_AV2_TX_MAX_PELS];
@@ -898,6 +969,7 @@ SvtAv2TransformStatus svt_av2_fwd_transform_bd(const int16_t* residual,
             coeff[i] = coeff_buf[i];
         }
     }
+#endif
     /* AVM applies odd-log2 sqrt2 normalization after packing, so every
      * carried coefficient of a 64-wide rectangle receives the same factor. */
     if ((tx_log2(width) + tx_log2(height)) & 1) {
@@ -907,3 +979,11 @@ SvtAv2TransformStatus svt_av2_fwd_transform_bd(const int16_t* residual,
     }
     return SVT_AV2_TX_OK;
 }
+
+#if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
+SvtAv2TransformStatus svt_av2_fwd_transform_bd(const int16_t* residual,
+                                             int32_t* coeff, uint32_t width,
+                                             uint32_t height, uint32_t bit_depth) {
+    return svt_av2_fwd_transform_dct64_bd(residual, coeff, width, height, bit_depth, 1);
+}
+#endif

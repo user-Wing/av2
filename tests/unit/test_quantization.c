@@ -1144,7 +1144,55 @@ static void test_peak_preflight_matches_original_block(void) {
                         }
 }
 
+static void test_qm12(void) {
+    SvtAv2QuantParams p;
+    int32_t coeff[16] = {0}, levels[16] = {0}, dq[16] = {0};
+    coeff[15] = -400;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, 8, 12, 0), SVT_AV2_QUANT_OK);
+    /* The last 4x4 inverse weight is 35 (Y), 47 (UV). Q100 step is 704. */
+    for (int plane = 0; plane < 3; ++plane) {
+        SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, coeff, levels, dq, 16, plane, 0), SVT_AV2_QUANT_OK);
+        SVT_TEST_CHECK_EQ_INT(levels[15], plane ? -3 : -4);
+        SVT_TEST_CHECK_EQ_INT(dq[15], plane ? -388 : -385);
+    }
+    SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, coeff, levels, dq, 15, 0, 0),
+        SVT_AV2_QUANT_ERR_UNSUPPORTED);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 64, 16, 8, 12, 0), SVT_AV2_QUANT_OK);
+    SvtAv2QuantParams packed;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&packed, 100, 32, 16, 8, 12, 0), SVT_AV2_QUANT_OK);
+    SVT_TEST_CHECK_EQ_INT(p.qm_offset, packed.qm_offset);
+    SVT_TEST_CHECK_EQ_INT(p.qm_size, 512);
+    for (unsigned depth = 8; depth <= 10; depth += 2) {
+        for (int level = 4; level <= 12; level += 4) {
+            SvtAv2QuantParams base, chroma;
+            SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&base, 100, 4, 4, depth, level, 0), SVT_AV2_QUANT_OK);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&chroma, 92, 4, 4, depth, level, 0), SVT_AV2_QUANT_OK);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, depth, level, -8), SVT_AV2_QUANT_OK);
+            for (int plane = 0; plane < 3; ++plane) {
+                const SvtAv2QuantParams* expected = plane ? &chroma : &base;
+                SVT_TEST_CHECK_EQ_INT(svt_av2_dequant_position(&p, -3, plane, 15),
+                    svt_av2_dequant_position(expected, -3, plane, 15));
+            }
+        }
+    }
+    SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, 8, 5, 0), SVT_AV2_QUANT_ERR_UNSUPPORTED);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, 8, 4, -24), SVT_AV2_QUANT_ERR_UNSUPPORTED);
+}
+
 int main(void) {
+    {
+        SvtAv2QuantParams p;
+        int32_t c[16] = {48, -48}, q[16], dq[16];
+        SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, 8, 0, 0), SVT_AV2_QUANT_OK);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, c, q, dq, 16, 0, 0), SVT_AV2_QUANT_OK);
+        SVT_TEST_CHECK_EQ_INT(q[0], 0);
+        p.avm_fp_round = 1;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, c, q, dq, 16, 0, 0), SVT_AV2_QUANT_OK);
+        SVT_TEST_CHECK_EQ_INT(q[0], 1);
+        SVT_TEST_CHECK_EQ_INT(q[1], -1);
+        SVT_TEST_CHECK_EQ_INT(dq[1], -88);
+    }
+    test_qm12();
     test_peak_preflight_matches_original_block();
     test_all_cqp_values();
     test_decoder_mask_sign_and_clip();

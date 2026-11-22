@@ -426,7 +426,7 @@ SvtAv2Error svt_av2_intra_basic_predict(const SvtAv2FrameBuffer* recon,
 }
 
 /* Fixed AVM v1 reconintra.h IDIF, 7-bit coefficients. Nonzero deltas use the
- * frozen derivative table below; edge filtering/MRLS/IBP stay disabled. */
+ * frozen derivative table below. */
 static const int16_t intra_direction_filter[32][4] = {
   { 0, 128, 0, 0 },     { -2, 127, 4, -1 },   { -3, 125, 8, -2 },
   { -5, 123, 13, -3 },  { -6, 121, 17, -4 },  { -7, 118, 22, -5 },
@@ -453,9 +453,65 @@ static const uint16_t intra_direction_derivative[90] = {
     10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
 };
 
-SvtAv2Error svt_av2_intra_directional_predict(const SvtAv2FrameBuffer* recon,
+/* AV2 7.13.2.17. Missing thresholds exceed all valid directional deltas. */
+static uint32_t edge_filter_strength(uint32_t size_sum, int delta, uint32_t filter_type) {
+    static const int normal[5][3] = {{56,256,256},{40,256,256},{8,16,32},{1,4,32},{1,1,1}};
+    static const int smooth[4][3] = {{40,64,256},{20,48,256},{4,4,4},{1,1,1}};
+    const int* thresholds = filter_type == 2u ?
+        smooth[size_sum <= 8u ? 0 : size_sum <= 16u ? 1 : size_sum <= 24u ? 2 : 3] :
+        normal[size_sum <= 8u ? 0 : size_sum <= 16u ? 1 : size_sum <= 24u ? 2 : size_sum <= 32u ? 3 : 4];
+    if (delta < 0) delta = -delta;
+    return (uint32_t)((delta >= thresholds[0]) + (delta >= thresholds[1]) + (delta >= thresholds[2]));
+}
+
+/* AV2 7.13.2.18. Filter from an immutable edge including the corner. */
+static void filter_direction_edge(uint16_t* edge, uint32_t length, uint32_t strength) {
+    if (!strength) return;
+    static const uint8_t taps[3][5] = {{0,4,8,4,0},{0,5,6,5,0},{2,4,4,4,2}};
+    uint16_t input[129];
+    memcpy(input, edge, length * sizeof(*input));
+    for (uint32_t i = 1u; i < length; ++i) {
+        uint32_t sum = 8u;
+        for (int k = 0; k < 5; ++k) {
+            const uint32_t j = (uint32_t)SVT_AV2_MAX(0, (int)i + k - 2);
+            sum += taps[strength - 1u][k] * (uint32_t)input[SVT_AV2_MIN(j, length - 1u)];
+        }
+        edge[i] = (uint16_t)(sum >> 4);
+    }
+}
+
+/* AV2 DC intra bi-prediction weights, indexed by log2(edge)-2. In the
+ * corner shared by both strips the longer edge takes precedence. */
+void svt_av2_intra_ibp_dc(const SvtAv2FrameBuffer* recon, const SvtAv2IntraBlock* b,
+    uint8_t* dst, uint32_t stride) {
+    static const uint8_t weights[5][16] = {
+        {96}, {86,107}, {77,90,102,115}, {71,78,86,92,100,107,114,121},
+        {68,72,76,79,83,87,90,94,98,102,106,109,113,117,121,124}
+    };
+    if ((b->w == 4u && b->h == 4u) || (!b->x && !b->y)) return;
+    const uint32_t bd = recon->bit_depth, step = bd > 8u ? 2u : 1u;
+    const uint32_t pitch = recon->strides[b->plane];
+    const uint8_t* origin = recon->planes[b->plane] + (size_t)b->y * pitch + b->x * step;
+    const int dc = svt_av2_sample_load(dst, bd);
+    const uint8_t* top = weights[floor_log2_u32(b->h) - 2u];
+    const uint8_t* left = weights[floor_log2_u32(b->w) - 2u];
+    for (uint32_t y = 0; y < b->h; ++y) {
+        for (uint32_t x = 0; x < b->w; ++x) {
+            int w, ref;
+            if (b->y && y < b->h / 4u && (!b->x || b->w >= b->h || x >= b->w / 4u)) {
+                w = top[y]; ref = svt_av2_sample_load(origin - pitch + x * step, bd);
+            } else if (b->x && x < b->w / 4u) {
+                w = left[x]; ref = svt_av2_sample_load(origin + (size_t)y * pitch - step, bd);
+            } else continue;
+            svt_av2_sample_store(dst + (size_t)y * stride + x * step, bd,
+                (uint16_t)((ref * (128 - w) + dc * w + 64) >> 7));
+        }
+    }
+}
+
+SvtAv2Error svt_av2_intra_directional_predict_tools(const SvtAv2FrameBuffer* recon,
     const SvtAv2IntraBlock* block, uint32_t mode, uint32_t top_right,
-    uint32_t bottom_left, uint8_t* dst, uint32_t stride) {
+    uint32_t bottom_left, uint32_t top_filter, uint32_t left_filter, int ibp, uint8_t* dst, uint32_t stride) {
     if (recon == NULL || block == NULL || dst == NULL || mode < 8u || mode > 61u ||
         block->plane > 2u ||
         (block->w != block->h && !((block->w == 4u && block->h == 8u) ||
@@ -525,6 +581,26 @@ SvtAv2Error svt_av2_intra_directional_predict(const SvtAv2FrameBuffer* recon,
     else if ((block->w == 2u * block->h && angle > 209) ||
         (block->w == 4u * block->h && angle > 197) ||
         (block->w == 8u * block->h && angle > 188)) angle -= 180;
+    ibp = ibp && (block->w != 4u || block->h != 4u);
+    if (top_filter && angle != 90 && angle != 180) {
+        const uint32_t size_sum = block->w + block->h;
+        if ((ibp || (angle > 90 && angle < 180)) && size_sum >= 24u) {
+            corner = (uint16_t)((5u * left[0] + 6u * corner + 5u * above[0] + 8u) >> 4);
+            above[-2] = above[-1] = left[-2] = left[-1] = corner;
+        }
+        if ((ibp || angle < 180) && block->y) {
+            const uint32_t n = angle < 90 || (ibp && angle > 180) ? size_sum : block->w;
+            const int delta = ibp && angle > 180 ? angle - 270 : angle - 90;
+            filter_direction_edge(above - 1, n + 1u, edge_filter_strength(size_sum, delta, top_filter));
+            above[n] = above[n + 1u] = above[n - 1u];
+        }
+        if ((ibp || angle > 90) && block->x) {
+            const uint32_t n = angle > 180 || (ibp && angle < 90) ? size_sum : block->h;
+            const int delta = ibp && angle < 90 ? angle : angle - 180;
+            filter_direction_edge(left - 1, n + 1u, edge_filter_strength(size_sum, delta, left_filter));
+            left[n] = left[n + 1u] = left[n - 1u];
+        }
+    }
     if (angle > 90 && angle < 180) {
         above[block->w] = above[block->w - 1u];
         left[block->h] = left[block->h - 1u];
@@ -533,6 +609,13 @@ SvtAv2Error svt_av2_intra_directional_predict(const SvtAv2FrameBuffer* recon,
         angle < 180 ? intra_direction_derivative[180 - angle] : 1u;
     const uint32_t dy = angle > 180 ? intra_direction_derivative[270 - angle] :
         angle > 90 ? intra_direction_derivative[angle - 90] : 1u;
+    const int folded = angle < 90 ? angle : 270 - angle;
+    const int delta = svt_av2_intra_mode_angle(mode) - svt_av2_intra_mode_angle(svt_av2_intra_mode_base(mode));
+    const int blend = ibp && !block->plane &&
+        (angle < 90 || angle > 180) && delta % 2 == 0 && (folded <= 36 || folded == 39 ||
+        folded == 45 || folded == 51 || folded == 61 || folded == 67 || folded == 73 || folded == 84);
+    const int second_step = blend ? intra_direction_derivative[90 - folded] : 0;
+    const int weight_step = blend ? intra_direction_derivative[90 - SVT_AV2_MAX(39, folded)] : 0;
     for (uint32_t y = 0u; y < block->h; ++y) {
         for (uint32_t x = 0u; x < block->w; ++x) {
             int32_t position;
@@ -564,10 +647,45 @@ SvtAv2Error svt_av2_intra_directional_predict(const SvtAv2FrameBuffer* recon,
                 }
                 value = SVT_AV2_MAX(0, SVT_AV2_MIN(value, (int32_t)limit));
             }
+            if (blend) {
+                const int zone1 = angle < 90;
+                const uint32_t row = zone1 ? y : x, col = zone1 ? x : y;
+                const uint32_t pos = 64u * row + (col + 1u) * second_step;
+                const uint16_t* side = zone1 ? left : above;
+                const int idx = (int)(pos >> 6);
+                int second = side[max];
+                if (idx <= (int)max) {
+                    const int16_t* taps = intra_direction_filter[(pos & 63u) >> 1];
+                    int sum = 0;
+                    for (int t = 0; t < 4; ++t) sum += taps[t] * side[idx + t - 1];
+                    second = SVT_AV2_MAX(0, SVT_AV2_MIN((int)limit, intra_round2(sum, 7u)));
+                }
+                const uint32_t r = row >> ((zone1 ? block->h : block->w) >> 5);
+                const uint32_t c = col >> ((zone1 ? block->w : block->h) >> 5);
+                const uint32_t distance = (c + 1u) * weight_step;
+                uint32_t shift;
+                const uint32_t div = resolve_divisor_u32(((r + 1u) << 6) + distance, &shift);
+                const int w = (int)round2_u32(distance * div, shift - SVT_AV2_DIV_LUT_BITS);
+                value = (value * w + second * (128 - w) + 64) >> 7;
+            }
             svt_av2_sample_store(dst + (size_t)y * stride + x * step, recon->bit_depth, (uint16_t)value);
         }
     }
     return SVT_AV2_ERROR_NONE;
+}
+
+SvtAv2Error svt_av2_intra_directional_predict_filtered(const SvtAv2FrameBuffer* recon,
+    const SvtAv2IntraBlock* block, uint32_t mode, uint32_t top_right,
+    uint32_t bottom_left, uint32_t filter_type, uint8_t* dst, uint32_t stride) {
+    return svt_av2_intra_directional_predict_tools(recon, block, mode, top_right, bottom_left,
+        filter_type, filter_type, 0, dst, stride);
+}
+
+SvtAv2Error svt_av2_intra_directional_predict(const SvtAv2FrameBuffer* recon,
+    const SvtAv2IntraBlock* block, uint32_t mode, uint32_t top_right,
+    uint32_t bottom_left, uint8_t* dst, uint32_t stride) {
+    return svt_av2_intra_directional_predict_filtered(recon, block, mode, top_right,
+        bottom_left, 0u, dst, stride);
 }
 
 /* AV2 CfL uses the neighbouring luma DC, not the current block mean. */

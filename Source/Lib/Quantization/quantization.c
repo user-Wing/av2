@@ -6,6 +6,8 @@
  * frozen scope and the specification/AVM anchors.
  */
 #include "quantization_internal.h"
+#include "qm12_data.h"
+#include "qm_search_data.h"
 
 #include <string.h>
 
@@ -43,6 +45,26 @@ static int quant_avx2_supported(void) {
  */
 #define SVT_AV2_QUANT_TABLE_BITS 3
 #define SVT_AV2_QUANT_FP_BITS 4
+/* Rounded 32 * 32 / inverse weight, shared by all native matrix levels. */
+static const uint16_t qm_reciprocal[256] = {
+    0, 1024, 512, 341, 256, 205, 171, 146, 128, 114, 102, 93, 85, 79, 73, 68,
+    64, 60, 57, 54, 51, 49, 47, 45, 43, 41, 39, 38, 37, 35, 34, 33,
+    32, 31, 30, 29, 28, 28, 27, 26, 26, 25, 24, 24, 23, 23, 22, 22,
+    21, 21, 20, 20, 20, 19, 19, 19, 18, 18, 18, 17, 17, 17, 17, 16,
+    16, 16, 16, 15, 15, 15, 15, 14, 14, 14, 14, 14, 13, 13, 13, 13,
+    13, 13, 12, 12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11,
+    11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 9, 9, 9, 9,
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+};
+
 #define SVT_AV2_AVM_QM_BITS 5
 
 /*
@@ -242,24 +264,48 @@ SvtAv2QuantStatus svt_av2_quant_params_init_tx_bd(SvtAv2QuantParams* params,
 
 /* --- dequantization -------------------------------------------------------- */
 
-int32_t svt_av2_dequant_coeff(const SvtAv2QuantParams* params, int32_t qcoeff, int plane, int pos_is_dc) {
+SvtAv2QuantStatus svt_av2_quant_params_init_matrix(SvtAv2QuantParams* params,
+    uint32_t qindex, uint32_t width, uint32_t height, uint32_t depth, int qm_level, int uv_delta_q) {
+    const SvtAv2QuantStatus status = svt_av2_quant_params_init_tx_bd(params, qindex, width, height, depth);
+    if (status != SVT_AV2_QUANT_OK) return status;
+    if (uv_delta_q) {
+        if (uv_delta_q < -23 || uv_delta_q > 8) return SVT_AV2_QUANT_ERR_UNSUPPORTED;
+        const int32_t q = svt_av2_quant_q_for((int)qindex, uv_delta_q, params->bit_depth);
+        for (unsigned p = 1u; p < 3u; ++p) params->plane[p].ac = params->plane[p].dc = q;
+    }
+    if (!qm_level) return SVT_AV2_QUANT_OK;
+    if (width < 4u || height < 4u || width > 64u || height > 64u ||
+        (width & (width - 1u)) || (height & (height - 1u))) return SVT_AV2_QUANT_ERR_UNSUPPORTED;
+    const uint32_t w = width < 32u ? width : 32u, h = height < 32u ? height : 32u;
+    const unsigned col = (w >= 8u) + (w >= 16u) + (w >= 32u);
+    const unsigned row = (h >= 8u) + (h >= 16u) + (h >= 32u);
+    if (qm_level != 4 && qm_level != 8 && qm_level != 12) return SVT_AV2_QUANT_ERR_UNSUPPORTED;
+    params->inverse_matrix = qm_level == 4 ? qm4_inverse : qm_level == 8 ? qm8_inverse : qm12_inverse;
+    params->qm_offset = qm12_offsets[col][row];
+    params->qm_size = (uint16_t)(w * h);
+    return SVT_AV2_QUANT_OK;
+}
+
+int32_t svt_av2_dequant_position(const SvtAv2QuantParams* params, int32_t qcoeff, int plane, size_t pos) {
     if (params == NULL || plane < 0 || plane > 2) {
         return 0;
     }
-    const int32_t dequant = pos_is_dc ? params->plane[plane].dc : params->plane[plane].ac;
-    /*
-     * No qmatrix in the frozen stream (using_qmatrix = 0). The AVM decoder still
-     * assigns qm level 15 and a NULL iqmatrix in that case
-     * (decodeframe.c setup_qm_params/setup_quant_matrices), and get_dqv() with a
-     * NULL iqmatrix is exactly `dequant[!!coeff_idx]`. So the no-qmatrix branch
-     * here is the decoder's actual behaviour, not a simplification.
-     */
+    int32_t dequant = pos == 0u ? params->plane[plane].dc : params->plane[plane].ac;
+    if (params->qm_size) {
+        if (pos >= params->qm_size) return 0;
+        const int weight = params->inverse_matrix[plane != 0][params->qm_offset + pos];
+        dequant = (weight * dequant + 16) >> SVT_AV2_AVM_QM_BITS;
+    }
     /* The decoder reads a magnitude, masks the product to 24 bits, rounds,
      * shifts and only then applies the sign (fixed v1 decodetxb.c:919-928). */
     const int64_t magnitude = qcoeff < 0 ? -(int64_t)qcoeff : qcoeff;
     const int64_t dq_coeff_hp = (magnitude * dequant) & 0xffffff;
     const int32_t magnitude_dq = svt_av2_round_power_of_two(dq_coeff_hp, SVT_AV2_QUANT_TABLE_BITS) >> params->tx_scale;
     return qcoeff < 0 ? -magnitude_dq : magnitude_dq;
+}
+
+int32_t svt_av2_dequant_coeff(const SvtAv2QuantParams* params, int32_t qcoeff, int plane, int pos_is_dc) {
+    return svt_av2_dequant_position(params, qcoeff, plane, pos_is_dc ? 0u : 1u);
 }
 
 SvtAv2QuantStatus svt_av2_dequantize_block(const SvtAv2QuantParams* params,
@@ -270,14 +316,14 @@ SvtAv2QuantStatus svt_av2_dequantize_block(const SvtAv2QuantParams* params,
     if (params == NULL || qcoeff == NULL || dqcoeff == NULL) {
         return SVT_AV2_QUANT_ERR_NULL;
     }
-    if (plane < 0 || plane > 2 || count == 0) {
+    if (plane < 0 || plane > 2 || count == 0 || (params->qm_size && count != params->qm_size)) {
         return SVT_AV2_QUANT_ERR_UNSUPPORTED;
     }
     const int32_t min_value = svt_av2_dequant_clip_min(params->bit_depth);
     const int32_t max_value = svt_av2_dequant_clip_max(params->bit_depth);
 
     for (size_t i = 0; i < count; ++i) {
-        int32_t dq = svt_av2_dequant_coeff(params, qcoeff[i], plane, i == 0);
+        int32_t dq = svt_av2_dequant_position(params, qcoeff[i], plane, i);
         /* decodetxb.c: tcoeffs[pos] = clamp(dq_coeff, min_value, max_value). */
         if (dq < min_value) {
             dq = min_value;
@@ -358,8 +404,9 @@ SvtAv2QuantStatus svt_av2_quant_build_coeffs(const SvtAv2QuantParams* params,
     memset(coeffs, 0, sizeof(*coeffs));
     coeffs->dequant_QTX[0] = dc;
     coeffs->dequant_QTX[1] = ac;
-    coeffs->round_QTX[0] = svt_av2_quant_round(dc);
-    coeffs->round_QTX[1] = svt_av2_quant_round(ac);
+    /* AVM round_fp_QTX is half a step at every non-lossless qindex. */
+    coeffs->round_QTX[0] = params->avm_fp_round ? dc >> (1 + SVT_AV2_QUANT_TABLE_BITS) : svt_av2_quant_round(dc);
+    coeffs->round_QTX[1] = params->avm_fp_round ? ac >> (1 + SVT_AV2_QUANT_TABLE_BITS) : svt_av2_quant_round(ac);
     coeffs->quant_fp_QTX[0] = svt_av2_quant_fp(dc);
     coeffs->quant_fp_QTX[1] = svt_av2_quant_fp(ac);
     coeffs->deadzone_QTX[0] = svt_av2_quant_deadzone(dc, log_scale);
@@ -463,7 +510,7 @@ static SvtAv2QuantStatus quantize_block_impl(const SvtAv2QuantParams* params,
     if (qcoeff == dqcoeff) {
         return SVT_AV2_QUANT_ERR_UNSUPPORTED;
     }
-    if (plane < 0 || plane > 2 || count == 0) {
+    if (plane < 0 || plane > 2 || count == 0 || (params->qm_size && count != params->qm_size)) {
         return SVT_AV2_QUANT_ERR_UNSUPPORTED;
     }
 
@@ -471,6 +518,27 @@ static SvtAv2QuantStatus quantize_block_impl(const SvtAv2QuantParams* params,
     SvtAv2QuantStatus status = svt_av2_quant_build_coeffs(params, log_scale, plane, &coeffs);
     if (status != SVT_AV2_QUANT_OK) {
         return status;
+    }
+
+    if (params->qm_size) {
+        int32_t levels[1024];
+        const uint8_t* inverse = params->inverse_matrix[plane != 0] + params->qm_offset;
+        for (size_t i = 0u; i < count; ++i) {
+            const int idx = i != 0u;
+            const int weight = qm_reciprocal[inverse[i]];
+            const int64_t mag = coeff[i] < 0 ? -(int64_t)coeff[i] : coeff[i];
+            int64_t level = 0;
+            if ((mag * weight << SVT_AV2_QUANT_TABLE_BITS) >=
+                ((int64_t)coeffs.dequant_QTX[idx] << (SVT_AV2_AVM_QM_BITS - 1 - log_scale))) {
+                const int32_t round = svt_av2_round_power_of_two(coeffs.round_QTX[idx], log_scale);
+                level = ((mag + round) * coeffs.quant_fp_QTX[idx] * weight) >>
+                    (coeffs.shift + SVT_AV2_AVM_QM_BITS);
+                if (level > coeffs.max_level) return SVT_AV2_QUANT_ERR_LEVEL_OVERFLOW;
+            }
+            levels[i] = coeff[i] < 0 ? -(int32_t)level : (int32_t)level;
+        }
+        memcpy(qcoeff, levels, count * sizeof(*levels));
+        return svt_av2_dequantize_block(params, qcoeff, dqcoeff, count, plane);
     }
 
     /*

@@ -8,6 +8,13 @@ int svt_av2_entropy_models_init(SvtAv2EntropyModels* models, uint32_t qctx) {
     return 0;
 }
 
+void svt_av2_entropy_models_decay(SvtAv2EntropyModels* models) {
+    for (uint32_t id = 0u; id < SVT_AV2_MODEL_COUNT; ++id) {
+        uint16_t* count = &models->cdf[id][svt_av2_model_nsyms[id]];
+        *count = (uint16_t)((3u * *count) >> 2);
+    }
+}
+
 int svt_av2_entropy_model_update(uint16_t* cdf, uint32_t nsyms, uint32_t symbol) {
     if (cdf == NULL) return SVT_AV2_ENTROPY_ERROR_NULL;
     if (nsyms < 2u || nsyms > 8u || symbol >= nsyms || cdf[nsyms] > 32u)

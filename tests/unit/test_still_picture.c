@@ -38,7 +38,7 @@ int main(void) {
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_STILL_PICTURE, &invalid), SVT_AV2_ERROR_INVALID_PARAMETER);
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_ANGLE_SEARCH, &invalid), SVT_AV2_ERROR_INVALID_PARAMETER);
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_MRL_SEARCH, &invalid), SVT_AV2_ERROR_INVALID_PARAMETER);
-    const uint32_t invalid_tree = 3u;
+    const uint32_t invalid_tree = 4u;
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_TREE_REFINEMENT, &invalid_tree), SVT_AV2_ERROR_INVALID_PARAMETER);
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(h), SVT_AV2_ERROR_NONE);
     uint8_t source[6144], stream[65536];
@@ -100,6 +100,18 @@ int main(void) {
         SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(h), still && rd ? SVT_AV2_ERROR_NONE : SVT_AV2_ERROR_INVALID_PARAMETER);
         SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&h), SVT_AV2_ERROR_NONE);
     }
+
+    h = configure(0u, 0u, 2u);
+    const uint32_t scales[] = {49u, 50u, 100u, 250u, 251u};
+    for (unsigned i = 0u; i < 5u; ++i)
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_RD_LAMBDA_SCALE, &scales[i]),
+            i == 0u || i == 4u ? SVT_AV2_ERROR_INVALID_PARAMETER : SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(h), SVT_AV2_ERROR_INVALID_PARAMETER);
+    const SvtAv2PredictionStructure low_delay = SVT_AV2_PRED_LOW_DELAY_P;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_PREDICTION_STRUCTURE, &low_delay), 0);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_RD_LAMBDA_MODEL, &primary), 0);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(h), 0);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&h), 0);
 
     h = configure(1u, 0u, 0u);
     const SvtAv2PredictionStructure inter = SVT_AV2_PRED_LOW_DELAY_P;
@@ -167,6 +179,23 @@ int main(void) {
         SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_TRANSFORM_SELECTION, &primary), 0);
         SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_TRANSFORM_SELECTION, &invalid_tx), SVT_AV2_ERROR_INVALID_PARAMETER);
         SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(h), SVT_AV2_ERROR_INVALID_PARAMETER);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&h), 0);
+    }
+    const uint32_t screen = 3u, rdoq = 2u;
+    for (uint32_t enabled = 0u; enabled <= 1u; ++enabled) {
+        h = configure(1u, 4u, 3u);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_PARTITION_SELECTION, &mixed8), 0);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_TREE_REFINEMENT, &screen), 0);
+        if (enabled) {
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_set_parameter(h, SVT_AV2_PARAM_COEFF_OPTIMIZATION, &rdoq), 0);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(h), 0);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture(h, &picture), 0);
+            SvtAv2Packet result = {stream, sizeof(stream), 0u, 0};
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_packet_ex(h, &result), 0);
+            SVT_TEST_CHECK(result.size > 0u);
+        } else {
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(h), SVT_AV2_ERROR_INVALID_PARAMETER);
+        }
         SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&h), 0);
     }
     /* Fresh single-picture handles, including the 1/2/3/17/1000 checkpoints.

@@ -88,6 +88,7 @@ typedef struct SvtAv2TileCoeffBlock {
      * with zero-plane magnitude bits zero and joint_sign=3*signU+signV-1. */
     uint8_t cfl_explicit, cfl_alpha_idx, cfl_alpha_signs;
     uint8_t mhccp; /* UV mode14: 0=old CfL, 1..3=MHCCP shared direction+1. */
+    uint8_t ist; /* Luma intra secondary transform, 0 or 1 + 3 * set + kernel. */
 } SvtAv2TileCoeffBlock;
 
 /* M6 rate session. One frame, raster SB order. Trials share the actual tile
@@ -102,10 +103,42 @@ typedef struct SvtAv2TileRateSession SvtAv2TileRateSession;
 int svt_av2_tile_rate_create(const SvtAv2FrameHeaderConfig* cfg,
                              SvtAv2TileRateSession** session);
 void svt_av2_tile_rate_free(SvtAv2TileRateSession* session);
+/* Raw end bank, before frame-boundary count decay; only after all commits. */
+int svt_av2_tile_rate_end_models(const SvtAv2TileRateSession* session,
+    struct SvtAv2EntropyModels* models);
+/* Writes a normal adaptive video tile; end bank is untouched on failure. */
+int svt_av2_tile_writer_write_video_models(const SvtAv2FrameHeaderConfig* cfg,
+    const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count,
+    uint8_t* out, size_t out_cap, size_t* out_size, struct SvtAv2EntropyModels* end_models);
+/* Inter sessions; committed raster prefix plus optional earlier leaves from
+ * a single uncommitted candidate, with no CDF writes. */
+int svt_av2_tile_rate_motion_predict(const SvtAv2TileRateSession* session,
+    const SvtAv2BlockView* block, uint32_t rank, const SvtAv2MotionPrefix* prefix,
+    int32_t* mv_x, int32_t* mv_y);
 int svt_av2_tile_rate_trial(SvtAv2TileRateSession* session, size_t sb_index,
     uint16_t partition, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
     const SvtAv2TileBlockMode* modes, size_t mode_count, int commit,
     uint64_t* rate_q12);
+
+/* Scratch-only exact rates for the four 32x32 leaves of a complete P SB
+ * (decision 1). A commit makes the cache stale until another begin. Keep the
+ * session alive while issuing trials; do not use it concurrently. Bits 0..3
+ * select paths in coding order. Within a begin, each lower-bit prefix of a
+ * successful trial identifies identical syntax inputs (including coeff values
+ * and resolved MVs) in all later trials. Inputs are otherwise borrowed only
+ * for the call. A failed trial publishes no new cache prefix. Never commits. */
+typedef struct SvtAv2TileInterRateCache SvtAv2TileInterRateCache;
+int svt_av2_tile_inter_rate_cache_create(SvtAv2TileInterRateCache** cache);
+void svt_av2_tile_inter_rate_cache_free(SvtAv2TileInterRateCache* cache);
+int svt_av2_tile_inter_rate_cache_begin(SvtAv2TileInterRateCache* cache,
+    SvtAv2TileRateSession* session, size_t sb_index);
+int svt_av2_tile_inter_rate_cache_trial(SvtAv2TileInterRateCache* cache, uint32_t ordinal,
+    const SvtAv2TileCoeffBlock blocks[12], const SvtAv2TileBlockMode modes[4], uint64_t* rate_q12);
+/* Cumulative successful leaf and partition-event writes, including work done
+ * before a later error. Output fields are optional. */
+void svt_av2_tile_inter_rate_cache_stats(const SvtAv2TileInterRateCache* cache,
+    uint64_t* leaf_writes, uint64_t* event_writes, size_t* scratch_bytes);
 
 typedef struct SvtAv2TileRatePrefix SvtAv2TileRatePrefix;
 int svt_av2_tile_rate_prefix_create(SvtAv2TileRatePrefix** prefix);

@@ -13,22 +13,35 @@ typedef struct SvtAv2RdFrameConfig {
     SvtAv2FrameHeaderConfig frame_header;
     uint32_t rd_mode; /* 1=exhaustive, 2=pruned, 3=fast still intra */
     uint32_t partition_selection; /* 4=small rectangles, 5=also uniform long rectangles, 6=also bounded 32-quadrant rectangles, 7=also bounded small-rectangle mixtures, 8=also uniform thin rectangles, 9=also bounded thin mixtures, 10=also uniform 8x64/64x8 */
-    uint32_t motion_optimization; /* 1=legacy-range RD, 2=legacy-range RD plus bounded wide refinement */
+    uint32_t motion_optimization; /* 1=legacy-range RD, 2=wide RD, 3=fixed half-pel RD (mv_half P frames only) */
     uint32_t satd_angles; /* Additional SATD shortlist; original candidates retained. */
     uint32_t angle_search; /* 48-angle Y-SAD shortlist plus exact refinement on the winning tree */
     uint32_t transform_selection; /* 1=binary DCT/ADST_ADST, 2=full syntax with four Y primary types */
     uint32_t coeff_optimization; /* 1=legacy tail trim, 2=single-picture level/EOB RD */
     uint32_t cfl_search; /* 1=classic explicit CfL, pixel-SSE top2/plane then exact SB RD */
+#if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
+    uint32_t video_cfl_search; /* Search applies only when the immutable sequence flag is set. */
+#endif
     /* Internal audit seam; production callers leave these zero. The observer
      * receives every completed trial, then the replayed winner (committed=1). */
     void (*candidate_hook)(void* user, size_t sb_index, uint64_t candidate_id,
         uint64_t distortion, uint64_t rate_q12, uint64_t cost, int committed);
     void* candidate_hook_user;
     uint32_t reverse_candidates;
+    int screen_trees; /* Compare greedy partition seeds before refining the winner. */
     uint32_t tree_finalists; /* 0=original winner, 2=best two basic trees, 4=also preserve two seeds before long rectangles, 8=global four plus two before long and thin rectangles, 10=also retain both 8x64/64x8 seeds */
+    uint32_t rd_lambda_scale;
     uint32_t rd_lambda_model; /* 0=original, 1=AVM AI with compile-time scale, 2=AVM AI base x6/4 */
     uint32_t mhccp_search; /* 1=three shared filter0 MHCCP directions, exact whole-SB RD. */
     uint32_t intra_joint; /* 1=bounded Y mode/TX joint RD; complete original route retained. */
+    uint32_t inter_skip_search; /* 1=explicit zero-residual RD on complete 64/32 P SBs. */
+    uint32_t inter_fine; /* 1=bounded quarter P 32->16 search, mutually exclusive with inter_skip_search. */
+    uint32_t inter_tail; /* 1=optionally prune weak end-of-block DCT coefficients on the P winner. */
+    uint32_t inter_near; /* 1=bounded exact-RD DRL0 predictor targets on quarter P. */
+    uint32_t intra_ist_search;
+    uint8_t avm_fp_round;
+    const SvtAv2ReferenceFrame* secondary_reference; /* Distinct past LONG in projected two-reference P. */
+    struct SvtAv2EntropyModels* end_models; /* Optional committed tile bank before frame decay. */
 } SvtAv2RdFrameConfig;
 
 typedef struct SvtAv2RdFrameOutput {
@@ -56,6 +69,8 @@ typedef struct SvtAv2RdFrameStats {
     uint64_t cfl_trials, cfl_accepts;
     uint64_t tree_finalist_trials, tree_finalist_accepts;
     uint64_t mhccp_trials, mhccp_accepts;
+    uint64_t inter_skip_trials, inter_skip_accepts;
+    uint64_t inter_fine_trials, inter_fine_accepts; /* Completed SB rate trials / committed fine SBs. */
 } SvtAv2RdFrameStats;
 
 /* Cost helpers are also used by the independent numeric unit tests. qindex is

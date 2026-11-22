@@ -28,22 +28,23 @@ static inline int svt_av2_intra_mode_angle(uint32_t mode) {
 #ifndef M6_FLIP_TX
 #define M6_FLIP_TX 0
 #endif
-#if M6_FLIP_TX
-/* Fixed AVM entropymode.h av2_md_idx2type; current own Y geometry domain.
- * Only 2-D types 0..8 are used here; 1-D/IDTX need separate coefficient paths. */
-/* AVM reconintra.h wide_angle_mapping: TX symbol class follows the
- * mapped prediction mode, including angle delta and the MRL angle offset. */
+/* AVM reconintra.h wide_angle_mapping: transform syntax uses the mapped
+ * prediction mode, including the angle delta and the MRL angle offset. */
 static inline uint32_t svt_av2_intra_tx_mode(uint32_t mode,uint32_t w,uint32_t h,uint32_t mrl) {
     static const int offsets[4]={0,1,-1,0};
     const uint32_t base=svt_av2_intra_mode_base(mode);
     const uint32_t joint=svt_av2_intra_mode_joint(mode);
     if (joint<5u || joint>60u) return base;
     const int angle=svt_av2_intra_mode_angle(mode)+offsets[mrl&3u];
-    if (h==2u*w && angle<61) return 13u; /* D203 */
-    if (w==2u*h && angle>209) return 8u; /* D45 */
+    if ((h==2u*w && angle<61) || (h==4u*w && angle<73) || (h==8u*w && angle<82))
+        return 13u; /* D203 */
+    if ((w==2u*h && angle>209) || (w==4u*h && angle>197) || (w==8u*h && angle>188))
+        return 8u; /* D45 */
     return base;
 }
 
+#if M6_FLIP_TX
+/* Fixed AVM entropymode.h av2_md_idx2type, restricted to 2-D types. */
 static inline uint32_t svt_av2_intra_tx_symbol(uint32_t mode,uint32_t w,uint32_t h,uint32_t type) {
     static const uint8_t avm_mode[14]={0,1,2,0,9,10,11,12,3,8,5,4,6,7};
     const uint32_t base=svt_av2_intra_mode_base(mode);

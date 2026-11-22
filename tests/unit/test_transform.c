@@ -307,6 +307,30 @@ static void ref_fwd_2d(const int16_t* in, int32_t* out, uint32_t w, uint32_t h) 
     int blk[SVT_AV2_TX_MAX_PELS];
     int vec[SVT_AV2_TX_MAX_DIM];
     int res[SVT_AV2_TX_MAX_DIM];
+#if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
+    if (w == 64u || h == 64u) {
+        const uint32_t sx = w > 32u ? 2u : 1u, sy = h > 32u ? 2u : 1u;
+        const uint32_t rw = w / sx, rh = h / sy;
+        memset(blk, 0, sizeof(blk));
+        for (uint32_t y = 0u; y < h; ++y)
+            for (uint32_t x = 0u; x < w; ++x)
+                blk[(y / sy) * rw + x / sx] += in[y * w + x];
+        for (uint32_t col = 0u; col < rw; ++col) {
+            for (uint32_t i = 0u; i < rh; ++i) vec[i] = blk[i * rw + col];
+            ref_fwd_1d(vec, res, fwd0, (int)rh);
+            for (uint32_t i = 0u; i < rh; ++i) buf[i * rw + col] = res[i];
+        }
+        for (uint32_t row = 0u; row < rh; ++row) {
+            ref_fwd_1d(buf + row * rw, res, fwd1, (int)rw);
+            for (uint32_t i = 0u; i < rw; ++i) {
+                out[row * rw + i] = (log2u(w) + log2u(h)) & 1 ?
+                    (int32_t)(((int64_t)res[i] * SVT_AV2_TX_NEW_SQRT2 +
+                        (1 << (SVT_AV2_TX_SQRT2_BITS - 1))) >> SVT_AV2_TX_SQRT2_BITS) : res[i];
+            }
+        }
+        return;
+    }
+#endif
     for (uint32_t i = 0; i < w * h; ++i) blk[i] = in[i];
     /* pass 1: line = w, size = h -> transform each column (strided read), write
      * contiguously into buf[j*h + f], j = x. For h > 32 AVM zeroes frequencies
@@ -762,7 +786,66 @@ static void test_bd_random_independent_models(void) {
     }
 }
 
+/* High-side residual samples are real inputs even though only 32 frequencies
+ * per 64-side are carried. Verify their impulses, both signs/limits, and the
+ * exact write footprint without relying on any inverse round trip. */
+static void test_packed_forward_extreme_quadrants(void) {
+    const uint32_t sides[][2] = {{64,64}, {64,32}, {32,64}, {64,16}, {16,64}};
+    const int32_t canary = INT32_C(0x31415926);
+    for (size_t g = 0; g < sizeof(sides)/sizeof(sides[0]); ++g) {
+        const uint32_t w = sides[g][0], h = sides[g][1], area = w*h;
+        if (!svt_av2_tx_supported(w,h)) continue;
+        const size_t carried = svt_av2_tx_coeff_count(w,h);
+        int16_t src[SVT_AV2_TX_MAX_PELS];
+        int32_t expected[SVT_AV2_TX_MAX_PELS], out[SVT_AV2_TX_MAX_PELS+2];
+        for (uint32_t bd = 8u; bd <= 10u; bd += 2u) for (uint32_t t = 0u; t < 6u; ++t) {
+            const int edge = (1 << bd) - 1;
+            memset(src, 0, sizeof(src));
+            if (t < 4u) {
+                const uint32_t x = (t & 1u) ? w-1u : w/2u;
+                const uint32_t y = (t & 2u) ? h-1u : h/2u;
+                src[y*w+x] = (int16_t)(t & 1u ? edge : -edge);
+            } else for (uint32_t y = 0u; y < h; ++y) for (uint32_t x = 0u; x < w; ++x)
+                src[y*w+x] = (int16_t)((t == 4u ? x : y) & 1u ? -edge : edge);
+            for (unsigned i = 0; i < SVT_AV2_TX_MAX_PELS+2; ++i) out[i] = canary;
+            ref_fwd_2d(src, expected, w, h);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_fwd_transform_bd(src,out+1,w,h,bd),SVT_AV2_TX_OK);
+            SVT_TEST_CHECK(memcmp(out+1,expected,carried*sizeof(*out)) == 0);
+            SVT_TEST_CHECK_EQ_INT(out[0],canary);
+            for (size_t i = carried+1u; i <= area+1u; ++i) SVT_TEST_CHECK_EQ_INT(out[i],canary);
+            src[area-1u] = (int16_t)(edge+1);
+            memset(out, 0, sizeof(out));
+            SVT_TEST_CHECK_EQ_INT(svt_av2_fwd_transform_bd(src,out+1,w,h,bd),SVT_AV2_TX_ERR_RANGE);
+            for (size_t i = 0u; i <= carried+1u; ++i) SVT_TEST_CHECK_EQ_INT(out[i],0);
+        }
+    }
+}
+
+static void test_rect_rdoq_energy(void) {
+    const uint32_t dims[][2] = {{32, 16}, {16, 32}, {16, 8}, {8, 16}};
+    for (size_t i = 0; i < sizeof(dims) / sizeof(dims[0]); ++i) {
+        const uint32_t w = dims[i][0], h = dims[i][1];
+        const int gain_squared = w * h > 256u ? 16 : 64;
+        int16_t residual[512];
+        int32_t coeff[512];
+        for (int ac = 0; ac < 2; ++ac) {
+            int64_t expected = 0, measured = 0;
+            for (uint32_t j = 0; j < w * h; ++j) {
+                const int sample = ac ? (int)((j * 37u + j / w * 23u) % 241u) - 120 : 64;
+                residual[j] = (int16_t)sample;
+                expected += sample * sample * gain_squared;
+            }
+            SVT_TEST_CHECK_EQ_INT(svt_av2_fwd_transform_bd(residual, coeff, w, h, 10u), SVT_AV2_TX_OK);
+            for (uint32_t j = 0; j < w * h; ++j) measured += (int64_t)coeff[j] * coeff[j];
+            /* Integer DCT rounding perturbs Parseval's identity. */
+            SVT_TEST_CHECK(measured * 100 > expected * 98 && measured * 100 < expected * 102);
+        }
+    }
+}
+
 int main(void) {
+    test_rect_rdoq_energy();
+    test_packed_forward_extreme_quadrants();
     test_bd_random_independent_models();
     test_reference_tables();
     test_geometry();

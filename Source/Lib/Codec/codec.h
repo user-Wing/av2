@@ -22,11 +22,16 @@ typedef enum SvtAv2EncoderState {
     SVT_AV2_STATE_CLOSED
 } SvtAv2EncoderState;
 
+/* Fixed luma grid for the optional causal anchor rule: roughly 1/900th of
+ * a 1080p picture, independent of SIMD stride or source ownership. */
+#define SVT_AV2_ANCHOR_GRID_X 64u
+#define SVT_AV2_ANCHOR_GRID_Y 36u
+#define SVT_AV2_ANCHOR_GRID_COUNT (SVT_AV2_ANCHOR_GRID_X * SVT_AV2_ANCHOR_GRID_Y)
+
 typedef struct SvtAv2EncoderContext {
     uint32_t           magic;
     SvtAv2EncoderState state;
     SvtAv2EncoderConfig config;
-    uint32_t           parameter_mask; /* bitmask of SvtAv2Parameter already set */
     uint32_t           pictures_sent;
     uint32_t           pictures_encoded;
     int                fatal_error;
@@ -73,11 +78,43 @@ typedef struct SvtAv2EncoderContext {
     size_t partition_decision_capacity;
     size_t partition_decision_count;
     SvtAv2ReferenceFrame reference;
+    SvtAv2ReferenceFrame long_reference; /* allocated only for dual-ref experiments */
     int32_t* coded_coeffs;
     size_t coded_block_capacity, coded_coeff_capacity;
     size_t coded_block_count, coded_coeff_count;
     uint32_t            recon_frame_index; /* index of the exported recon frame */
     SvtAv2ContentType content_type; /* private optional hint; calloc defaults to NONE */
+    uint32_t inter_skip_search;
+    uint32_t inter_ref_period;
+    int32_t video_key_qp;
+    int32_t video_anchor_qp;
+    uint32_t inter_fine;
+    uint32_t inter_tail;
+    uint32_t inter_near;
+    uint32_t cdf_inherit;
+    uint32_t rd_lambda_scale;
+    struct SvtAv2VideoCdfState* video_cdf;
+    uint8_t intra_ist_scope; /* 0=off, 1=signal, 2=KEY, 4=P, 6=KEY/P. */
+    uint8_t still_edge_filter;
+    uint8_t enable_ibp;
+    uint8_t qm_scope;
+    int8_t uv_delta_q;
+    uint8_t qm_level;
+    uint8_t luma_compensation_scope;
+    uint8_t source_cdef_scope;
+    uint8_t gdf_key, gdf_inter;
+    SvtAv2FrameHeaderConfig still_tools_header;
+    uint32_t dual_ref_period;
+    uint32_t dual_ref_policy;
+    uint32_t dual_ref_cadence;
+    uint32_t anchor_source_valid;
+    uint32_t previous_motion_q8, last_clean_frame;
+    uint8_t quiet_frames, held_pictures;
+    uint8_t motion_q;
+    uint16_t anchor_source[SVT_AV2_ANCHOR_GRID_COUNT];
+    uint64_t inter_skip_trials, inter_skip_accepts;
+    uint64_t inter_fine_trials, inter_fine_accepts;
+    SvtAv2BlockRefStats block_ref_stats;
 } SvtAv2EncoderContext;
 
 /* Releases every buffer owned by the context (pending frame and packet) and

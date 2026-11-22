@@ -245,6 +245,10 @@ int32_t svt_av2_tx_round_shift(int64_t value, int bit);
 
 SvtAv2TransformStatus svt_av2_fwd_transform_bd(const int16_t* residual, int32_t* coeff,
     uint32_t width, uint32_t height, uint32_t bit_depth);
+#if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
+SvtAv2TransformStatus svt_av2_fwd_transform_dct64_bd(const int16_t* residual, int32_t* coeff,
+    uint32_t width, uint32_t height, uint32_t bit_depth, int match_dct64);
+#endif
 SvtAv2TransformStatus svt_av2_inv_transform_bd(const int32_t* dqcoeff, int16_t* residual,
     uint32_t width, uint32_t height, uint32_t bit_depth);
 /* Single-picture primary subset: 0 DCT_DCT, 1 ADST_DCT, 2 DCT_ADST,

@@ -59,7 +59,7 @@ def preview_command(ffmpeg, width, height, raw, jpeg):
             '-vf', 'scale=640:-2', '-q:v', '3', '-threads', '1', str(jpeg)]
 
 
-def encoder_command(encoder, source, output, qp, content, profile, width, height, recon=None):
+def encoder_command(encoder, source, output, qp, content, profile, width, height, recon=None, *, fast_gdf=False):
     if (width, height) not in ((1920, 1080), (3840, 2160)):
         raise ValueError('Unsupported profile dimensions')
     selected = ('animation' if content == 'animation' and width == 1920 else 'photo') if profile == 'auto' else profile
@@ -67,7 +67,7 @@ def encoder_command(encoder, source, output, qp, content, profile, width, height
     command = [str(encoder), '--input', str(source), '--output', str(output), '--still-picture',
                '--threads', '1', '--qp', str(qp), '--intra-select', 'cfl', '--partition-select', 'mixed8',
                '--rd-mode', 'fast', '--entropy-adapt', 'on', '--transform-select', 'full',
-               '--coeff-opt', 'rdoq', '--angle-search', 'rd', '--mrl-search', 'rd', '--tree-refine', 'wide',
+               '--coeff-opt', 'rdoq', '--angle-search', 'rd', '--mrl-search', 'rd', '--tree-refine', 'screen' if fast_gdf else 'wide',
                '--cfl-search', 'rd', '--mhccp-search', 'rd', '--rd-lambda', model, '--content-type', content]
     if recon is not None:
         command += ['--export-recon', str(recon)]
@@ -82,6 +82,11 @@ def main():
     parser.add_argument('--recon', type=Path)
     parser.add_argument('--content-type', choices=('auto', 'animation', 'real'), default='auto')
     parser.add_argument('--profile', choices=('auto', 'animation', 'photo'), default='auto')
+    search = parser.add_mutually_exclusive_group()
+    search.add_argument('--fusion-gdf', action='store_true', help='use screened trees, resolution-based matrices and UV delta -8')
+    search.add_argument('--fast-gdf', action='store_true', help='use screened mixed8 trees and single-pass restoration')
+    search.add_argument('--deep-gdf', nargs='?', const='base', choices=('base', 'qm12'),
+                        help='use deep rectangle RD, rectangle RDOQ, IBP, edge filtering and KEY GDF, optionally with QM12')
     parser.add_argument('--ffmpeg', type=Path)
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--classifier-dir', type=Path, default=Path(__file__).parent / 'public-classifier')
@@ -105,6 +110,19 @@ def main():
     if recon is not None:
         report['recon'] = str(recon)
     env = {k: v for k, v in os.environ.items() if not k.startswith('SVT_AV2_TEST_') and k != 'SVT_AV2_M6_DIP'}
+    screened = args.fast_gdf or args.fusion_gdf
+    if args.deep_gdf or screened:
+        env = {k: v for k, v in env.items() if not k.startswith('SVT_AV2_')}
+        settings = dict(SVT_AV2_STILL_RECT_RD='deep', SVT_AV2_RECT_RDOQ='1', SVT_AV2_IBP='1',
+                        SVT_AV2_STILL_EDGE_FILTER='1', SVT_AV2_GDF='key', SVT_AV2_STILL_UV_RD='0',
+                        SVT_AV2_INTRA_IST='off', SVT_AV2_QM12='all' if args.deep_gdf == 'qm12' else 'off',
+                        SVT_AV2_SSIM_RD='off',
+                        SVT_AV2_LUMA_COMPENSATION='off')
+        if screened:
+            settings.pop('SVT_AV2_STILL_RECT_RD')
+            settings.update(SVT_AV2_DCT64_MATCH='key')
+        env.update(settings)
+        report['tool_environment'] = settings
     try:
         content = args.content_type
         if content == 'auto':
@@ -124,7 +142,15 @@ def main():
             report['classifier'] = {name: sha(package / name) for name in ('predict.py', 'runtime.json')}
             report['checkpoint_sha256'] = runtime.config['model']['sha256']
             content = report['classification']['encoder_content_type']
-        selected, model, command = encoder_command(encoder, source, output, args.qp, content, args.profile, width, height, recon)
+        if screened:
+            matrix = content == 'animation' or (args.fusion_gdf and width == 1920)
+            settings['SVT_AV2_QM12'] = 'all' if matrix else 'off'
+            if args.fusion_gdf:
+                settings['SVT_AV2_UV_DELTA_Q'] = '-8'
+                if matrix:
+                    settings['SVT_AV2_QM_LEVEL'] = '4' if width == 1920 else '8'
+            env.update(settings)
+        selected, model, command = encoder_command(encoder, source, output, args.qp, content, args.profile, width, height, recon, fast_gdf=screened)
         report.update(content_type=content, selected_profile=selected, rd_lambda=model, command=command)
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         with log_path.open('xb') as log:

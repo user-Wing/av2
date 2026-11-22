@@ -1188,7 +1188,35 @@ static void test_m5_axis_prediction(void) {
         SVT_TEST_CHECK_EQ_INT(dst[i], 0x7B);
 }
 
+static void test_ibp_edges(void) {
+    SvtAv2FrameBuffer pic = {0};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_picture_alloc(&pic, 32, 32), SVT_AV2_ERROR_NONE);
+    const uint32_t pitch = pic.strides[0];
+    for (uint32_t k = 8u; k < 32u; ++k) {
+        pic.planes[0][7u * pitch + k] = 200u;
+        pic.planes[0][k * pitch + 7u] = 40u;
+    }
+    uint8_t dst[16u * 16u];
+    SvtAv2IntraBlock b = {8u, 8u, 16u, 8u, 0u};
+    memset(dst, 120, sizeof(dst));
+    svt_av2_intra_ibp_dc(&pic, &b, dst, 16u);
+    SVT_TEST_CHECK_EQ_INT(dst[0], (86u * 120u + 42u * 200u + 64u) / 128u);
+    SVT_TEST_CHECK_EQ_INT(dst[2u * 16u], (77u * 120u + 51u * 40u + 64u) / 128u);
+    SVT_TEST_CHECK_EQ_INT(dst[2u * 16u + 4u], 120u);
+    b.w = 8u; b.h = 16u;
+    memset(dst, 120, sizeof(dst));
+    svt_av2_intra_ibp_dc(&pic, &b, dst, 16u);
+    SVT_TEST_CHECK_EQ_INT(dst[0], (86u * 120u + 42u * 40u + 64u) / 128u);
+    b.h = 8u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_intra_directional_predict_tools(&pic, &b, 8u, 0u, 0u,
+        0u, 0u, 1, dst, 16u), SVT_AV2_ERROR_NONE);
+    /* D45, equal distances to the two constant reference edges. */
+    for (uint32_t k = 0u; k < 8u; ++k) SVT_TEST_CHECK_EQ_INT(dst[k * 16u + k], 120u);
+    svt_av2_picture_free(&pic);
+}
+
 int main(void) {
+    test_ibp_edges();
     test_m5_axis_prediction();
     test_highbd_random_dc_and_residual();
     test_first_block_no_uninitialised_read();

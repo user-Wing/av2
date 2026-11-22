@@ -90,10 +90,17 @@ void svt_av2_sequence_header_config_default(SvtAv2SequenceHeaderConfig* cfg,
     cfg->chroma_format = 1u;
     cfg->chroma_dct_only = 0u;
     cfg->enable_cfl_intra = 0u;
+    cfg->enable_intra_ist = 0u;
+    cfg->enable_ibp = 0u;
+    cfg->enable_intra_edge_filter = 0u;
     cfg->enable_mrls = 0u;
     cfg->enable_mhccp = 0u;
     cfg->enable_ccso64 = 0u;
+    cfg->enable_gdf = 0u;
+    cfg->uv_delta_q = 0;
+    cfg->enable_cdef = 0u;
     cfg->enable_pc_wiener = 0u;
+    cfg->dual_ref = 0u;
 }
 
 /* Shared body validation (everything the M1 subset checks except the
@@ -103,7 +110,9 @@ void svt_av2_sequence_header_config_default(SvtAv2SequenceHeaderConfig* cfg,
 static int seq_validate_config(const SvtAv2SequenceHeaderConfig* cfg,
                               uint32_t* width_bits,
                               uint32_t* height_bits) {
-    if (cfg->low_delay_p > 1u || cfg->chroma_dct_only > 1u || cfg->enable_cfl_intra > 1u || cfg->enable_mrls > 1u || cfg->enable_mhccp > 1u) return SVT_AV2_BW_ERROR_RANGE;
+    if (cfg->low_delay_p > 1u || cfg->dual_ref > 1u || cfg->chroma_dct_only > 1u || cfg->enable_cfl_intra > 1u || cfg->enable_mrls > 1u || cfg->enable_mhccp > 1u || cfg->enable_intra_ist > 1u ||
+        cfg->uv_delta_q < -23 || cfg->uv_delta_q > 8 || cfg->enable_gdf > 1u || cfg->enable_cdef > 1u || cfg->enable_ibp > 1u || cfg->enable_intra_edge_filter > 1u) return SVT_AV2_BW_ERROR_RANGE;
+    if (cfg->dual_ref && !cfg->low_delay_p) return SVT_AV2_BW_ERROR_UNSUPPORTED;
     if (cfg->enable_pc_wiener > 1u || (cfg->enable_pc_wiener &&
         ((cfg->max_frame_width & 7u) || (cfg->max_frame_height & 7u) ||
          cfg->max_frame_width > 4096u || cfg->max_frame_height > 2160u ||
@@ -149,7 +158,7 @@ static int seq_validate_config(const SvtAv2SequenceHeaderConfig* cfg,
 
 int svt_av2_sequence_header_write_multi(SvtAv2BitWriter* bw,
                                        const SvtAv2SequenceHeaderConfig* cfg) {
-    if (cfg != NULL && (cfg->enable_ccso64 || cfg->enable_pc_wiener)) return SVT_AV2_BW_ERROR_RANGE;
+    if (cfg != NULL && (cfg->enable_ccso64 || cfg->enable_pc_wiener || cfg->enable_cdef)) return SVT_AV2_BW_ERROR_RANGE;
     if (bw == NULL || cfg == NULL) {
         return SVT_AV2_BW_ERROR_NULL;
     }
@@ -270,7 +279,7 @@ int svt_av2_sequence_header_write_multi(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_dip */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_intra_edge_filter */
+    if ((status = seq_write_bit(bw, cfg->enable_intra_edge_filter)) != SVT_AV2_BW_OK) { /* enable_intra_edge_filter */
         return status;
     }
     if ((status = seq_write_bit(bw, cfg->enable_mrls)) != SVT_AV2_BW_OK) { /* enable_mrls */
@@ -285,7 +294,7 @@ int svt_av2_sequence_header_write_multi(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, cfg->enable_mhccp)) != SVT_AV2_BW_OK) { /* enable_mhccp */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_ibp */
+    if ((status = seq_write_bit(bw, cfg->enable_ibp)) != SVT_AV2_BW_OK) { /* enable_ibp */
         return status;
     }
 
@@ -326,9 +335,10 @@ int svt_av2_sequence_header_write_multi(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, cfg->low_delay_p != 0u)) != SVT_AV2_BW_OK) { /* explicit_num_ref_frames */
         return status;
     }
-    if (cfg->low_delay_p && (status = seq_write_bits(bw, 0u, 4u)) != SVT_AV2_BW_OK) return status;
-    /* explicit_num_ref_frames == 0: NumRefFrames = 8, no
-     * num_ref_frames_minus_1. */
+    /* Explicit NumRefFrames = num_ref_frames_minus_1 + 1: low-delay
+     * uses one or two physical slots, independently of the per-frame map.
+     * Otherwise the decoder infers eight slots and there is no count field. */
+    if (cfg->low_delay_p && (status = seq_write_bits(bw, cfg->dual_ref, 4u)) != SVT_AV2_BW_OK) return status;
     if ((status = seq_write_bits(bw, 0u, 3u)) != SVT_AV2_BW_OK) { /* long_term_frame_id_bits */
         return status;
     }
@@ -413,7 +423,7 @@ int svt_av2_sequence_header_write_multi(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_idtx_intra (!fsc) */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_intra_ist */
+    if ((status = seq_write_bit(bw, cfg->enable_intra_ist)) != SVT_AV2_BW_OK) { /* enable_intra_ist */
         return status;
     }
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_inter_ist */
@@ -450,7 +460,7 @@ int svt_av2_sequence_header_write_multi(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, 1u)) != SVT_AV2_BW_OK) { /* equal_ac_dc_q */
         return status;
     }
-    if ((status = seq_write_bits(bw, 23u, 5u)) != SVT_AV2_BW_OK) { /* base_uv_ac_delta_q: -23 + 23 = 0 */
+    if ((status = seq_write_bits(bw, (uint32_t)(cfg->uv_delta_q + 23), 5u)) != SVT_AV2_BW_OK) {
         return status;
     }
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* uv_ac_delta_q_enabled */
@@ -464,9 +474,8 @@ int svt_av2_sequence_header_write_multi(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_cdef */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_gdf */
-        return status;
-    }
+    if ((status = seq_write_bit(bw, cfg->enable_gdf)) != SVT_AV2_BW_OK) return status;
+    if (cfg->enable_gdf && (status = seq_write_bit(bw, 1u)) != SVT_AV2_BW_OK) return status;
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_restoration */
         return status;
     }
@@ -506,6 +515,8 @@ int svt_av2_sequence_header_write(SvtAv2BitWriter* bw,
     if (!svt_av2_bit_writer_byte_aligned(bw)) {
         return SVT_AV2_BW_ERROR_UNALIGNED;
     }
+
+    if (cfg->dual_ref) return SVT_AV2_BW_ERROR_UNSUPPORTED;
 
     /* --- validation of the M1 subset (fail loudly, never guess) ---------- */
     uint32_t width_bits = 0u;
@@ -590,7 +601,7 @@ int svt_av2_sequence_header_write(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_dip */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_intra_edge_filter */
+    if ((status = seq_write_bit(bw, cfg->enable_intra_edge_filter)) != SVT_AV2_BW_OK) { /* enable_intra_edge_filter */
         return status;
     }
     if ((status = seq_write_bit(bw, cfg->enable_mrls)) != SVT_AV2_BW_OK) { /* enable_mrls */
@@ -605,7 +616,7 @@ int svt_av2_sequence_header_write(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, cfg->enable_mhccp)) != SVT_AV2_BW_OK) { /* enable_mhccp */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_ibp */
+    if ((status = seq_write_bit(bw, cfg->enable_ibp)) != SVT_AV2_BW_OK) { /* enable_ibp */
         return status;
     }
 
@@ -636,7 +647,7 @@ int svt_av2_sequence_header_write(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_idtx_intra (!fsc) */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_intra_ist */
+    if ((status = seq_write_bit(bw, cfg->enable_intra_ist)) != SVT_AV2_BW_OK) { /* enable_intra_ist */
         return status;
     }
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_inter_ist */
@@ -669,7 +680,7 @@ int svt_av2_sequence_header_write(SvtAv2BitWriter* bw,
     /* equal_ac_dc_q == 1: no base_y_dc_delta_q / base_uv_dc_delta_q.
      * Not monochrome: base_uv_ac_delta_q f(5) + uv_ac_delta_q_enabled f(1)
      * are always present (outside the equal_ac_dc_q condition). */
-    if ((status = seq_write_bits(bw, 23u, 5u)) != SVT_AV2_BW_OK) { /* base_uv_ac_delta_q: -23 + 23 = 0 */
+    if ((status = seq_write_bits(bw, (uint32_t)(cfg->uv_delta_q + 23), 5u)) != SVT_AV2_BW_OK) {
         return status;
     }
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* uv_ac_delta_q_enabled */
@@ -680,13 +691,11 @@ int svt_av2_sequence_header_write(SvtAv2BitWriter* bw,
     if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* disable_loopfilters_across_tiles */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_cdef */
+    if ((status = seq_write_bit(bw, cfg->enable_cdef)) != SVT_AV2_BW_OK) { /* enable_cdef */
         return status;
     }
-    if ((status = seq_write_bit(bw, 0u)) != SVT_AV2_BW_OK) { /* enable_gdf */
-        return status;
-    }
-    /* enable_gdf == 0: no gdf_unit_matches_sb_size. */
+    if ((status = seq_write_bit(bw, cfg->enable_gdf)) != SVT_AV2_BW_OK) return status;
+    if (cfg->enable_gdf && (status = seq_write_bit(bw, 1u)) != SVT_AV2_BW_OK) return status;
     if ((status = seq_write_bit(bw, cfg->enable_pc_wiener)) != SVT_AV2_BW_OK) { /* enable_restoration */
         return status;
     }

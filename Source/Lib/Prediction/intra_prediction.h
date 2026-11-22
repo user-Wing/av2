@@ -206,10 +206,21 @@ SvtAv2Error svt_av2_intra_basic_predict(const SvtAv2FrameBuffer* recon,
 
 /* Square directional modes 8..61: fixed AVM IDIF for Y, two-tap interpolation
  * for inherited UV angles. TR/BL are contiguous decoded sample counts beyond
- * the ordinary edge, each at most the side size; edge filter/MRLS/IBP are off. */
+ * the ordinary edge, each at most the side size. The legacy entry uses
+ * unfiltered references. */
 SvtAv2Error svt_av2_intra_directional_predict(const SvtAv2FrameBuffer* recon,
     const SvtAv2IntraBlock* block, uint32_t mode, uint32_t top_right,
     uint32_t bottom_left, uint8_t* dst, uint32_t stride);
+/* Blend the decoder's DC predictor in-place for an eligible non-CfL block. */
+void svt_av2_intra_ibp_dc(const SvtAv2FrameBuffer* recon, const SvtAv2IntraBlock* block,
+    uint8_t* dst, uint32_t stride);
+/* Edge filter type 0=off, 1=normal, 2=smooth neighbor. */
+SvtAv2Error svt_av2_intra_directional_predict_filtered(const SvtAv2FrameBuffer* recon,
+    const SvtAv2IntraBlock* block, uint32_t mode, uint32_t top_right,
+    uint32_t bottom_left, uint32_t filter_type, uint8_t* dst, uint32_t stride);
+SvtAv2Error svt_av2_intra_directional_predict_tools(const SvtAv2FrameBuffer* recon,
+    const SvtAv2IntraBlock* block, uint32_t mode, uint32_t top_right, uint32_t bottom_left,
+    uint32_t top_filter, uint32_t left_filter, int ibp, uint8_t* dst, uint32_t stride);
 
 /* AV2 classic CfL, shared coding/transform block; signed alpha_q3 is -8..8.
  * Current co-located Y and causal U/V neighbours must already be reconstructed.

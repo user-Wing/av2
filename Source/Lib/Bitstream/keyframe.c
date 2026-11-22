@@ -26,7 +26,7 @@
 #include "tile_writer.h"
 
 #include "cdf_tables.h"      /* svt_av2_cdf_coeff_q_ctx */
-#include "entropy_encoder.h" /* SVT_AV2_ENTROPY_ERROR_RANGE */
+#include "entropy_models.h" /* detached adaptive context */
 
 /* The three OBU headers plus the fixed 22-bit frame header cannot fit in less
  * than this, so a smaller request is a caller error rather than a "no space"
@@ -216,6 +216,7 @@ static int write_closed_loop_key_obu(SvtAv2BitWriter* bw, uint32_t width,
 static int encode_sequence_header_ex(uint32_t width, uint32_t height,
                                          uint32_t bit_depth, uint32_t chroma_format, uint32_t low_delay_p,
                                          uint32_t still_picture, uint32_t chroma_dct_only, uint32_t enable_cfl_intra, uint32_t enable_mrls, uint32_t enable_mhccp, uint32_t enable_ccso64, uint32_t enable_pc_wiener,
+                                         uint32_t dual_ref, uint32_t enable_intra_ist, uint32_t enable_intra_edge_filter, uint32_t enable_ibp, uint32_t enable_cdef, uint32_t enable_gdf, int8_t uv_delta_q,
                                          uint8_t* out, size_t out_cap,
                                          size_t* out_size) {
     if (out == NULL || out_size == NULL) {
@@ -231,11 +232,18 @@ static int encode_sequence_header_ex(uint32_t width, uint32_t height,
     scfg.bit_depth = bit_depth;
     scfg.chroma_format = chroma_format;
     scfg.low_delay_p = low_delay_p;
+    scfg.dual_ref = dual_ref;
     scfg.chroma_dct_only = chroma_dct_only;
     scfg.enable_cfl_intra = enable_cfl_intra;
+    scfg.enable_intra_ist = enable_intra_ist;
+    scfg.enable_ibp = enable_ibp;
+    scfg.enable_intra_edge_filter = enable_intra_edge_filter;
     scfg.enable_mrls = enable_mrls;
     scfg.enable_mhccp = enable_mhccp;
     scfg.enable_ccso64 = enable_ccso64;
+    scfg.uv_delta_q = uv_delta_q;
+    scfg.enable_cdef = enable_cdef;
+    scfg.enable_gdf = enable_gdf;
     scfg.enable_pc_wiener = enable_pc_wiener;
     scfg.seq_profile_idc = chroma_format == 3u ? 4u : 0u;
     /* The caller must have verified a level exists; a size with no level is
@@ -296,7 +304,7 @@ static int encode_sequence_header_ex(uint32_t width, uint32_t height,
 
 int svt_av2_encode_sequence_header_multi(uint32_t width, uint32_t height,
     uint8_t* out, size_t out_cap, size_t* out_size) {
-    return encode_sequence_header_ex(width, height, 8u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, out, out_cap, out_size);
+    return encode_sequence_header_ex(width, height, 8u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0, out, out_cap, out_size);
 }
 
 int svt_av2_encode_keyframe_64x64_multi(const uint8_t* y, size_t y_stride,
@@ -341,37 +349,109 @@ int svt_av2_encode_keyframe_64x64_multi(const uint8_t* y, size_t y_stride,
     return 0;
 }
 
+typedef struct DualRefPacketConfig {
+    uint32_t refresh_mask;
+    uint32_t reference_slot;
+    uint32_t logical_ref_count;
+    uint32_t distance[2];
+} DualRefPacketConfig;
+
+/* Old and inherited video packets share the same OBU assembly. The tile's
+ * output bank stays private until the enclosing packet has succeeded. */
+static int emit_frame_packet(const SvtAv2FrameHeaderConfig* cfg, uint32_t frame_index,
+    const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t low_delay_p,
+    uint8_t* out, size_t out_cap, size_t* out_size, SvtAv2EntropyModels* end_models) {
+    if (out_size == NULL || out == NULL) return SVT_AV2_BW_ERROR_NULL;
+    *out_size = 0u;
+    if (!svt_av2_frame_header_video_cfl_valid(cfg) ||
+        (cfg->enable_cfl_intra && (!low_delay_p || end_models == NULL)))
+        return SVT_AV2_BW_ERROR_RANGE;
+    size_t prefix = 0u;
+    int st;
+    if (frame_index == 0u) {
+        st = encode_sequence_header_ex(cfg->frame_width, cfg->frame_height, cfg->bit_depth,
+            cfg->chroma_format, low_delay_p, !cfg->multi_frame, cfg->m5_intra_modes >= 2u,
+            svt_av2_frame_header_use_cfl(cfg), cfg->enable_mrls, cfg->enable_mhccp,
+            cfg->ccso64 != NULL, cfg->enable_pc_wiener, cfg->dual_ref, cfg->enable_intra_ist,
+            cfg->enable_intra_edge_filter, cfg->enable_ibp, cfg->cdef_primary != 0u, cfg->enable_gdf, cfg->uv_delta_q, out, out_cap, &prefix);
+    } else {
+        SvtAv2BitWriter delimiter;
+        svt_av2_bit_writer_init(&delimiter, out, out_cap);
+        st = svt_av2_obu_write(&delimiter, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0, NULL, 0);
+        if (st == 0) prefix = svt_av2_bit_writer_bytes_written(&delimiter);
+    }
+    if (st != 0) return st;
+    if (out_cap <= prefix + 16u) return SVT_AV2_BW_ERROR_NO_SPACE;
+    const size_t tile_cap = out_cap - prefix - 16u;
+    uint8_t* tile = (uint8_t*)malloc(tile_cap);
+    if (tile == NULL) return SVT_AV2_BW_ERROR_NO_SPACE;
+    size_t tile_size = 0u;
+    SvtAv2EntropyModels staged;
+    if (end_models != NULL)
+        st = svt_av2_tile_writer_write_video_models(cfg, blocks, block_count, modes, mode_count,
+            tile, tile_cap, &tile_size, &staged);
+    else if (cfg->inter_frame)
+        st = svt_av2_tile_writer_write_inter_coeffs(cfg, blocks, block_count, modes, mode_count,
+            tile, tile_cap, &tile_size);
+    else
+        st = svt_av2_tile_writer_write_closed_loop_key_coeffs(cfg, blocks, block_count,
+            tile, tile_cap, &tile_size, NULL);
+    if (st == 0) {
+        SvtAv2BitWriter bw;
+        svt_av2_bit_writer_init(&bw, out + prefix, out_cap - prefix);
+        st = svt_av2_obu_write(&bw, cfg->inter_frame ? SVT_AV2_OBU_REGULAR_TILE_GROUP : SVT_AV2_OBU_CLOSED_LOOP_KEY, 0, tile, tile_size);
+        if (st == 0) {
+            *out_size = prefix + svt_av2_bit_writer_bytes_written(&bw);
+            if (end_models != NULL) *end_models = staged;
+        }
+    }
+    free(tile);
+    return st;
+}
+
+int svt_av2_encode_packet_video_models(const SvtAv2FrameHeaderConfig* cfg, uint32_t frame_index,
+    const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count,
+    uint8_t* out, size_t out_cap, size_t* out_size, SvtAv2EntropyModels* end_models) {
+    if (out_size != NULL) *out_size = 0u;
+    if (cfg == NULL || end_models == NULL) return SVT_AV2_BW_ERROR_NULL;
+    if (!cfg->multi_frame || cfg->entropy_adaptation != 1u || cfg->order_hint != (frame_index & 255u) ||
+        cfg->inter_frame != (frame_index != 0u ? 1u : 0u) || end_models == cfg->primary_models)
+        return SVT_AV2_BW_ERROR_RANGE;
+    return emit_frame_packet(cfg, frame_index, blocks, block_count, modes, mode_count,
+        1u, out, out_cap, out_size, end_models);
+}
+
 static int encode_packet_ccso64(uint32_t width, uint32_t height,
     uint32_t bit_depth, uint32_t chroma_format,
     uint32_t base_q_idx, uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks,
     size_t block_count, const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t low_delay_p,
     uint32_t m5_intra_modes, const uint16_t* partition_decisions, size_t partition_decision_count,
     uint32_t entropy_adaptation, uint32_t still_picture, uint32_t transform_selection, uint32_t enable_mrls, uint32_t enable_mhccp,
-    const SvtAv2Ccso64Plan* ccso64, uint32_t deblock_y, int32_t deblock_delta, int32_t deblock_delta_h, uint32_t enable_pc_wiener, const uint64_t pc_wiener_none_mask[2], uint8_t* out, size_t out_cap, size_t* out_size) {
+    const SvtAv2Ccso64Plan* ccso64, uint32_t deblock_y, int32_t deblock_delta, int32_t deblock_delta_h, uint32_t enable_pc_wiener, const uint64_t pc_wiener_none_mask[2], uint32_t mv_half, uint32_t retain_reference, uint32_t sharp_filter,
+    const DualRefPacketConfig* dual_ref, uint8_t* out, size_t out_cap, size_t* out_size) {
     if (out_size == NULL || out == NULL) return SVT_AV2_BW_ERROR_NULL;
     *out_size = 0;
-    size_t prefix = 0;
-    int st = 0;
-    if (frame_index == 0u) {
-        st = encode_sequence_header_ex(width, height, bit_depth, chroma_format, low_delay_p,
-            still_picture, m5_intra_modes >= 2u, m5_intra_modes == 4u, enable_mrls, enable_mhccp, ccso64 != NULL, enable_pc_wiener, out, out_cap, &prefix);
-        if (st != 0) return st;
-    } else {
-        SvtAv2BitWriter delimiter;
-        svt_av2_bit_writer_init(&delimiter, out, out_cap);
-        st = svt_av2_obu_write(&delimiter, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0, NULL, 0);
-        if (st != 0) return st;
-        prefix = svt_av2_bit_writer_bytes_written(&delimiter);
-    }
-    if (out_cap <= prefix + 16u) return SVT_AV2_BW_ERROR_NO_SPACE;
-    const size_t tile_cap = out_cap - prefix - 16u;
-    uint8_t* tile = (uint8_t*)malloc(tile_cap);
-    if (tile == NULL) return SVT_AV2_BW_ERROR_NO_SPACE;
+    if ((mv_half || retain_reference) &&
+        (frame_index == 0u || low_delay_p != 1u || still_picture || entropy_adaptation > 1u))
+        return SVT_AV2_BW_ERROR_UNSUPPORTED;
     SvtAv2FrameHeaderConfig cfg;
     svt_av2_frame_header_config_default(&cfg, width, height);
     cfg.base_q_idx = base_q_idx;
     cfg.multi_frame = !still_picture;
     cfg.inter_frame = low_delay_p && frame_index != 0u;
+    cfg.mv_half = mv_half;
+    cfg.sharp_filter = sharp_filter;
+    cfg.retain_reference = retain_reference;
+    if (dual_ref != NULL) {
+        cfg.dual_ref = 1u;
+        cfg.refresh_mask = dual_ref->refresh_mask;
+        cfg.reference_slot = dual_ref->reference_slot;
+        cfg.logical_ref_count = dual_ref->logical_ref_count;
+        cfg.ref_distance[0] = dual_ref->distance[0];
+        cfg.ref_distance[1] = dual_ref->distance[1];
+    }
     cfg.order_hint = frame_index & 255u;
     cfg.reduced_tx_set = transform_selection == 2u ? 0u : transform_selection ? 1u : 2u;
     cfg.bit_depth = bit_depth;
@@ -382,23 +462,12 @@ static int encode_packet_ccso64(uint32_t width, uint32_t height,
     cfg.enable_mhccp = enable_mhccp;
     cfg.ccso64 = ccso64;
     cfg.enable_pc_wiener = enable_pc_wiener;
-    if (pc_wiener_none_mask) memcpy(cfg.pc_wiener_none_mask, pc_wiener_none_mask, sizeof(cfg.pc_wiener_none_mask));
+    if (pc_wiener_none_mask) memcpy(cfg.pc_wiener_none_mask, pc_wiener_none_mask, 2u * sizeof(*pc_wiener_none_mask));
     cfg.deblock_y = deblock_y;cfg.deblock_delta = deblock_delta;cfg.deblock_delta_h = deblock_delta_h;
     cfg.partition_decisions = partition_decisions;
     cfg.partition_decision_count = partition_decision_count;
-    size_t tile_size = 0;
-    st = cfg.inter_frame ? svt_av2_tile_writer_write_inter_coeffs(&cfg, blocks, block_count,
-        modes, mode_count, tile, tile_cap, &tile_size) :
-        svt_av2_tile_writer_write_closed_loop_key_coeffs(&cfg, blocks, block_count,
-        tile, tile_cap, &tile_size, NULL);
-    if (st == 0) {
-        SvtAv2BitWriter bw;
-        svt_av2_bit_writer_init(&bw, out + prefix, out_cap - prefix);
-        st = svt_av2_obu_write(&bw, cfg.inter_frame ? SVT_AV2_OBU_REGULAR_TILE_GROUP : SVT_AV2_OBU_CLOSED_LOOP_KEY, 0, tile, tile_size);
-        if (st == 0) *out_size = prefix + svt_av2_bit_writer_bytes_written(&bw);
-    }
-    free(tile);
-    return st;
+    return emit_frame_packet(&cfg, frame_index, blocks, block_count, modes, mode_count,
+        low_delay_p, out, out_cap, out_size, NULL);
 }
 
 static int encode_packet(uint32_t width, uint32_t height,
@@ -410,7 +479,7 @@ static int encode_packet(uint32_t width, uint32_t height,
     uint8_t* out, size_t out_cap, size_t* out_size) {
     return encode_packet_ccso64(width,height,bit_depth,chroma_format,base_q_idx,
         frame_index,blocks,block_count,modes,mode_count,low_delay_p,intra_modes,
-        decisions,decision_count,entropy,still,transform,mrl,mh,NULL,0u,0,0,0u,0u,out,out_cap,out_size);
+        decisions,decision_count,entropy,still,transform,mrl,mh,NULL,0u,0,0,0u,NULL,0u,0u,0u,NULL,out,out_cap,out_size);
 }
 
 int svt_av2_encode_intra_packet_ex(uint32_t width, uint32_t height,
@@ -454,6 +523,109 @@ int svt_av2_encode_packet_tools(uint32_t width, uint32_t height,
     return encode_packet(width,height,bit_depth,chroma_format,base_q_idx,frame_index,
         blocks,block_count,modes,mode_count,low_delay_p,intra_modes,
         partition_decisions,decision_count,0u,0u,0u,0u,0u,out,out_cap,out_size);
+}
+
+int svt_av2_encode_packet_tools_half(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t low_delay_p,
+    uint32_t intra_modes, const uint16_t* partition_decisions, size_t decision_count,
+    uint8_t* out, size_t out_cap, size_t* out_size) {
+    return svt_av2_encode_packet_tools_half_entropy(width,height,bit_depth,chroma_format,base_q_idx,
+        frame_index,blocks,block_count,modes,mode_count,low_delay_p,intra_modes,
+        partition_decisions,decision_count,0u,out,out_cap,out_size);
+}
+
+int svt_av2_encode_packet_tools_half_entropy(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t low_delay_p,
+    uint32_t intra_modes, const uint16_t* partition_decisions, size_t decision_count,
+    uint32_t entropy_adaptation, uint8_t* out, size_t out_cap, size_t* out_size) {
+    return encode_packet_ccso64(width,height,bit_depth,chroma_format,base_q_idx,
+        frame_index,blocks,block_count,modes,mode_count,low_delay_p,intra_modes,
+        partition_decisions,decision_count,entropy_adaptation,0u,0u,0u,0u,NULL,0u,0,0,0u,NULL,1u,0u,0u,NULL,
+        out,out_cap,out_size);
+}
+
+int svt_av2_encode_packet_inter_profile(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count, uint32_t entropy_adaptation,
+    uint32_t mv_half, uint32_t retain_reference, uint32_t sharp_filter,
+    uint8_t* out, size_t out_cap, size_t* out_size) {
+    return encode_packet_ccso64(width,height,bit_depth,chroma_format,base_q_idx,
+        frame_index,blocks,block_count,modes,mode_count,1u,intra_modes,
+        partition_decisions,decision_count,entropy_adaptation,0u,0u,0u,0u,NULL,0u,0,0,0u,NULL,
+        mv_half,retain_reference,sharp_filter,NULL,
+        out,out_cap,out_size);
+}
+
+int svt_av2_encode_packet_dual_ref(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count, uint32_t entropy_adaptation,
+    uint32_t mv_half, uint32_t sharp_filter, uint32_t refresh_mask, uint32_t reference_slot,
+    uint8_t* out, size_t out_cap, size_t* out_size) {
+    if (out == NULL || out_size == NULL) return SVT_AV2_BW_ERROR_NULL;
+    *out_size = 0;
+    if (refresh_mask > 3u || reference_slot > 1u) return SVT_AV2_BW_ERROR_RANGE;
+    if (frame_index == 0u && (refresh_mask || reference_slot || mv_half || sharp_filter ||
+        modes != NULL || mode_count != 0u)) return SVT_AV2_BW_ERROR_UNSUPPORTED;
+    const DualRefPacketConfig dual_ref = {refresh_mask, reference_slot, 0u, {0u, 0u}};
+    return encode_packet_ccso64(width,height,bit_depth,chroma_format,base_q_idx,
+        frame_index,blocks,block_count,modes,mode_count,1u,intra_modes,
+        partition_decisions,decision_count,entropy_adaptation,0u,0u,0u,0u,NULL,0u,0,0,0u,NULL,
+        mv_half,0u,sharp_filter,&dual_ref,
+        out,out_cap,out_size);
+}
+
+int svt_av2_encode_packet_two_refs_projected(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count, uint32_t entropy_adaptation,
+    uint32_t mv_half, uint32_t sharp_filter, uint32_t refresh_mask,
+    const uint32_t distance[2], uint8_t* out, size_t out_cap, size_t* out_size) {
+    if (out == NULL || out_size == NULL) return SVT_AV2_BW_ERROR_NULL;
+    *out_size = 0u;
+    if (frame_index == 0u) return SVT_AV2_BW_ERROR_UNSUPPORTED;
+    if (refresh_mask > 3u || entropy_adaptation > 1u) return SVT_AV2_BW_ERROR_RANGE;
+    if (distance != NULL && (distance[0] < 1u || distance[0] > 8u || distance[1] < 1u || distance[1] > 8u ||
+        distance[0] == distance[1] || distance[0] > frame_index || distance[1] > frame_index ||
+        mv_half != 2u || sharp_filter != 1u)) return SVT_AV2_BW_ERROR_RANGE;
+    const DualRefPacketConfig dual_ref = {refresh_mask, 0u, 2u,
+        {distance != NULL ? distance[0] : 0u, distance != NULL ? distance[1] : 0u}};
+    return encode_packet_ccso64(width,height,bit_depth,chroma_format,base_q_idx,
+        frame_index,blocks,block_count,modes,mode_count,1u,intra_modes,
+        partition_decisions,decision_count,entropy_adaptation,0u,0u,0u,0u,NULL,0u,0,0,0u,NULL,
+        mv_half,0u,sharp_filter,&dual_ref,out,out_cap,out_size);
+}
+
+int svt_av2_encode_packet_two_refs_entropy(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count, uint32_t entropy_adaptation,
+    uint32_t mv_half, uint32_t sharp_filter, uint32_t refresh_mask,
+    uint8_t* out, size_t out_cap, size_t* out_size) {
+    return svt_av2_encode_packet_two_refs_projected(width,height,bit_depth,chroma_format,base_q_idx,
+        frame_index,blocks,block_count,modes,mode_count,intra_modes,partition_decisions,decision_count,
+        entropy_adaptation,mv_half,sharp_filter,refresh_mask,NULL,out,out_cap,out_size);
+}
+
+int svt_av2_encode_packet_two_refs(uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t chroma_format, uint32_t base_q_idx,
+    uint32_t frame_index, const SvtAv2TileCoeffBlock* blocks, size_t block_count,
+    const SvtAv2TileBlockMode* modes, size_t mode_count, uint32_t intra_modes,
+    const uint16_t* partition_decisions, size_t decision_count,
+    uint32_t mv_half, uint32_t sharp_filter, uint32_t refresh_mask,
+    uint8_t* out, size_t out_cap, size_t* out_size) {
+    return svt_av2_encode_packet_two_refs_entropy(width,height,bit_depth,chroma_format,base_q_idx,
+        frame_index,blocks,block_count,modes,mode_count,intra_modes,partition_decisions,decision_count,
+        0u,mv_half,sharp_filter,refresh_mask,out,out_cap,out_size);
 }
 
 int svt_av2_encode_packet_tools_entropy(uint32_t width, uint32_t height,
@@ -531,7 +703,8 @@ int svt_av2_ccso64_header_size(const SvtAv2FrameHeaderConfig* cfg,SvtAv2Ccso64He
     uint8_t data[256];size_t prefix=0u;
     int st=encode_sequence_header_ex(cfg->frame_width,cfg->frame_height,cfg->bit_depth,
         cfg->chroma_format,0u,1u,cfg->m5_intra_modes>=2u,cfg->m5_intra_modes==4u,
-        cfg->enable_mrls,cfg->enable_mhccp,cfg->ccso64!=NULL,cfg->enable_pc_wiener,data,sizeof(data),&prefix);
+        cfg->enable_mrls,cfg->enable_mhccp,cfg->ccso64!=NULL,cfg->enable_pc_wiener,0u,
+        cfg->enable_intra_ist,cfg->enable_intra_edge_filter,cfg->enable_ibp,cfg->cdef_primary!=0u,cfg->enable_gdf,cfg->uv_delta_q,data,sizeof(data),&prefix);
     SvtAv2BitWriter bw;svt_av2_bit_writer_init(&bw,data,sizeof(data));
     if (st==0) st=svt_av2_bit_writer_write_bit(&bw,1u);
     if (st==0) st=svt_av2_frame_header_write(&bw,cfg);
@@ -543,13 +716,10 @@ int svt_av2_ccso64_header_size(const SvtAv2FrameHeaderConfig* cfg,SvtAv2Ccso64He
 int svt_av2_encode_still_picture_ccso64_packet(const SvtAv2FrameHeaderConfig* cfg,
     const SvtAv2TileCoeffBlock* blocks,size_t count,uint8_t* out,size_t capacity,size_t* bytes) {
     if (cfg==NULL) return SVT_AV2_BW_ERROR_NULL;
-    if (cfg->multi_frame || cfg->inter_frame || cfg->sb_shift!=4u || cfg->reduced_tx_set>2u)
+    if (cfg->multi_frame || cfg->inter_frame || cfg->enable_cfl_intra ||
+        cfg->sb_shift!=4u || cfg->reduced_tx_set>2u)
         return SVT_AV2_BW_ERROR_RANGE;
-    const uint32_t transform=cfg->reduced_tx_set==0u?2u:cfg->reduced_tx_set==1u?1u:0u;
-    return encode_packet_ccso64(cfg->frame_width,cfg->frame_height,cfg->bit_depth,cfg->chroma_format,
-        cfg->base_q_idx,0u,blocks,count,NULL,0u,0u,cfg->m5_intra_modes,cfg->partition_decisions,
-        cfg->partition_decision_count,cfg->entropy_adaptation,1u,transform,cfg->enable_mrls,
-        cfg->enable_mhccp,cfg->ccso64,cfg->deblock_y,cfg->deblock_delta,cfg->deblock_delta_h,cfg->enable_pc_wiener,cfg->pc_wiener_none_mask,out,capacity,bytes);
+    return emit_frame_packet(cfg,0u,blocks,count,NULL,0u,0u,out,capacity,bytes,NULL);
 }
 
 int svt_av2_encode_still_picture_ccso64(uint32_t width, uint32_t height,
@@ -568,7 +738,7 @@ int svt_av2_encode_still_picture_ccso64(uint32_t width, uint32_t height,
         (transform && intra_modes < 2u) || (mrl && intra_modes < 3u)) return SVT_AV2_BW_ERROR_RANGE;
     const int st = encode_packet_ccso64(width,height,bit_depth,chroma_format,
         base_q_idx,0u,blocks,block_count,NULL,0u,0u,intra_modes,decisions,
-        decision_count,entropy,1u,transform,mrl,mh,ccso64,0u,0,0,0u,0u,out,out_cap,out_size);
+        decision_count,entropy,1u,transform,mrl,mh,ccso64,0u,0,0,0u,NULL,0u,0u,0u,NULL,out,out_cap,out_size);
     if (st == 0) svt_av2_ccso64_apply(ccso64,recon);
     return st;
 }

@@ -287,6 +287,320 @@ static void frame_test(uint32_t width, uint32_t height, uint32_t bd,
     svt_av2_picture_free(&source); svt_av2_picture_free(&recon);
 }
 
+typedef struct SkipAudit {
+    Audit common;
+    uint64_t skip_trials, skip_winners, full_leaves, split_sbs, fractional_winners;
+    const SvtAv2FrameBuffer* recon;
+    const SvtAv2FrameBuffer* reference;
+    uint32_t half;
+} SkipAudit;
+
+static void observe_skip(void* user, size_t sb, uint64_t id, uint64_t d,
+    uint64_t r, uint64_t cost, int committed) {
+    SkipAudit* audit = (SkipAudit*)user;
+    observe(&audit->common, sb, id, d, r, cost, committed);
+    const uint32_t cols = (audit->common.width + 63u) / 64u;
+    const int full = audit->common.width - (uint32_t)(sb % cols) * 64u >= 64u &&
+        audit->common.height - (uint32_t)(sb / cols) * 64u >= 64u;
+    const size_t start = audit->common.previous_modes, end = audit->common.output->mode_count;
+    if (committed) {
+        audit->common.previous_modes = end;
+        if (full) { audit->full_leaves += end - start; audit->split_sbs += end - start > 1u; }
+    }
+    if (!((id >> 41u) & 1u)) return;
+    SVT_TEST_CHECK(full);
+    if (!committed) { ++audit->skip_trials; return; }
+    const uint32_t mask = (uint32_t)((id >> 32u) & 15u);
+    const uint32_t bd = audit->recon->bit_depth, step = bd > 8u ? 2u : 1u;
+    SVT_TEST_CHECK(mask > 0u && end > start && end - start <= 4u && (mask >> (end - start)) == 0u);
+    for (size_t i = start; i < end; ++i) {
+        if (!(mask & (1u << (i - start)))) continue;
+        ++audit->skip_winners;
+        const SvtAv2TileBlockMode* mode = audit->common.output->modes + i;
+        SVT_TEST_CHECK_EQ_INT(mode->is_inter, 1u);
+        if (audit->half && (mode->mv_x % 2 != 0 || mode->mv_y % 2 != 0)) ++audit->fractional_winners;
+        for (uint32_t p = 0u; p < 3u; ++p) {
+            const SvtAv2TileCoeffBlock* block = audit->common.output->blocks + i * 3u + p;
+            const size_t coeffs = (size_t)(block->width < 32u ? block->width : 32u) *
+                (block->height < 32u ? block->height : 32u);
+            for (size_t k = 0u; k < coeffs; ++k) SVT_TEST_CHECK_EQ_INT(block->qcoeff[k], 0);
+            SvtAv2BlockView view = {0};
+            view.x = block->x; view.y = block->y; view.w = block->width; view.h = block->height;
+            uint16_t pred[4096];
+            const SvtAv2MotionVector mv = {mode->mv_x, mode->mv_y};
+            const SvtAv2HalfPelMotionVector half = {mode->mv_x, mode->mv_y};
+            const SvtAv2Error e = audit->half ? svt_av2_inter_predict_half(audit->reference,
+                p, &view, half, pred, view.w) : svt_av2_inter_predict(audit->reference, p, &view, mv, pred, view.w);
+            SVT_TEST_CHECK_EQ_INT(e, SVT_AV2_ERROR_NONE);
+            if (e != SVT_AV2_ERROR_NONE) continue;
+            for (uint32_t y = 0u; y < view.h; ++y)
+                for (uint32_t x = 0u; x < view.w; ++x)
+                    SVT_TEST_CHECK_EQ_INT(pred[(size_t)y * view.w + x], svt_av2_sample_load(audit->recon->planes[p] +
+                        (size_t)(view.y + y) * audit->recon->strides[p] + (view.x + x) * step, bd));
+        }
+    }
+}
+
+static void skip_frame_test(uint32_t width, uint32_t height, uint32_t bd, SvtAv2ChromaFormat format,
+    uint32_t motion, uint32_t adaptive, uint32_t partition) {
+    SvtAv2FrameBuffer source = {0}, recon = {0};
+    SvtAv2ReferenceFrame reference = {0};
+    SvtAv2ReconScratch scratch = {0};
+    SvtAv2RdFrameOutput output = {0};
+    const size_t count = (size_t)width * height;
+    const uint32_t step = bd > 8u ? 2u : 1u;
+    output.block_capacity = count / 64u * 3u; output.mode_capacity = count / 64u;
+    output.coeff_capacity = count * 3u; output.decision_capacity = ((width + 63u) / 64u) * ((height + 63u) / 64u);
+    output.blocks = calloc(output.block_capacity, sizeof(*output.blocks));
+    output.modes = calloc(output.mode_capacity, sizeof(*output.modes));
+    output.qcoeff = calloc(output.coeff_capacity, sizeof(*output.qcoeff));
+    output.decisions = calloc(output.decision_capacity, sizeof(*output.decisions));
+    const SvtAv2Error a = svt_av2_picture_alloc_ex(&source, width, height, bd, format);
+    const SvtAv2Error b = svt_av2_picture_alloc_ex(&recon, width, height, bd, format);
+    const SvtAv2Error c = svt_av2_recon_pool_init(&scratch, 64u, 64u);
+    const SvtAv2Error f = svt_av2_reference_init(&reference, width, height, bd, format);
+    const int allocated = !a && !b && !c && !f && output.blocks && output.modes && output.qcoeff && output.decisions;
+    SVT_TEST_CHECK(allocated);
+    if (!allocated) goto done;
+    fill(&source);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_reference_prepare(&reference, &source, 0u), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_reference_commit(&reference), SVT_AV2_ERROR_NONE);
+    for (uint32_t p = 0u; p < 3u; ++p) {
+        const uint32_t uv420 = p && format == SVT_AV2_CHROMA_420;
+        const uint32_t pix_w = svt_av2_picture_plane_width(&source, p);
+        const uint32_t pix_h = svt_av2_picture_plane_height(&source, p);
+        for (uint32_t y = 0u; y < pix_h; ++y) {
+            const uint8_t* ref = reference.committed.planes[p] + (size_t)y * reference.committed.strides[p];
+            for (uint32_t x = 0u; x < pix_w; ++x) {
+                uint8_t* pixel = source.planes[p] + (size_t)y * source.strides[p] + x * step;
+                uint16_t value = svt_av2_sample_load(ref + x * step, bd);
+                /* Opposing 3.5-pel shifts make a single SB MV genuinely
+                 * inferior to separate quadrant MVs. Compute edge-extended
+                 * fractional samples independently, including UV420. */
+                if (motion == 3u) {
+                    const uint32_t parity = (y / (uv420 ? 16u : 32u) + x / (uv420 ? 16u : 32u)) % 2u;
+                    const int32_t denom = uv420 ? 4 : 2, units = parity ? -7 : 7;
+                    const int32_t integral = units >= 0 ? units / denom : (units - denom + 1) / denom;
+                    const uint32_t fraction = (uint32_t)(units - integral * denom);
+                    const int32_t x0 = (int32_t)x + integral, x1 = x0 + 1;
+                    const uint32_t a_pos = x0 < 0 ? 0u : (uint32_t)x0 >= pix_w ? pix_w - 1u : (uint32_t)x0;
+                    const uint32_t b_pos = x1 < 0 ? 0u : (uint32_t)x1 >= pix_w ? pix_w - 1u : (uint32_t)x1;
+                    const uint16_t aa = svt_av2_sample_load(ref + a_pos * step, bd);
+                    const uint16_t bb = svt_av2_sample_load(ref + b_pos * step, bd);
+                    value = (uint16_t)((((uint32_t)denom - fraction) * aa + fraction * bb +
+                        (uint32_t)denom / 2u) / (uint32_t)denom);
+                }
+                const uint16_t delta = (uint16_t)(2u << (bd - 8u));
+                if ((uint32_t)value + delta < (1u << bd)) value = (uint16_t)(value + delta);
+                svt_av2_sample_store(pixel, bd, value);
+            }
+        }
+    }
+    const uint64_t src_hash = picture_hash(&source), ref_hash = picture_hash(&reference.committed);
+    SvtAv2RdFrameConfig cfg = {0};
+    svt_av2_frame_header_config_default(&cfg.frame_header, width, height);
+    cfg.frame_header.bit_depth = bd; cfg.frame_header.chroma_format = (uint32_t)format;
+    cfg.frame_header.base_q_idx = 145u + (bd == 10u ? 48u : 0u);
+    cfg.frame_header.reduced_tx_set = 2u; cfg.frame_header.multi_frame = cfg.frame_header.inter_frame = 1u;
+    cfg.frame_header.m5_intra_modes = 1u; cfg.frame_header.mv_half = motion == 3u ? 1u : 0u;
+    cfg.frame_header.entropy_adaptation = adaptive;
+    cfg.rd_mode = 2u; cfg.partition_selection = partition; cfg.motion_optimization = motion;
+    SvtAv2TransformPathState transform;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_transform_path_init_bd(&transform, &cfg.transform,
+        cfg.frame_header.base_q_idx, bd), SVT_AV2_ERROR_NONE);
+    SvtAv2RdFrameStats baseline = {0}, first = {0}, reverse = {0};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &reference, &cfg, &scratch, &output, &baseline), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(baseline.inter_skip_trials + baseline.inter_skip_accepts, 0u);
+    SkipAudit audit = {0};
+    audit.recon = &recon; audit.reference = &reference.committed;
+    audit.half = cfg.frame_header.mv_half;
+    audit.common.width = width; audit.common.height = height;
+    audit.common.output = &output;
+    audit.common.lambda = baseline.lambda_q8;
+    cfg.inter_skip_search = 1u;
+    cfg.candidate_hook = observe_skip;
+    cfg.candidate_hook_user = &audit;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &reference, &cfg, &scratch, &output, &first), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(first.replay_checks, output.decision_count);
+    SVT_TEST_CHECK_EQ_INT(first.distortion, independent_distortion(&source, &recon));
+    SVT_TEST_CHECK_EQ_INT(first.inter_skip_trials, audit.skip_trials);
+    SVT_TEST_CHECK_EQ_INT(first.inter_skip_trials, audit.full_leaves);
+    SVT_TEST_CHECK_EQ_INT(first.inter_skip_accepts, audit.skip_winners);
+    SVT_TEST_CHECK(first.inter_skip_trials >= first.full_superblocks && first.inter_skip_trials <= first.full_superblocks * 4u);
+    SVT_TEST_CHECK(first.inter_skip_accepts > 0u);
+    if (partition) SVT_TEST_CHECK(audit.split_sbs > 0u);
+    if (motion == 3u) SVT_TEST_CHECK(audit.fractional_winners > 0u);
+    if (width == 64u && height == 64u && partition == 0u) {
+        SVT_TEST_CHECK_EQ_INT(first.inter_skip_trials, 1u);
+        SVT_TEST_CHECK(first.cost < baseline.cost);
+        SVT_TEST_CHECK_EQ_INT(first.forward_calls + 3u, baseline.forward_calls);
+    }
+    cfg.frame_header.partition_decisions = output.decisions;
+    cfg.frame_header.partition_decision_count = output.decision_count;
+    uint64_t replay_rate = 0u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_tile_rate_frame(&cfg.frame_header, output.blocks, output.block_count,
+        output.modes, output.mode_count, &replay_rate), 0);
+    SVT_TEST_CHECK_EQ_INT(replay_rate, first.rate_q12);
+    cfg.frame_header.partition_decisions = NULL; cfg.frame_header.partition_decision_count = 0u;
+    cfg.candidate_hook = NULL;
+    cfg.reverse_candidates = 1u;
+    const uint64_t recon_hash = picture_hash(&recon);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &reference, &cfg, &scratch, &output, &reverse), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(reverse.winner_hash, first.winner_hash);
+    SVT_TEST_CHECK_EQ_INT(reverse.rate_q12, first.rate_q12);
+    SVT_TEST_CHECK_EQ_INT(reverse.inter_skip_accepts, first.inter_skip_accepts);
+    SVT_TEST_CHECK_EQ_INT(recon_hash, picture_hash(&recon));
+    cfg.inter_skip_search = 2u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &reference, &cfg, &scratch, &output, &reverse),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    cfg.inter_skip_search = 1u;
+    cfg.rd_mode = 1u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &reference, &cfg, &scratch, &output, &reverse),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    SVT_TEST_CHECK_EQ_INT(src_hash, picture_hash(&source));
+    SVT_TEST_CHECK_EQ_INT(ref_hash, picture_hash(&reference.committed));
+
+done:
+    free(output.blocks); free(output.modes); free(output.qcoeff); free(output.decisions);
+    svt_av2_reference_release(&reference); svt_av2_recon_pool_free(&scratch);
+    svt_av2_picture_free(&source); svt_av2_picture_free(&recon);
+}
+
+static void fine_frame_test(uint32_t width, uint32_t height, uint32_t bd,
+    SvtAv2ChromaFormat chroma, uint32_t adaptive) {
+    SvtAv2FrameBuffer source = {0}, recon = {0};
+    SvtAv2ReferenceFrame ref = {0};
+    SvtAv2ReconScratch scratch = {0};
+    SvtAv2RdFrameOutput output = {0};
+    const size_t pixels = (size_t)width * height;
+    output.block_capacity = 3u * pixels / 64u; output.mode_capacity = pixels / 64u;
+    output.coeff_capacity = pixels * 3u;
+    output.decision_capacity = ((width + 63u) / 64u) * ((height + 63u) / 64u);
+    output.blocks = (SvtAv2TileCoeffBlock*)calloc(output.block_capacity, sizeof(*output.blocks));
+    output.modes = (SvtAv2TileBlockMode*)calloc(output.mode_capacity, sizeof(*output.modes));
+    output.qcoeff = (int32_t*)calloc(output.coeff_capacity, sizeof(*output.qcoeff));
+    output.decisions = (uint16_t*)calloc(output.decision_capacity, sizeof(*output.decisions));
+    SVT_TEST_CHECK(output.blocks && output.modes && output.qcoeff && output.decisions);
+    if (!output.blocks || !output.modes || !output.qcoeff || !output.decisions) goto done;
+    const SvtAv2Error a = svt_av2_picture_alloc_ex(&source, width, height, bd, chroma);
+    const SvtAv2Error b = svt_av2_picture_alloc_ex(&recon, width, height, bd, chroma);
+    const SvtAv2Error c = svt_av2_reference_init(&ref, width, height, bd, chroma);
+    const SvtAv2Error d = svt_av2_recon_pool_init(&scratch, 64u, 64u);
+    SVT_TEST_CHECK(a == 0 && b == 0 && c == 0 && d == 0);
+    if (a || b || c || d) goto done;
+    fill(&source);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_reference_prepare(&ref, &source, 0u), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_reference_commit(&ref), SVT_AV2_ERROR_NONE);
+    /* Abrupt opposing odd-quarter shifts within one 32 quadrant; remaining
+     * quadrants use one vector. Includes both completed SBs and clipped edges. */
+    const uint32_t step = bd > 8u ? 2u : 1u;
+    for (uint32_t p = 0u; p < 3u; ++p) {
+        const uint32_t side = p != 0u && chroma == SVT_AV2_CHROMA_420 ? 8u : 16u;
+        const uint32_t w = svt_av2_picture_plane_width(&source, p);
+        const uint32_t h = svt_av2_picture_plane_height(&source, p);
+        for (uint32_t y = 0u; y < h; y += side) for (uint32_t x = 0u; x < w; x += side) {
+            if (w - x < side || h - y < side) continue;
+            const SvtAv2BlockView leaf = {x, y, side, side, NULL};
+            const uint32_t q = (y / (2u * side) % 2u) * 2u + x / (2u * side) % 2u;
+            const uint32_t sb = x / (4u * side) + 3u * (y / (4u * side));
+            const uint32_t cell = (y / side % 2u) * 2u + x / side % 2u;
+            static const SvtAv2QuarterPelMotionVector shifts[4] = {{-29, 13}, {27, -13}, {29, 9}, {-27, -9}};
+            const SvtAv2QuarterPelMotionVector ambient = {3, -1};
+            const SvtAv2QuarterPelMotionVector mv = q == sb % 4u ? shifts[cell] : ambient;
+            uint16_t prediction[16u * 16u];
+            SVT_TEST_CHECK_EQ_INT(svt_av2_inter_predict_quarter_sharp(&ref.committed, p,
+                &leaf, mv, prediction, side), SVT_AV2_ERROR_NONE);
+            for (uint32_t j = 0u; j < side; ++j) for (uint32_t i = 0u; i < side; ++i)
+                svt_av2_sample_store(source.planes[p] + (size_t)(y + j) * source.strides[p] + (x + i) * step,
+                    bd, prediction[(size_t)j * side + i]);
+        }
+    }
+    const uint64_t src_hash = picture_hash(&source), ref_hash = picture_hash(&ref.committed);
+    SvtAv2RdFrameConfig cfg = {0};
+    svt_av2_frame_header_config_default(&cfg.frame_header, width, height);
+    cfg.frame_header.bit_depth = bd; cfg.frame_header.chroma_format = (uint32_t)chroma;
+    cfg.frame_header.base_q_idx = 116u + (bd == 10u ? 48u : 0u);
+    cfg.frame_header.reduced_tx_set = 2u; cfg.frame_header.multi_frame = cfg.frame_header.inter_frame = 1u;
+    cfg.frame_header.m5_intra_modes = 1u; cfg.frame_header.mv_half = 2u; cfg.frame_header.sharp_filter = 1u;
+    cfg.frame_header.entropy_adaptation = adaptive;
+    cfg.rd_mode = 2u; cfg.partition_selection = 1u; cfg.motion_optimization = 5u;
+    SvtAv2TransformPathState transform;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_transform_path_init_bd(&transform, &cfg.transform,
+        cfg.frame_header.base_q_idx, bd), SVT_AV2_ERROR_NONE);
+    SvtAv2RdFrameStats coarse = {0}, fine = {0}, reverse = {0};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &ref, &cfg, &scratch, &output, &coarse), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(coarse.inter_fine_trials + coarse.inter_fine_accepts, 0u);
+    const uint64_t coarse_recon = picture_hash(&recon);
+    Audit audit = {0}; audit.lambda = coarse.lambda_q8;
+    cfg.inter_fine = 1u; cfg.candidate_hook = observe; cfg.candidate_hook_user = &audit;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &ref, &cfg, &scratch, &output, &fine), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(fine.replay_checks, output.decision_count);
+    SVT_TEST_CHECK_EQ_INT(fine.distortion, independent_distortion(&source, &recon));
+    SVT_TEST_CHECK(fine.inter_fine_trials <= 2u * fine.full_superblocks);
+    SVT_TEST_CHECK(fine.inter_fine_accepts > 0u && fine.inter_fine_accepts <= fine.inter_fine_trials);
+    unsigned split_sbs = 0u, fractional_fine = 0u;
+    for (size_t i = 0u; i < output.decision_count; ++i) {
+        const uint32_t cols = (width + 63u) / 64u;
+        SVT_TEST_CHECK_EQ_INT(audit.committed[i], 1u);
+        if (height - (uint32_t)(i / cols) * 64u < 64u || width - (uint32_t)(i % cols) * 64u < 64u) {
+            SVT_TEST_CHECK_EQ_INT(output.decisions[i], 0u);
+            continue;
+        }
+        if (output.decisions[i] > 1u) {
+            ++split_sbs;
+            SVT_TEST_CHECK_EQ_INT(audit.minimum_id[i], (UINT64_C(1) << 42u) | output.decisions[i]);
+            unsigned splits = 0u;
+            for (uint32_t q = 0u; q < 4u; ++q)
+                splits += svt_av2_partition_plan_depth(output.decisions[i], q) == 2u;
+            SVT_TEST_CHECK(splits == 1u || splits == 2u);
+        }
+    }
+    SVT_TEST_CHECK_EQ_INT(split_sbs, fine.inter_fine_accepts);
+    for (size_t i = 0u; i < output.mode_count; ++i) {
+        const SvtAv2TileCoeffBlock* y = &output.blocks[3u * i];
+        const SvtAv2TileBlockMode* m = &output.modes[i];
+        if (y->width == 16u && y->height == 16u && m->is_inter && (m->mv_x % 2 || m->mv_y % 2))
+            ++fractional_fine;
+    }
+    SVT_TEST_CHECK(fractional_fine > 0u);
+    if (width == 64u && height == 64u) SVT_TEST_CHECK(fine.cost < coarse.cost);
+    cfg.frame_header.partition_decisions = output.decisions;
+    cfg.frame_header.partition_decision_count = output.decision_count;
+    uint64_t rate = 0u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_tile_rate_frame(&cfg.frame_header, output.blocks, output.block_count,
+        output.modes, output.mode_count, &rate), 0);
+    SVT_TEST_CHECK_EQ_INT(rate, fine.rate_q12);
+    const uint64_t recon_hash = picture_hash(&recon);
+    cfg.frame_header.partition_decisions = NULL; cfg.frame_header.partition_decision_count = 0u;
+    cfg.candidate_hook = NULL; cfg.reverse_candidates = 1u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &ref, &cfg, &scratch, &output, &reverse), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(reverse.winner_hash, fine.winner_hash);
+    SVT_TEST_CHECK_EQ_INT(reverse.inter_fine_trials, fine.inter_fine_trials);
+    SVT_TEST_CHECK_EQ_INT(reverse.inter_fine_accepts, fine.inter_fine_accepts);
+    SVT_TEST_CHECK_EQ_INT(reverse.rate_q12, fine.rate_q12);
+    SVT_TEST_CHECK_EQ_INT(picture_hash(&recon), recon_hash);
+    cfg.inter_skip_search = 1u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &ref, &cfg, &scratch, &output, &reverse),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    cfg.inter_skip_search = 0u; cfg.partition_selection = 0u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &ref, &cfg, &scratch, &output, &reverse),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    cfg.partition_selection = 1u; cfg.inter_fine = 2u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &ref, &cfg, &scratch, &output, &reverse),
+        SVT_AV2_ERROR_INVALID_PARAMETER);
+    cfg.inter_fine = 0u;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_rd_frame_encode(&source, &recon, &ref, &cfg, &scratch, &output, &reverse), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(reverse.winner_hash, coarse.winner_hash);
+    SVT_TEST_CHECK_EQ_INT(picture_hash(&recon), coarse_recon);
+    SVT_TEST_CHECK_EQ_INT(picture_hash(&source), src_hash);
+    SVT_TEST_CHECK_EQ_INT(picture_hash(&ref.committed), ref_hash);
+
+done:
+    free(output.blocks); free(output.modes); free(output.qcoeff); free(output.decisions);
+    svt_av2_reference_release(&ref); svt_av2_recon_pool_free(&scratch);
+    svt_av2_picture_free(&source); svt_av2_picture_free(&recon);
+}
+
 typedef struct FullCandidate { int32_t x, y; uint64_t sad; } FullCandidate;
 static int full_order(const void* av, const void* bv) {
     const FullCandidate* a = (const FullCandidate*)av;
@@ -376,7 +690,60 @@ static void list_tests(void) {
     SVT_TEST_CHECK(appended > 0u);
 }
 
+static void check_projected_motion_parity(void) {
+    SvtAv2MotionSyntax motion;
+    const int init = svt_av2_motion_syntax_init_precision(&motion, 128u, 64u, 2u);
+    SVT_TEST_CHECK_EQ_INT(init, 0);
+    if (init != 0) return;
+    motion.two_refs = 1u;
+    motion.ref_distance[0] = 2u;
+    motion.ref_distance[1] = 3u;
+    SvtAv2EntropyEncoder enc;
+    svt_av2_entropy_rate_init(&enc);
+    const SvtAv2BlockView first = {0,0,64,64,NULL}, second = {64,0,16,16,NULL};
+    const SvtAv2TileBlockMode old = {1u,-2,2,1u}, bad = {1u,0,0,0u}, exact = {1u,-1,1,0u};
+    const SvtAv2MotionCell speculative = {-2,2,1u,2u,1u,1u};
+    const SvtAv2MotionCell intra = {0,0,1u,0u,0u,1u};
+    SvtAv2MotionPrefix prefix = {&first, &speculative, 1u};
+    int32_t px = 77, py = 88;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &second, 0u, NULL, &px, &py), 0);
+    SVT_TEST_CHECK(px == 0 && py == 0);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &second, 0u, &prefix, &px, &py), 0);
+    SVT_TEST_CHECK(px == -1 && py == 1 && !motion.cells[0].valid && enc.rate_q12 == 0);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &first, &old, 1u), 0);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &second, 0u, NULL, &px, &py), 0);
+    SVT_TEST_CHECK(px == -1 && py == 1);
+    prefix.cells = &intra;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &second, 0u, &prefix, &px, &py), 0);
+    SVT_TEST_CHECK(px == 0 && py == 0 && motion.cells[0].is_inter == 2u);
+    const uint64_t before = enc.rate_q12, symbols = enc.rate_symbols;
+    const unsigned right = second.x / 4u;
+    SVT_TEST_CHECK_EQ_INT(motion.cells[right].valid, 0u);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &second, &bad, 1u),
+        SVT_AV2_ENTROPY_ERROR_RANGE);
+    SVT_TEST_CHECK(enc.rate_q12 == before && enc.rate_symbols == symbols && !motion.cells[right].valid);
+    const SvtAv2BlockView unsupported[] = {{64,0,4,4,NULL}, {68,0,16,16,NULL}, {64,0,16,32,NULL}};
+    for (uint32_t i = 0u; i < sizeof(unsupported) / sizeof(unsupported[0]); ++i) {
+        SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &unsupported[i], &exact, 1u),
+            SVT_AV2_ENTROPY_ERROR_RANGE);
+        SVT_TEST_CHECK(enc.rate_q12 == before && enc.rate_symbols == symbols && !motion.cells[right + 1u].valid);
+    }
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &second, &exact, 1u), 0);
+    SVT_TEST_CHECK_EQ_INT(motion.cells[right].is_inter, 1u);
+    SVT_TEST_CHECK_EQ_INT(motion.cells[right].is_new, 0u);
+    SVT_TEST_CHECK_EQ_INT(motion.cells[right].mv_x, -1);
+    SVT_TEST_CHECK_EQ_INT(motion.cells[right].mv_y, 1);
+    SVT_TEST_CHECK(enc.rate_q12 > before && enc.rate_symbols > symbols);
+    const SvtAv2BlockView edge = {80,0,8,8,NULL};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &edge, 0u, NULL, &px, &py), 0);
+    const SvtAv2TileBlockMode edge_mode = {1u,px,py,0u};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &edge, &edge_mode, 1u), 0);
+    SVT_TEST_CHECK(motion.cells[edge.x / 4u].valid && !motion.cells[edge.x / 4u].is_new);
+    svt_av2_motion_syntax_free(&motion);
+}
+
 int main(void) {
+    check_projected_motion_parity();
     list_tests();
     frame_test(56u, 56u, 10u, SVT_AV2_CHROMA_420, 1);
     frame_test(64u, 64u, 8u, SVT_AV2_CHROMA_420, 0);
@@ -385,6 +752,12 @@ int main(void) {
     frame_test(128u, 128u, 8u, SVT_AV2_CHROMA_420, 1);
     frame_test(136u, 72u, 10u, SVT_AV2_CHROMA_420, 0);
     frame_test(120u, 120u, 10u, SVT_AV2_CHROMA_444, 1);
+    skip_frame_test(64u, 64u, 8u, SVT_AV2_CHROMA_420, 0u, 0u, 0u);
+    skip_frame_test(136u, 72u, 10u, SVT_AV2_CHROMA_420, 3u, 1u, 1u);
+    skip_frame_test(64u, 64u, 10u, SVT_AV2_CHROMA_444, 2u, 1u, 0u);
+    fine_frame_test(64u, 64u, 8u, SVT_AV2_CHROMA_420, 0u);
+    fine_frame_test(136u, 128u, 10u, SVT_AV2_CHROMA_420, 1u);
+    fine_frame_test(128u, 72u, 10u, SVT_AV2_CHROMA_444, 0u);
     SVT_TEST_CHECK(total_accepts > 0u);
     SVT_TEST_REPORT("test_m6_motion");
 }

@@ -27,6 +27,8 @@ typedef struct RdTransformCacheEntry {
     uint32_t generation;
 } RdTransformCacheEntry;
 typedef struct RdTransformCache {
+    int8_t uv_delta_q;
+    uint32_t qm_level;  /* Immutable for the lifetime of the frame cache. */
     RdTransformCacheEntry* entries;
     uint32_t* buckets;
     uint8_t* arena;
@@ -144,7 +146,7 @@ static int rd_tx_memo_restore(RdTransformCache* c, uint32_t id,
     memcpy(coeff, raw, count * sizeof(*coeff));
     memcpy(qcoeff, raw + count * sizeof(*coeff), count * sizeof(*qcoeff));
     SvtAv2QuantParams params;
-    if (svt_av2_quant_params_init_tx_bd(&params, e->key[4], w, h, e->key[5]) !=
+    if (svt_av2_quant_params_init_matrix(&params, e->key[4], w, h, e->key[5], c->qm_level, c->uv_delta_q) !=
             SVT_AV2_QUANT_OK ||
         svt_av2_dequantize_block(&params, qcoeff, dqcoeff, count, (int)e->key[0]) !=
             SVT_AV2_QUANT_OK) return 0;

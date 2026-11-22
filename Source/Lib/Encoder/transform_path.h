@@ -70,6 +70,13 @@ typedef struct SvtAv2TransformPathState {
     /* Chosen qindex, kept so the per-block quantizer init can be re-derived. */
     uint32_t base_q_idx;
     uint32_t bit_depth;
+    int8_t uv_delta_q;
+    uint8_t qm_level;
+    uint8_t ac_prune;
+    uint8_t avm_fp_round;
+#if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
+    int match_dct64; /* Set before starting the frame; never shared across paths. */
+#endif
     /* Counters, so a caller (or a test) can prove the path actually ran. */
     uint64_t forward_calls;
     uint64_t inverse_calls;

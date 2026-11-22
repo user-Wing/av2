@@ -99,15 +99,22 @@ typedef struct SvtAv2SequenceHeaderConfig {
     uint32_t use_128x128_superblock;
     /* 0 => single tile (the decoder derives the tile grid from the frame). */
     uint32_t seq_tile_info_present_flag;
-    uint32_t low_delay_p;               /* M4 one-slot explicit reference map */
+    uint32_t low_delay_p;               /* Explicit low-delay reference map. */
     uint32_t bit_depth;                  /* 8 or 10 */
     uint32_t chroma_format;              /* 1=420, 3=444 (public enum) */
     uint32_t chroma_dct_only;            /* I1 UV modes require the implemented DCT path. */
     uint32_t enable_cfl_intra;           /* M6 implicit CfL, filter index zero. */
+    uint32_t enable_intra_ist;
+    uint32_t enable_ibp;
+    uint32_t enable_intra_edge_filter;
     uint32_t enable_mrls; /* Optional Y multi-reference-line syntax. */
     uint32_t enable_mhccp; /* Optional filter0 multi-parameter chroma-from-luma syntax. */
     uint32_t enable_ccso64; /* Internal forced64 BO-only; default0. */
+    uint32_t enable_gdf;
+    int8_t uv_delta_q;
+    uint32_t enable_cdef;
     uint32_t enable_pc_wiener; /* Single-picture luma PC-Wiener, RU256. */
+    uint32_t dual_ref; /* Low-delay multi-frame only: two physical DPB slots (default 0). */
 } SvtAv2SequenceHeaderConfig;
 
 /* Fills cfg with the frozen M1 defaults for the given frame size:

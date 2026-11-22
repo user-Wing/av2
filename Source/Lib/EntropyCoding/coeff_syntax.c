@@ -14,6 +14,8 @@
  */
 #include "coeff_syntax.h"
 #include "entropy_models.h"
+#include "intra_ist.h"
+#include "intra_ist_modes.h"
 
 #include "cdf_tables.h"
 #include "cdf_tables_coeff.h"
@@ -634,11 +636,20 @@ static uint32_t or_edge(const uint8_t* level, const uint8_t* dc, uint32_t from,
     return acc;
 }
 
-int svt_av2_coeff_write_block_transform_intra(SvtAv2EntropyEncoder* enc,
+static int emit_ist(SvtAv2EntropyEncoder* enc, uint32_t q_ctx, uint32_t model,
+    uint32_t nsyms, uint32_t symbol) {
+    uint16_t cdf[6];
+    for (uint32_t i = 0u; i + 1u < nsyms; ++i)
+        cdf[i] = (uint16_t)(32768u - svt_av2_model_defaults[q_ctx][model][i]);
+    return emit_sym(enc, model, cdf, nsyms, symbol);
+}
+
+int svt_av2_coeff_write_block_transform_ist(SvtAv2EntropyEncoder* enc,
                               const SvtAv2CoeffPlaneInfo* plane_info,
                               uint8_t eob_u_nonzero, const int32_t* qcoeff,
                               SvtAv2CoeffNeighbours* nb, uint32_t q_ctx, uint32_t is_inter,
-                              uint32_t reduced_tx_set, uint32_t tx_type, uint32_t intra_mode) {
+                              uint32_t reduced_tx_set, uint32_t tx_type, uint32_t intra_mode,
+                              uint32_t enable_ist, uint32_t ist) {
     if (enc == NULL || plane_info == NULL || qcoeff == NULL || nb == NULL) {
         return SVT_AV2_COEFF_ERR_NULL;
     }
@@ -694,6 +705,14 @@ int svt_av2_coeff_write_block_transform_intra(SvtAv2EntropyEncoder* enc,
 
     /* --- 1. all_zero (5.20.7.27 p.224; CDF 8.3.2 p.598) ------------------ */
     cb.eob = svt_av2_coeff_find_eob(qcoeff, scan_buf, cb.count);
+    const uint32_t ist_mode = enable_ist ? svt_av2_ist_mode(intra_mode) : 12u;
+    const int ist_signal = enable_ist && !is_inter && pi->plane == 0u &&
+        ist_mode < 12u && cb.eob > 1u &&
+        cb.eob <= svt_av2_ist_eob_limit(cb.ctx_w, cb.ctx_h, tx_type);
+    if (ist && (!ist_signal || cb.ctx_w < 8u || cb.ctx_h < 8u ||
+        svt_av2_ist_set(ist) < (tx_type == 3u ? 7u : 0u) ||
+        svt_av2_ist_set(ist) >= (tx_type == 3u ? 11u : 7u)))
+        return SVT_AV2_COEFF_ERR_UNSUPPORTED;
     /* Intra EOB=1 implies DCT_DCT in the frozen decoder. */
     if (tx_type != 0u && cb.eob == 1u) return SVT_AV2_COEFF_ERR_UNSUPPORTED;
     const uint32_t az_symbol = (cb.eob == 0u) ? 1u : 0u;
@@ -855,6 +874,21 @@ int svt_av2_coeff_write_block_transform_intra(SvtAv2EntropyEncoder* enc,
         const uint32_t diag = ((cb.eob - 1u) >> cb.bwl) + ((cb.eob - 1u) & (cb.width - 1u));
         const uint32_t ectx = diag < 2u ? 1u : diag > cb.width + cb.height - 4u ? 2u : 0u;
         const int st = emit_sym(enc, SVT_AV2_MODEL_INTER_TX + ectx * 4u + (uint32_t)pi->tx_size, &cdf, 2u, 1u);
+        if (st != 0) return st;
+    }
+    if (ist_signal) {
+        uint32_t context = 0u;
+        for (uint32_t side = 4u; side < min_u32(cb.ctx_w, cb.ctx_h); side *= 2u) ++context;
+        int st = emit_ist(enc, q_ctx, SVT_AV2_MODEL_INTRA_IST + context, 4u,
+            ist ? svt_av2_ist_type(ist) : 0u);
+        if (st == 0 && ist) {
+            const uint32_t set = svt_av2_ist_set(ist);
+            st = tx_type == 3u ?
+                emit_ist(enc, q_ctx, SVT_AV2_MODEL_IST_SET_ADST, 4u,
+                    ist_adst_set_symbol[ist_mode][set - 7u]) :
+                emit_ist(enc, q_ctx, SVT_AV2_MODEL_IST_SET_DCT, 7u,
+                    ist_dct_set_symbol[ist_mode][set]);
+        }
         if (st != 0) return st;
     }
     /* --- 3. magnitudes, scan order c = eob-1 down to 1 (5.20.7.27 p.228) -- */
@@ -1181,6 +1215,14 @@ int svt_av2_coeff_write_block_transform_intra(SvtAv2EntropyEncoder* enc,
     }
 
     return SVT_AV2_COEFF_OK;
+}
+
+int svt_av2_coeff_write_block_transform_intra(SvtAv2EntropyEncoder* enc,
+    const SvtAv2CoeffPlaneInfo* pi, uint8_t eob_u_nonzero, const int32_t* qcoeff,
+    SvtAv2CoeffNeighbours* nb, uint32_t q_ctx, uint32_t is_inter,
+    uint32_t reduced_tx_set, uint32_t tx_type, uint32_t intra_mode) {
+    return svt_av2_coeff_write_block_transform_ist(enc, pi, eob_u_nonzero, qcoeff, nb,
+        q_ctx, is_inter, reduced_tx_set, tx_type, intra_mode, 0u, 0u);
 }
 
 int svt_av2_coeff_write_block_transform(SvtAv2EntropyEncoder* enc,

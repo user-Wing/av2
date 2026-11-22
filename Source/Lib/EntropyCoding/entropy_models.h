@@ -9,6 +9,8 @@ typedef struct SvtAv2EntropyModels {
 } SvtAv2EntropyModels;
 
 int svt_av2_entropy_models_init(SvtAv2EntropyModels* models, uint32_t qctx);
+/* Decay counts once at frame end before saving the initialized tile context. */
+void svt_av2_entropy_models_decay(SvtAv2EntropyModels* models);
 int svt_av2_entropy_model_update(uint16_t* cdf, uint32_t nsyms, uint32_t symbol);
 /* Explicit semantic ID, with the frozen forward row retained for off mode. */
 int svt_av2_entropy_encode_model(SvtAv2EntropyEncoder* enc, uint32_t model,

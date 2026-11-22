@@ -1,28 +1,122 @@
 #include "motion_estimation.h"
 #include <stdint.h>
 
+#if (defined(_M_X64) && !defined(_M_ARM64EC)) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(__SSE2__)
+#include <emmintrin.h>
+#define SVT_ME_SSE2 1
+#else
+#define SVT_ME_SSE2 0
+#endif
+
 static uint32_t edge_coordinate(int64_t coordinate, uint32_t extent) {
     if (coordinate < 0) return 0;
     if (coordinate >= extent) return extent - 1;
     return (uint32_t)coordinate;
 }
-/* AVM avm_scale/generic/yv12extend.c extends each edge sample and then each
- * edge row. Clamping each address has the same result without reading padding. */
+static inline uint32_t sample_difference(int a, int b) {
+    const int diff = a - b;
+    return (uint32_t)(diff < 0 ? -diff : diff);
+}
+
+/* Like AVM's SAD over an edge-extended reference, but only read visible
+ * samples: repeat the first/last sample around the contiguous middle span. */
+static inline uint64_t sad_row_8(const uint8_t* src, const uint8_t* ref,
+    uint32_t left, uint32_t middle, uint32_t right) {
+    uint64_t sad = 0;
+    if (left != 0) {
+        const uint8_t edge = ref[0];
+        for (uint32_t x = 0; x < left; ++x) sad += sample_difference(src[x], edge);
+        src += left;
+    }
+    uint32_t x = 0u;
+#if SVT_ME_SSE2
+    if (middle >= 16u) {
+        __m128i lanes = _mm_setzero_si128();
+        const uint32_t stop = middle & ~15u;
+        for (; x < stop; x += 16u) {
+            const __m128i a = _mm_loadu_si128((const __m128i*)(src + x));
+            const __m128i b = _mm_loadu_si128((const __m128i*)(ref + x));
+            lanes = _mm_add_epi64(lanes, _mm_sad_epu8(a, b));
+        }
+        /* Per-lane total <= 255 * UINT32_MAX, so the reduction fits uint64_t. */
+        uint64_t values[2];
+        _mm_storeu_si128((__m128i*)values, lanes);
+        sad += values[0] + values[1];
+    }
+#endif
+    for (; x < middle; ++x) sad += sample_difference(src[x], ref[x]);
+    if (right != 0) {
+        const uint8_t edge = ref[middle != 0 ? middle - 1u : 0u];
+        src += middle;
+        for (uint32_t tail = 0; tail < right; ++tail) sad += sample_difference(src[tail], edge);
+    }
+    return sad;
+}
+
+static inline uint64_t sad_row_10(const uint8_t* src, const uint8_t* ref,
+    uint32_t left, uint32_t middle, uint32_t right) {
+    uint64_t sad = 0;
+    if (left != 0) {
+        const uint16_t edge = svt_av2_sample_load(ref, 10);
+        for (uint32_t x = 0; x < left; ++x)
+            sad += sample_difference(svt_av2_sample_load(src + (size_t)x * 2u, 10), edge);
+        src += (size_t)left * 2u;
+    }
+    uint32_t x = 0u;
+#if SVT_ME_SSE2
+    if (middle >= 8u && middle <= 4096u) {
+        __m128i lanes = _mm_setzero_si128();
+        const __m128i zero = _mm_setzero_si128();
+        const uint32_t stop = middle & ~7u;
+        for (; x < stop; x += 8u) {
+            const size_t offset = (size_t)x * 2u;
+            const __m128i a = _mm_loadu_si128((const __m128i*)(src + offset));
+            const __m128i b = _mm_loadu_si128((const __m128i*)(ref + offset));
+            /* Unsigned absolute difference even for full-range words. */
+            const __m128i diff = _mm_or_si128(_mm_subs_epu16(a, b), _mm_subs_epu16(b, a));
+            lanes = _mm_add_epi32(lanes, _mm_add_epi32(_mm_unpacklo_epi16(diff, zero),
+                                                       _mm_unpackhi_epi16(diff, zero)));
+        }
+        /* At most 4096*65535, well below INT32_MAX. */
+        lanes = _mm_add_epi32(lanes, _mm_srli_si128(lanes, 8));
+        lanes = _mm_add_epi32(lanes, _mm_srli_si128(lanes, 4));
+        sad += (uint32_t)_mm_cvtsi128_si32(lanes);
+    }
+#endif
+    for (; x < middle; ++x) {
+        const size_t offset = (size_t)x * 2u;
+        sad += sample_difference(svt_av2_sample_load(src + offset, 10), svt_av2_sample_load(ref + offset, 10));
+    }
+    if (right != 0) {
+        const uint16_t edge = svt_av2_sample_load(ref + (size_t)(middle != 0 ? middle - 1u : 0u) * 2u, 10);
+        src += (size_t)middle * 2u;
+        for (uint32_t tail = 0; tail < right; ++tail)
+            sad += sample_difference(svt_av2_sample_load(src + (size_t)tail * 2u, 10), edge);
+    }
+    return sad;
+}
+
 static uint64_t candidate_sad(const SvtAv2FrameBuffer* source,
     const SvtAv2FrameBuffer* reference, const SvtAv2BlockView* block,
     SvtAv2MotionVector mv, uint64_t limit) {
-    uint64_t cost = 0;
+    const int64_t rx = (int64_t)block->x + mv.mv_x;
+    const int64_t ry = (int64_t)block->y + mv.mv_y;
+    const int64_t right_overhang = rx + block->w - reference->visible_width;
+    /* Cap each overhang at the block width: a narrow block can lie entirely
+     * outside the frame. In that case ref points at the repeated edge. */
+    const uint32_t left = rx < 0 ? (uint32_t)(-rx < block->w ? -rx : block->w) : 0;
+    const uint32_t right = right_overhang > 0 ?
+        (uint32_t)(right_overhang < block->w ? right_overhang : block->w) : 0;
+    const uint32_t middle = block->w - left - right;
     const uint32_t step = source->bit_depth > 8 ? 2u : 1u;
+    const uint8_t* src = source->planes[0] + (size_t)block->y * source->strides[0] + (size_t)block->x * step;
+    const uint8_t* ref_column = reference->planes[0] + (size_t)edge_coordinate(rx, reference->visible_width) * step;
+    uint64_t cost = 0;
     for (uint32_t y = 0; y < block->h; ++y) {
-        const uint32_t ry = edge_coordinate((int64_t)block->y + y + mv.mv_y, reference->visible_height);
-        const uint8_t* src = source->planes[0] + (size_t)(block->y + y) * source->strides[0] + (size_t)block->x * step;
-        const uint8_t* ref = reference->planes[0] + (size_t)ry * reference->strides[0];
-        for (uint32_t x = 0; x < block->w; ++x) {
-            const uint32_t rx = edge_coordinate((int64_t)block->x + x + mv.mv_x, reference->visible_width);
-            const int difference = (int)svt_av2_sample_load(src + x * step, source->bit_depth) -
-                (int)svt_av2_sample_load(ref + (size_t)rx * step, reference->bit_depth);
-            cost += (uint64_t)(difference < 0 ? -difference : difference);
-        }
+        const uint8_t* ref = ref_column + (size_t)edge_coordinate(ry + y, reference->visible_height) * reference->strides[0];
+        const uint8_t* row = src + (size_t)y * source->strides[0];
+        cost += step == 1u ? sad_row_8(row, ref, left, middle, right) : sad_row_10(row, ref, left, middle, right);
         /* A strictly larger partial SAD cannot win, including the tie rule. */
         if (cost > limit) break;
     }
@@ -61,6 +155,27 @@ SvtAv2Error svt_av2_motion_estimate(const SvtAv2FrameBuffer* source,
         }
     *result = best;
     return SVT_AV2_ERROR_NONE;
+}
+
+void svt_av2_motion_extend(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* reference,
+    const SvtAv2BlockView* block, SvtAv2MotionSearchResult* result) {
+    if (result->sad < (uint64_t)block->w * block->h * (3u << (source->bit_depth - 8u))) return;
+    for (int step = 4; step; step /= 2) {
+        const SvtAv2MotionVector center = step == 4 ? (SvtAv2MotionVector){0, 0} : result->mv;
+        const int radius = step == 4 ? 16 : step;
+        for (int dy = -radius; dy <= radius; dy += step) for (int dx = -radius; dx <= radius; dx += step) {
+            const SvtAv2MotionVector mv = {center.mv_x + dx, center.mv_y + dy};
+            if ((magnitude(mv.mv_x) <= 8 && magnitude(mv.mv_y) <= 8) ||
+                magnitude(mv.mv_x) > 16 || magnitude(mv.mv_y) > 16) continue;
+            const uint64_t sad = candidate_sad(source, reference, block, mv, result->sad);
+            ++result->candidates;
+            if (sad < result->sad || (sad == result->sad && preferred(mv, result->mv))) {
+                result->sad = sad;
+                result->mv = mv;
+            }
+        }
+        if (magnitude(result->mv.mv_x) <= 8 && magnitude(result->mv.mv_y) <= 8) break;
+    }
 }
 
 SvtAv2Error svt_av2_motion_estimate_list(const SvtAv2FrameBuffer* source,

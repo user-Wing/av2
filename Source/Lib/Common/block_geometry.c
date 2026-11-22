@@ -1,6 +1,9 @@
 #ifndef M6_FINE16
 #define M6_FINE16 0
 #endif
+#ifndef M6_FINE16_GEOMETRY
+#define M6_FINE16_GEOMETRY M6_FINE16
+#endif
 #ifndef M6_FINE16_PAIR
 #define M6_FINE16_PAIR 0
 #endif
@@ -517,7 +520,12 @@ uint16_t svt_av2_partition_mixed7_plan(uint32_t code) {
 SvtAv2Error svt_av2_partition_plan_validate_sb(const SvtAv2FrameGeometry* geometry,
     size_t sb_index, uint16_t decision) {
     if (!valid_plan_geometry(geometry) ||
-        sb_index >= (size_t)geometry->sb_cols * geometry->sb_rows || (decision > (M6_ROOT_ASYM ? 3288u : 3284u) && (!M6_FINE16 || decision<4096u || decision>11095u) && (!M6_FINE16_PAIR || decision<11096u || decision>40495u)) ||
+        sb_index >= (size_t)geometry->sb_cols * geometry->sb_rows ||
+        (decision > (M6_ROOT_ASYM ? 3288u : 3284u) &&
+         (!M6_FINE16_GEOMETRY || decision<4096u || decision>11095u) &&
+         (!M6_FINE16_PAIR || decision<11096u || decision>40495u) &&
+         !svt_av2_partition_is_mixed_rect32(decision) && !svt_av2_partition_is_half_rect(decision) &&
+         !svt_av2_partition_is_rect16(decision)) ||
         (decision >= 882u && decision <= 3282u &&
          svt_av2_partition_mixed7_plan((uint32_t)decision - 882u) != decision))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
@@ -590,6 +598,49 @@ SvtAv2Error svt_av2_partition_coded_type_plan_validated(const SvtAv2FrameGeometr
     if (error != SVT_AV2_ERROR_NONE) return error;
     const uint16_t decision = decisions == NULL ? 0u :
         decisions[(size_t)(block->y / 64u) * geometry->sb_cols + block->x / 64u];
+    if (svt_av2_partition_is_mixed_rect32(decision) || svt_av2_partition_is_half_rect(decision) ||
+        svt_av2_partition_is_rect16(decision)) {
+        static const uint32_t powers[4] = {1u,7u,49u,343u};
+        static const uint32_t widths[7] = {16u,8u,16u,8u,32u,32u,16u};
+        static const uint32_t heights[7] = {16u,8u,8u,16u,32u,16u,32u};
+        const uint32_t quadrant = (block->y % 64u / 32u) * 2u + block->x % 64u / 32u;
+        uint32_t shape;
+        if (svt_av2_partition_is_rect16(decision)) {
+            const uint32_t code = decision - SVT_AV2_RECT16_BASE;
+            const uint32_t variant = code / 343u, special = variant / 8u;
+            if (quadrant == special) {
+                const uint32_t cell = (block->y % 32u / 16u) * 2u + block->x % 32u / 16u;
+                shape = block->w <= 16u && block->h <= 16u && cell == (variant / 2u) % 4u ?
+                    2u + (variant & 1u) : 0u;
+            } else {
+                shape = code % 343u / powers[quadrant - (quadrant > special)] % 7u;
+            }
+        } else if (svt_av2_partition_is_half_rect(decision)) {
+            const uint32_t code = decision - SVT_AV2_HALF_RECT_BASE;
+            const uint32_t variant = code / 343u, special = variant / 4u;
+            if (quadrant == special) {
+                const int vertical = (variant & 2u) != 0u;
+                const uint32_t half = ((vertical ? block->x : block->y) % 32u) / 16u;
+                shape = vertical ? 6u : 5u;
+                if (block->w <= 32u && block->h <= 32u &&
+                    (block->w < 32u || block->h < 32u) && half != (variant & 1u))
+                    shape = 0u;
+            } else {
+                shape = code % 343u / powers[quadrant - (quadrant > special)] % 7u;
+            }
+        } else {
+            shape = (decision - SVT_AV2_MIXED_RECT32_BASE) / powers[quadrant] % 7u;
+        }
+        if (block->w > 32u || block->h > 32u)
+            *partition = block->w > block->h ? SVT_AV2_PARTITION_VERT : SVT_AV2_PARTITION_HORZ;
+        else if (block->w == widths[shape] && block->h == heights[shape])
+            *partition = SVT_AV2_PARTITION_NONE;
+        else if (block->w == widths[shape]) *partition = SVT_AV2_PARTITION_HORZ;
+        else if (block->h == heights[shape]) *partition = SVT_AV2_PARTITION_VERT;
+        else *partition = block->w > block->h ? SVT_AV2_PARTITION_VERT : SVT_AV2_PARTITION_HORZ;
+        *is_implied = 0;
+        return SVT_AV2_ERROR_NONE;
+    }
 #if M6_FINE16_PAIR
     if (decision>=11096u && decision<=40495u) {
         static const uint32_t pairs[6][2]={{0u,1u},{0u,2u},{0u,3u},{1u,2u},{1u,3u},{2u,3u}};
@@ -624,7 +675,7 @@ SvtAv2Error svt_av2_partition_coded_type_plan_validated(const SvtAv2FrameGeometr
         *is_implied=0;return SVT_AV2_ERROR_NONE;
     }
 #endif
-#if M6_FINE16
+#if M6_FINE16_GEOMETRY
     if (decision>=4096u && decision<=11095u) {
         const uint32_t code=(uint32_t)decision-4096u;
         const uint32_t special=(code/125u)/14u;

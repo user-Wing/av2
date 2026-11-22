@@ -259,6 +259,27 @@ SvtAv2Error svt_av2_partition_select_quads(const SvtAv2FrameBuffer* source,
 /* Four base7 quadrant shape digits in0..2400 -> canonical plan; invalid
  * code returns UINT16_MAX. Existing selectors retain their own frozen mapping. */
 uint16_t svt_av2_partition_mixed7_plan(uint32_t code);
+/* Base-7 quadrants: the mixed8 shapes plus 32x16 and 16x32. */
+#define SVT_AV2_MIXED_RECT32_BASE 40496u
+#define SVT_AV2_MIXED_RECT32_COUNT 2401u
+static inline int svt_av2_partition_is_mixed_rect32(uint16_t plan) {
+    return plan >= SVT_AV2_MIXED_RECT32_BASE &&
+        plan < SVT_AV2_MIXED_RECT32_BASE + SVT_AV2_MIXED_RECT32_COUNT;
+}
+/* One quadrant has two 16x16 leaves and one intact rectangle. The other
+ * three retain their base-7 shapes. Four orientations per quadrant. */
+#define SVT_AV2_HALF_RECT_BASE 43000u
+#define SVT_AV2_HALF_RECT_COUNT (16u * 343u)
+static inline int svt_av2_partition_is_half_rect(uint16_t plan) {
+    return plan >= SVT_AV2_HALF_RECT_BASE && plan < SVT_AV2_HALF_RECT_BASE + SVT_AV2_HALF_RECT_COUNT;
+}
+/* One of the sixteen 16x16 cells splits into two 16x8 or 8x16 leaves.
+ * Its three siblings stay 16x16; other quadrants keep the base-7 shapes. */
+#define SVT_AV2_RECT16_BASE (SVT_AV2_HALF_RECT_BASE + SVT_AV2_HALF_RECT_COUNT)
+#define SVT_AV2_RECT16_COUNT (32u * 343u)
+static inline int svt_av2_partition_is_rect16(uint16_t plan) {
+    return plan >= SVT_AV2_RECT16_BASE && plan < SVT_AV2_RECT16_BASE + SVT_AV2_RECT16_COUNT;
+}
 SvtAv2Error svt_av2_partition_plan_validate(const SvtAv2FrameGeometry* geometry,
     const uint16_t* decisions, size_t count);
 /* Validate just the changed entry of an already-valid private plan. */

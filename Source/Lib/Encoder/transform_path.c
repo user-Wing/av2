@@ -16,6 +16,7 @@
  */
 #include "transform_path.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "picture.h"
@@ -52,7 +53,8 @@ static SvtAv2Error path_forward_type(void* user,
     /* T010 re-derives the quantizer for this block's own geometry; nothing is
      * cached, so a later change of block size cannot read a stale quantizer. */
     SvtAv2QuantParams params;
-    if (svt_av2_quant_params_init_tx_bd(&params, state->base_q_idx, block_w, block_h, state->bit_depth) !=
+    if (svt_av2_quant_params_init_matrix(&params, state->base_q_idx, block_w, block_h,
+            state->bit_depth, state->qm_level, state->uv_delta_q) !=
         SVT_AV2_QUANT_OK) {
         return SVT_AV2_ERROR_UNSUPPORTED;
     }
@@ -71,9 +73,16 @@ static SvtAv2Error path_forward_type(void* user,
      * caller-facing coefficient arrays use that SAME packed layout, so the
      * first `count` entries are copied out below (contract section 3). */
     int32_t packed_coeff[SVT_AV2_TX_MAX_PELS];
-    if (svt_av2_fwd_transform_type_bd(packed_res, packed_coeff, block_w, block_h, state->bit_depth, tx_type) != SVT_AV2_TX_OK) {
-        return SVT_AV2_ERROR_UNSUPPORTED;
-    }
+    SvtAv2TransformStatus tx_status;
+#if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
+    if (tx_type == 0u && (block_w == 64u || block_h == 64u))
+        tx_status = svt_av2_fwd_transform_dct64_bd(packed_res, packed_coeff, block_w,
+            block_h, state->bit_depth, state->match_dct64);
+    else
+#endif
+        tx_status = svt_av2_fwd_transform_type_bd(packed_res, packed_coeff, block_w,
+            block_h, state->bit_depth, tx_type);
+    if (tx_status != SVT_AV2_TX_OK) return SVT_AV2_ERROR_UNSUPPORTED;
 
     const uint32_t kw = path_kernel_width(block_w);
     const uint32_t kh = path_kernel_width(block_h);
@@ -83,12 +92,27 @@ static SvtAv2Error path_forward_type(void* user,
 
     /* Quantise the carried grid: the count must be the carried count so the
      * qcoeff/dqcoeff contract is the same one T011 reads (row stride min(w,32)). */
+    params.avm_fp_round = state->avm_fp_round;
     if (state->quantize_block(&params, packed_coeff, qcoeff, dqcoeff, count, (int)plane,
                                log_scale) != SVT_AV2_QUANT_OK) {
         /* Includes LEVEL_OVERFLOW: refuse rather than emit a truncated block. */
         return SVT_AV2_ERROR_UNSUPPORTED;
     }
 
+    /* Isolated unit AC levels cost both a significance symbol and a sign.
+     * Use a higher zero threshold there than inside a run of nonzero levels. */
+    if (state->ac_prune) {
+        for (size_t i = count - 1u; i > 0u; --i) {
+            if (qcoeff[i] != 1 && qcoeff[i] != -1) continue;
+            const size_t x = i % kw;
+            const unsigned support = (x && qcoeff[i - 1u]) + (x + 1u < kw && qcoeff[i + 1u]) +
+                (i >= kw && qcoeff[i - kw]) + (i + kw < count && qcoeff[i + kw]);
+            const int threshold = 10 + state->ac_prune * (5 - (int)support);
+            if ((int64_t)abs(coeff[i]) * 16 < (int64_t)abs(dqcoeff[i]) * threshold) {
+                qcoeff[i] = dqcoeff[i] = 0;
+            }
+        }
+    }
     ++state->forward_calls;
     *all_zero_out = svt_av2_quant_all_zero(qcoeff, count) == 1;
     return SVT_AV2_ERROR_NONE;
