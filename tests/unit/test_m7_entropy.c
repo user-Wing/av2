@@ -115,7 +115,7 @@ static void fresh_writer(uint32_t depth, uint32_t format, uint32_t inter) {
     cfg.reduced_tx_set = 2u; cfg.entropy_adaptation = 1u;
     int32_t coeffs[6][1024] = {{0}};
     SvtAv2TileCoeffBlock blocks[6];
-    SvtAv2TileBlockMode modes[2] = {{1u, 3, -2,0u}, {0u, 0, 0,0u}};
+    SvtAv2TileBlockMode modes[2] = {{1u, 3, -2,0u, 0, 0}, {0u, 0, 0,0u, 0, 0}};
     for (uint32_t sb = 0u; sb < 2u; ++sb) {
         for (uint32_t p = 0u; p < 3u; ++p) {
             const uint32_t i = sb * 3u + p;
@@ -201,9 +201,9 @@ static void quarter_expected(SvtAv2EntropyEncoder* e, uint32_t sb) {
 
 static void quarter_motion(void) {
     static SvtAv2EntropyModels actual_models, expected_models, rate_models;
-    static const SvtAv2TileBlockMode moves[5] = {{1u,-64,-63,0u},{1u,64,64,0u},{1u,-64,-64,0u},
-        {1u,-64,-64,0u},{1u,-63,-64,0u}};
-    static const SvtAv2TileBlockMode invalid[] = {{1u,65,0,0u},{1u,0,-65,0u}};
+    static const SvtAv2TileBlockMode moves[5] = {{1u,-64,-63,0u, 0, 0},{1u,64,64,0u, 0, 0},{1u,-64,-64,0u, 0, 0},
+        {1u,-64,-64,0u, 0, 0},{1u,-63,-64,0u, 0, 0}};
+    static const SvtAv2TileBlockMode invalid[] = {{1u,65,0,0u, 0, 0},{1u,0,-65,0u, 0, 0}};
     SvtAv2MotionSyntax reject;
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_syntax_init_precision(&reject, 320u, 64u, 3u), SVT_AV2_ENTROPY_ERROR_RANGE);
     SVT_TEST_CHECK(reject.cells == NULL);
@@ -214,7 +214,7 @@ static void quarter_motion(void) {
         SVT_TEST_CHECK_EQ_INT(rc, 0);
         if (!rc) {
             SvtAv2BlockView view = {0}; view.w = view.h = 64u;
-            const SvtAv2TileBlockMode out_of_range = {1u, 0, limit[precision] + 1,0u};
+            const SvtAv2TileBlockMode out_of_range = {1u, 0, limit[precision] + 1,0u, 0, 0};
             SvtAv2EntropyEncoder e; svt_av2_entropy_rate_init(&e);
             SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&old, &e, &view, &out_of_range, 1u), SVT_AV2_ENTROPY_ERROR_RANGE);
             SVT_TEST_CHECK(e.rate_symbols == 0u && !old.cells[0].valid);
@@ -276,6 +276,29 @@ static void quarter_motion(void) {
     }
 }
 
+static void wide_quarter_shell(void) {
+    SvtAv2MotionSyntax motion;
+    SvtAv2EntropyModels models;
+    SvtAv2EntropyEncoder rate;
+    svt_av2_entropy_rate_init(&rate);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_entropy_models_init(&models, 2u), 0);
+    rate.models = &models;
+    const int status = svt_av2_motion_syntax_init_precision(&motion, 128u, 64u, 2u);
+    SVT_TEST_CHECK_EQ_INT(status, 0);
+    if (status) return;
+    motion.wide_motion = 2u;
+    for (unsigned i = 0; i < 2; ++i) {
+        SvtAv2BlockView view = {0};
+        view.x = i*64u;
+        view.w = view.h = 64u;
+        const int mv = i ? -252 : 252;
+        const SvtAv2TileBlockMode mode = {1u,mv,mv,0u,0,0};
+        SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &rate, &view, &mode, 1u), 0);
+    }
+    SVT_TEST_CHECK_EQ_INT(models.cdf[SVT_AV2_MODEL_MV_QUARTER_BIT8][2], 1u);
+    svt_av2_motion_syntax_free(&motion);
+}
+
 static void independent_ref_contexts(void) {
     static const uint16_t initial[3][12] = {
         {6299, 0, 0, 2, 3, 4}, {19137, 0, 0, 2, 2, 3}, {30169, 0, 0, 2, 3, 4}
@@ -318,7 +341,7 @@ static void independent_ref_contexts(void) {
         const uint32_t y = 2u * (i / 32u) + ((i >> 1u) & 1u);
         const uint32_t inter = i % 19u != 10u;
         const uint32_t rank = inter ? (x >= 8u) ^ (y >= 8u) : 0u;
-        const SvtAv2TileBlockMode mode = {inter, 0, 0, rank};
+        const SvtAv2TileBlockMode mode = {inter, 0, 0, rank, 0, 0};
         const SvtAv2BlockView block = {x * 32u, y * 32u, 32u, 32u, NULL};
         const uint32_t left = x ? visible[y][x - 1u] : 0u;
         const uint32_t above = y ? visible[y - 1u][x] : 0u;
@@ -339,7 +362,7 @@ static void independent_ref_contexts(void) {
     }
     SVT_TEST_CHECK(visits[0] > 32u && visits[1] > 16u && visits[2] > 32u);
     SVT_TEST_CHECK_EQ_INT(svt_av2_entropy_models_init(&rate_models, 3u), 0);
-    const SvtAv2TileBlockMode old_mode = {1u, 0, 0, 9u}; /* legacy ignores field */
+    const SvtAv2TileBlockMode old_mode = {1u, 0, 0, 9u, 0, 0}; /* legacy ignores field */
     const SvtAv2BlockView old_block = {0u, 0u, 32u, 32u, NULL};
     estimated.two_refs = 0u;
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&estimated, &rate, &old_block, &old_mode, 1u), 0);
@@ -350,7 +373,7 @@ static void independent_ref_contexts(void) {
 }
 
 int main(void) {
-    updates(); decay(); isolation(); quarter_motion(); independent_ref_contexts();
+    updates(); decay(); isolation(); quarter_motion(); wide_quarter_shell(); independent_ref_contexts();
     for (uint32_t inter = 0u; inter < 2u; ++inter) {
         fresh_writer(8u, 1u, inter); fresh_writer(10u, 1u, inter); fresh_writer(10u, 3u, inter);
     }

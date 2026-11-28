@@ -291,6 +291,14 @@ SVT_AV2_API SvtAv2Error svt_av2_enc_init_handle(SvtAv2Handle* handle, const SvtA
 SVT_AV2_API SvtAv2Error svt_av2_enc_set_parameter(SvtAv2Handle handle, SvtAv2Parameter param, const void* value);
 SVT_AV2_API SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle);
 SVT_AV2_API SvtAv2Error svt_av2_enc_send_picture(SvtAv2Handle handle, const void* picture);
+/* Fixed QP for one submitted picture. The next ordinary submission resumes the
+ * configured frame-level allocation. EOS uses the ordinary send entry point. */
+SVT_AV2_API SvtAv2Error svt_av2_enc_send_picture_at_qp(SvtAv2Handle handle,
+    const SvtAv2Picture* picture, int32_t qp);
+/* Single-tile low-delay RD: copy one positive Q8 lambda multiplier per
+ * 64x64 superblock, in raster order. 256 uses the frame's ordinary lambda. */
+SVT_AV2_API SvtAv2Error svt_av2_enc_send_picture_weighted(SvtAv2Handle handle,
+    const SvtAv2Picture* picture, int32_t qp, const uint16_t* weights, size_t count);
 SVT_AV2_API SvtAv2Error svt_av2_enc_get_packet(SvtAv2Handle handle, void* packet, int32_t* has_packet);
 
 /* Delivers the coded packet for the frame handed to send_picture().

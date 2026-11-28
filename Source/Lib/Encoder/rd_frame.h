@@ -8,6 +8,9 @@
 /* Internal, bounded RD domain. Public configuration validation belongs to Codec.
  * off bypasses this module. Source/reference are read-only; references are never
  * committed here. See docs/m6-rd-contracts.md for units and candidate domains. */
+uint64_t svt_av2_contrast_distortion(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* recon,
+    const SvtAv2BlockView* block);
+
 typedef struct SvtAv2RdFrameConfig {
     SvtAv2IntraTransformPath transform;
     SvtAv2FrameHeaderConfig frame_header;
@@ -35,6 +38,7 @@ typedef struct SvtAv2RdFrameConfig {
     uint32_t shortlist_trees;
     int thin_still_search;
     int subrect_search;
+    const uint16_t* sb_lambda_weights;
     uint16_t* sb_qindex; /* Optional output map for still-picture delta Q. */
     int sparse_angle_search;
     uint32_t threads;

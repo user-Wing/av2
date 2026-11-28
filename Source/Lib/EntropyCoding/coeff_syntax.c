@@ -680,8 +680,11 @@ int svt_av2_coeff_write_block_transform_ist(SvtAv2EntropyEncoder* enc,
     if (pi->plane > 2u ||
         (uint32_t)pi->tx_size >= (uint32_t)SVT_AV2_TX_SIZE_COUNT ||
         (is_inter && pi->tx_size >= SVT_AV2_TX_4X8 &&
-         !(pi->plane ? (pi->tx_size == SVT_AV2_TX_16X8 || pi->tx_size == SVT_AV2_TX_8X16) :
-                       (pi->tx_size == SVT_AV2_TX_32X16 || pi->tx_size == SVT_AV2_TX_16X32))) ||
+         !(pi->plane ? (pi->tx_size == SVT_AV2_TX_16X8 || pi->tx_size == SVT_AV2_TX_8X16 ||
+                        pi->tx_size == SVT_AV2_TX_32X16 || pi->tx_size == SVT_AV2_TX_16X32 ||
+                        pi->tx_size == SVT_AV2_TX_64X32 || pi->tx_size == SVT_AV2_TX_32X64) :
+                       (pi->tx_size == SVT_AV2_TX_32X16 || pi->tx_size == SVT_AV2_TX_16X32 ||
+                        pi->tx_size == SVT_AV2_TX_64X32 || pi->tx_size == SVT_AV2_TX_32X64))) ||
         pi->units_w > SVT_AV2_COEFF_CTX_UNITS || pi->units_h > SVT_AV2_COEFF_CTX_UNITS ||
         pi->x4 >= pi->units_w || pi->y4 >= pi->units_h) {
         return SVT_AV2_COEFF_ERR_UNSUPPORTED;
@@ -886,7 +889,7 @@ int svt_av2_coeff_write_block_transform_ist(SvtAv2EntropyEncoder* enc,
     }
     /* Inter DCT_IDTX reduced set: DCT_DCT is symbol one, uniform binary.
      * Intra DCT and 64x64 transforms are implied; chroma inherits luma type. */
-    if (is_inter && plane == 0u && pi->tx_size != SVT_AV2_TX_64X64) {
+    if (is_inter && plane == 0u && cb.ctx_w <= 32u && cb.ctx_h <= 32u) {
         const uint32_t diag = ((cb.eob - 1u) >> cb.bwl) + ((cb.eob - 1u) & (cb.width - 1u));
         const uint32_t ectx = diag < 2u ? 1u : diag > cb.width + cb.height - 4u ? 2u : 0u;
         int st;

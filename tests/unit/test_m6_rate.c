@@ -61,7 +61,7 @@ static void transactions(uint32_t bit_depth, uint32_t format, uint32_t inter,
     cfg.reduced_tx_set = 2u;
     int32_t coeffs[6][1024] = {{0}};
     SvtAv2TileCoeffBlock blocks[6] = {{0}};
-    SvtAv2TileBlockMode modes[2] = {{1u, 3, -2,0u}, {1u, -4, 2,0u}};
+    SvtAv2TileBlockMode modes[2] = {{1u, 3, -2,0u, 0, 0}, {1u, -4, 2,0u, 0, 0}};
     for (uint32_t sb = 0u; sb < 2u; ++sb) {
         for (uint32_t p = 0u; p < 3u; ++p) {
             const uint32_t i = sb * 3u + p;

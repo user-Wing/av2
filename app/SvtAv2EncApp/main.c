@@ -20,12 +20,15 @@
  * mid-grey (128). This is honest documented behaviour, not a silent shortcut.
  */
 
+#include <stddef.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "svt_av2.h"
 #include "y4m.h"
+#include "pyramid8.h"
 
 /* M4: single-threaded 8-bit420 / 10-bit420,444, DC prediction, fixed user QP. */
 #define SVT_AV2_M1_DEFAULT_QP 100
@@ -668,7 +671,335 @@ static int app_read_frame_payload(FILE* stream, uint8_t* buffer, size_t size) {
 
 /* Compare source luma in display order before deciding whether to read ahead.
  * The grid and 8-bit scale match the encoder's anchor activity probe. */
-static int app_drawing_changed(const uint8_t* frame, uint32_t w, uint32_t h, unsigned bd, uint16_t grid[576]) {
+static unsigned app_luma8(const uint8_t* frame, size_t position, unsigned depth) {
+    if (depth == 8u) return frame[position];
+    return (frame[2u*position] | ((unsigned)frame[2u*position+1u]<<8u)) >> (depth-8u);
+}
+
+/* Estimate what fraction of the current drawing each parent can predict.
+ * Coarse motion compensation within each 64x64 region distinguishes moving
+ * texture from genuinely new detail. All costs use original luma samples. */
+static void app_parent_fractions(const uint8_t* source, const uint8_t* parents[2],
+    unsigned count, int w, int h, unsigned depth, double fractions[2]) {
+    unsigned regions = 0;
+    for (int by=0; by<h; by+=64) for (int bx=0; bx<w; bx+=64) {
+        unsigned values[16], sum=0, n=0, intra=0, sad[2]={0,0};
+        for (int y=by; y<h && y<by+64; y+=16) for (int x=bx; x<w && x<bx+64; x+=16) {
+            values[n] = app_luma8(source,(size_t)y*w+x,depth);
+            sum += values[n++];
+        }
+        const int mean = (int)((sum+n/2u)/n);
+        for (unsigned i=0;i<n;++i) intra += (unsigned)abs((int)values[i]-mean);
+        for (unsigned r=0;r<count;++r) {
+            sad[r] = UINT32_MAX;
+            for (int dy=-4;dy<=4;dy+=4) for (int dx=-4;dx<=4;dx+=4) {
+                unsigned err=0,i=0;
+                for (int y=by;y<h && y<by+64;y+=16) for (int x=bx;x<w && x<bx+64;x+=16) {
+                    const int xx=x+dx<0?0:x+dx>=w?w-1:x+dx;
+                    const int yy=y+dy<0?0:y+dy>=h?h-1:y+dy;
+                    err += (unsigned)abs((int)values[i++]-(int)app_luma8(parents[r],(size_t)yy*w+xx,depth));
+                }
+                if (err < sad[r]) sad[r] = err;
+            }
+        }
+        const unsigned better = count == 2u && sad[1] < sad[0];
+        const unsigned baseline = intra+n;
+        if (sad[better] < baseline) {
+            const double gain = 1.0 - (double)sad[better]/baseline;
+            if (count == 2u && sad[0] == sad[1]) { fractions[0] += 0.5*gain; fractions[1] += 0.5*gain; }
+            else fractions[better] += gain;
+        }
+        ++regions;
+    }
+    fractions[0] /= regions;
+    fractions[1] /= regions;
+}
+
+static void app_dependency_qp(const uint8_t* group, const uint8_t* previous, size_t bytes,
+    unsigned count, const unsigned order[32], int w, int h, unsigned depth, int qp, int out[32]) {
+    double weight[33];
+    unsigned left[33], right[33];
+    for (unsigned i=0; i<=count; ++i) weight[i]=1.0;
+    for (unsigned start=0;start<count;) {
+        const unsigned span = order[start]+1u-start;
+        for (unsigned k=0;k<span;++k) {
+            const SvtAv2PyramidNode node = svt_av2_pyramid_node(span,k,0);
+            const unsigned pos = start+node.position;
+            left[pos] = start+node.left;
+            right[pos] = k ? start+node.right : left[pos];
+        }
+        start += span;
+    }
+    for (unsigned k=count; k--;) {
+        const unsigned pos=order[k]+1u, a=left[pos], b=right[pos];
+        const uint8_t* parents[2] = {a ? group+(a-1u)*bytes : previous, b ? group+(b-1u)*bytes : previous};
+        double fraction[2]={0,0};
+        app_parent_fractions(group+(pos-1u)*bytes,parents,1u+(a!=b),w,h,depth,fraction);
+        weight[a] += weight[pos]*fraction[0];
+        weight[b] += weight[pos]*fraction[1];
+        const int q = qp+14-(int)lround(16.0*log2(weight[pos]));
+        out[k] = q<1 ? 1 : q>255 ? 255 : q;
+    }
+}
+
+static unsigned app_drawing_sad(const uint8_t* a, const uint8_t* b,
+        unsigned width, unsigned height, unsigned depth) {
+    unsigned sad = 0;
+    for (unsigned y=0; y<18u; ++y) for (unsigned x=0; x<32u; ++x) {
+        const size_t pos = (size_t)((2u*y+1u)*height/36u)*width + (2u*x+1u)*width/64u;
+        sad += (unsigned)abs((int)app_luma8(a,pos,depth)-(int)app_luma8(b,pos,depth));
+    }
+    return sad;
+}
+
+/* A small new stroke can be invisible in a whole-frame average.
+ * Screen 8x8 cells on all planes before treating the drawing as a hold. */
+static int app_same_local_drawing(const uint8_t* a, const uint8_t* b,
+        size_t bytes, unsigned width, unsigned height, unsigned depth) {
+    const unsigned step = depth==8u ? 1u : 2u;
+    const unsigned shift = bytes == (size_t)width*height*step*3u ? 0u : 1u;
+    for (unsigned p=0; p<3; ++p) {
+        const unsigned w = p ? width>>shift : width, h = p ? height>>shift : height;
+        for (unsigned by=0; by<h; by+=8u) for (unsigned bx=0; bx<w; bx+=8u) {
+            unsigned sad=0, n=0;
+            for (unsigned y=by; y<h && y<by+8u; y+=2u) for (unsigned x=bx; x<w && x<bx+8u; x+=2u) {
+                const size_t pos=(size_t)y*w+x;
+                sad+=(unsigned)abs((int)app_luma8(a,pos,depth)-(int)app_luma8(b,pos,depth));
+                ++n;
+            }
+            if (sad>4u*n) return 0;
+        }
+        a+=(size_t)w*h*step;
+        b+=(size_t)w*h*step;
+    }
+    return 1;
+}
+
+/* Average only consecutive exposures of one drawing. Reject local outliers
+ * even in an otherwise still frame, to keep changing line art and subtitles. */
+static int app_filter_drawing(const uint8_t* frames, unsigned count, unsigned pos,
+        size_t bytes, unsigned width, unsigned height, unsigned depth, uint8_t* dst) {
+    const uint8_t* center = frames + pos*bytes;
+    unsigned first = pos, end = pos+1u;
+    while (first && pos-first<8u && app_drawing_sad(center,frames+(first-1u)*bytes,width,height,depth)<=576u) --first;
+    while (end<count && end-pos<=8u && app_drawing_sad(center,frames+end*bytes,width,height,depth)<=576u) ++end;
+    if (end-first<3u) return 0;
+    const size_t samples = bytes/(depth==8u ? 1u : 2u);
+    const int limit = 4 << (depth-8u);
+    for (size_t i=0; i<samples; ++i) {
+        const int value = depth==8u ? center[i] : ((const uint16_t*)center)[i];
+        int sum = 0, weight = 0;
+        for (unsigned j=first; j<end; ++j) {
+            const uint8_t* frame = frames + j*bytes;
+            const int other = depth==8u ? frame[i] : ((const uint16_t*)frame)[i];
+            const int w = limit-abs(other-value);
+            if (w>0) { sum+=w*other; weight+=w; }
+        }
+        const int result = (sum+weight/2)/weight; /* center always votes */
+        if (depth==8u) dst[i]=(uint8_t)result;
+        else ((uint16_t*)dst)[i]=(uint16_t)result;
+    }
+    return 1;
+}
+
+/* Count the effective number of displays that can reuse the root drawing.
+ * A one-level mean luma change (on the 8-bit scale) halves its direct credit.
+ * Changed regions still contribute through the existing motion-based TPL. */
+static double app_direct_displays(const uint8_t* frames, size_t bytes, unsigned center,
+        unsigned first, unsigned end, unsigned width, unsigned height, unsigned depth) {
+    const uint8_t* reference = frames + center*bytes;
+    double displays = 1.0;
+    for (unsigned j = first; j < end; ++j) {
+        if (j == center) continue;
+        const uint8_t* frame = frames + j*bytes;
+        const double difference = app_drawing_sad(frame,reference,width,height,depth) / 576.0;
+        displays += 1.0 / (1.0 + difference*difference);
+    }
+    return displays;
+}
+
+/* Propagate future reconstruction value through each 32x32 region of the
+ * actual coding tree. A moving region credits its matched parent region. */
+static int app_tpl_group(const uint8_t* frames, const uint8_t* previous, size_t bytes,
+        unsigned count, const unsigned order[32], int key, int w, int h, unsigned depth,
+        int qp, int out[32], uint16_t* weights, int root_policy, int reuse_qp) {
+    const unsigned cols = ((unsigned)w+31u)/32u, rows = ((unsigned)h+31u)/32u;
+    const size_t cells = (size_t)cols*rows;
+    float* credit = calloc(cells*(count+1u),sizeof(*credit));
+    const unsigned sb_cols=(cols+1u)/2u;
+    const size_t superblocks=(size_t)sb_cols*((rows+1u)/2u);
+    double* local=weights ? calloc(2u*superblocks,sizeof(*local)) : NULL;
+    if (!credit || (weights && !local)) { free(local); free(credit); return -1; }
+    unsigned left[32]={0}, right[32]={0};
+    for (unsigned start=(unsigned)key; start<count;) {
+        const unsigned span = order[start]+1u-start;
+        for (unsigned k=0;k<span;++k) {
+            const SvtAv2PyramidNode node = svt_av2_pyramid_node(span,k,0);
+            left[start+k] = start+node.left;
+            right[start+k] = k ? start+node.right : start+node.left;
+        }
+        start += span;
+    }
+    for (unsigned k=count;k--;) {
+        const unsigned pos=order[k]+1u, parent[2]={left[k],right[k]};
+        const uint8_t* src=frames+(pos-1u)*bytes;
+        double incoming=0, own=0;
+        if (local) memset(local,0,2u*superblocks*sizeof(*local));
+        for (unsigned cy=0;cy<rows;++cy) for (unsigned cx=0;cx<cols;++cx) {
+            const int bx=(int)cx*32, by=(int)cy*32;
+            const int bw=w-bx<32?w-bx:32, bh=h-by<32?h-by:32;
+            int values[16], n=0, sum=0, intra=0;
+            for (int y=0;y<bh;y+=8) for (int x=0;x<bw;x+=8) {
+                values[n]=(int)app_luma8(src,(size_t)(by+y)*w+bx+x,depth);
+                sum+=values[n++];
+            }
+            for (int i=0;i<n;++i) intra+=abs(values[i]-(sum+n/2)/n);
+            const size_t cell=(size_t)cy*cols+cx;
+            const double base=n+intra;
+            const double value=base+credit[pos*cells+cell];
+            own+=base;
+            incoming+=value;
+            if (local) {
+                const size_t sb=(size_t)(cy/2u)*sb_cols+cx/2u;
+                local[2u*sb]+=base;
+                local[2u*sb+1u]+=value;
+            }
+            if (!k && key) continue;
+            unsigned best[2]={UINT32_MAX,UINT32_MAX};
+            size_t target[2]={cell,cell};
+            const unsigned refs=1u+(parent[0]!=parent[1]);
+            for (unsigned r=0;r<refs;++r) {
+                const uint8_t* ref=parent[r] ? frames+(parent[r]-1u)*bytes : previous;
+                int dx=0,dy=0;
+                for (int step=16;step;step/=2) {
+                    const int ox=dx,oy=dy;
+                    for (int j=-1;j<=1;++j) for (int i=-1;i<=1;++i) {
+                        const int tx=ox+i*step, ty=oy+j*step;
+                        if (bx+tx<0 || by+ty<0 || bx+tx+bw>w || by+ty+bh>h) continue;
+                        unsigned sad=0,t=0;
+                        for (int y=0;y<bh;y+=8) for (int x=0;x<bw;x+=8)
+                            sad+=(unsigned)abs(values[t++]-(int)app_luma8(ref,(size_t)(by+ty+y)*w+bx+tx+x,depth));
+                        if (sad<best[r] || (sad==best[r] && abs(tx)+abs(ty)<abs(dx)+abs(dy))) {
+                            best[r]=sad; dx=tx; dy=ty;
+                        }
+                    }
+                    if (!best[r]) break;
+                }
+                target[r]=(size_t)((by+bh/2+dy)/32)*cols+(bx+bw/2+dx)/32;
+            }
+            const unsigned r=refs==2u && best[1]<best[0];
+            if (best[r]<base) {
+                const float gain=(float)(value*(1.0-best[r]/base));
+                if (refs==2u && best[0]==best[1]) {
+                    credit[parent[0]*cells+target[0]]+=0.5f*gain;
+                    credit[parent[1]*cells+target[1]]+=0.5f*gain;
+                } else credit[parent[r]*cells+target[r]]+=gain;
+            }
+        }
+        /* The AV2 quantizer step doubles every 24 indices. Scale it by
+         * the inverse square root of the estimated reconstruction value. */
+        const int is_key = key && !k;
+        const int root = root_policy && (is_key || (parent[0]==parent[1] && pos-parent[0]>=4u));
+        double importance = incoming/own;
+        if (root) {
+            const double direct = app_direct_displays(frames,bytes,pos-1u,is_key ? 0u : parent[0],
+                is_key ? count : pos,(unsigned)w,(unsigned)h,depth);
+            if (direct < importance) {
+                const double propagation = sqrt(importance/direct);
+                /* Direct holds need little residual. A moving group can
+                 * instead protect detail reused through motion compensation. */
+                importance = root_policy == 1 ? importance/propagation : importance*propagation;
+            }
+        }
+        int q=qp+10-(int)lround(12.0*log2(importance));
+        if (root && q>qp) q=qp;
+        else if (!root && is_key && q>qp-18) q=qp-18;
+        if (reuse_qp && !is_key) {
+            /* An already coded parent carries this drawing. Keep the usual
+             * quality for new drawings and let the reused one mostly skip. */
+            const unsigned refs = 1u+(parent[0]!=parent[1]);
+            int local_change = 0, matched = 0;
+            for (unsigned r=0; r<refs; ++r) {
+                const uint8_t* reference = parent[r] ? frames+(parent[r]-1u)*bytes : previous;
+                if (app_drawing_sad(src,reference,(unsigned)w,(unsigned)h,depth)>576u) continue;
+                if (reuse_qp == 1 || app_same_local_drawing(src,reference,bytes,(unsigned)w,(unsigned)h,depth)) {
+                    matched = 1;
+                    break;
+                }
+                local_change = 1;
+            }
+            if (matched) q=qp+36;
+            else if (local_change && importance>1.5 && q>qp-12) q=qp-12;
+        }
+        out[k]=q<1?1:q>255?255:q;
+        if (local) for (size_t sb=0;sb<superblocks;++sb) {
+            const double ratio=(incoming/own)*local[2u*sb]/local[2u*sb+1u];
+            const long scale=lround(256.0*sqrt(ratio));
+            weights[k*superblocks+sb]=(uint16_t)(scale<128?128:scale>512?512:scale);
+        }
+    }
+    free(local);
+    free(credit);
+    return 0;
+}
+
+/* Compare legal mini-GOP spans on source luma in display order. Cache the
+ * motion-compensated prediction error per region, then price every tree in
+ * coding order. Only the chosen spans reach the encoder. */
+static int app_choose_spans(const uint8_t* group, const uint8_t* previous, size_t bytes,
+        unsigned count, unsigned w, unsigned h, unsigned depth, unsigned span_at[32]) {
+    enum { W=64,H=36,COLS=8,ROWS=6,REGIONS=COLS*ROWS };
+    const unsigned even=count&~1u, frames=even+1u;
+    if (!even) return 0;
+    uint8_t* grid=malloc((size_t)frames*W*H);
+    uint16_t* errors=malloc((size_t)frames*frames*REGIONS*sizeof(*errors));
+    if (!grid || !errors) { free(grid); free(errors); return -1; }
+    for (unsigned t=0;t<frames;++t) {
+        const uint8_t* src=t ? group+(t-1u)*bytes : previous;
+        for (unsigned y=0;y<H;++y) for (unsigned x=0;x<W;++x)
+            grid[(t*H+y)*W+x]=(uint8_t)app_luma8(src,(size_t)((2u*y+1u)*h/(2u*H))*w+(2u*x+1u)*w/(2u*W),depth);
+    }
+    for (unsigned t=0;t<frames;++t) for (unsigned r=0;r<frames;++r) {
+        uint16_t* cost=errors+(t*frames+r)*REGIONS;
+        for (int by=0;by<ROWS;++by) for (int bx=0;bx<COLS;++bx) {
+            unsigned best=UINT16_MAX;
+            for (int dy=-1;dy<=1;++dy) for (int dx=-1;dx<=1;++dx) {
+                unsigned sad=0;
+                for (int y=by*6;y<by*6+6 && sad<best;++y) for (int x=bx*8;x<bx*8+8;++x) {
+                    const int yy=y+dy<0?0:y+dy>=H?H-1:y+dy;
+                    const int xx=x+dx<0?0:x+dx>=W?W-1:x+dx;
+                    sad+=(unsigned)abs(grid[(t*H+y)*W+x]-grid[(r*H+yy)*W+xx]);
+                }
+                if (sad<best) best=sad;
+            }
+            cost[by*COLS+bx]=(uint16_t)best;
+        }
+    }
+    double suffix[33]={0};
+    for (int start=(int)even-2;start>=0;start-=2) {
+        double best=1e100;
+        for (unsigned span=2;span<=even-(unsigned)start;span+=2) {
+            double score=suffix[start+span]+REGIONS;
+            for (unsigned k=0;k<span;++k) {
+                const SvtAv2PyramidNode node=svt_av2_pyramid_node(span,k,0);
+                const unsigned t=start+node.position;
+                const uint16_t* l=errors+(t*frames+start+node.left)*REGIONS;
+                const uint16_t* r=k ? errors+(t*frames+start+node.right)*REGIONS : l;
+                const unsigned reach=k ? node.position-node.left : span;
+                const double rate=reach>=8u ? 1.5 : reach>=4u ? 1.25 : reach>=2u ? 1.1 : 0.8;
+                for (unsigned cell=0;cell<REGIONS;++cell)
+                    score+=rate*log2(1.0+(l[cell]<r[cell]?l[cell]:r[cell])/48.0);
+            }
+            if (score<best) { best=score; span_at[start]=span; }
+        }
+        suffix[start]=best;
+    }
+    free(errors);
+    free(grid);
+    return 0;
+}
+
+static int app_drawing_changed(const uint8_t* frame, uint32_t w, uint32_t h, unsigned bd, uint16_t grid[576], unsigned threshold_q8) {
     uint32_t sad = 0u;
     for (unsigned y = 0; y < 18u; ++y) for (unsigned x = 0; x < 32u; ++x) {
         const size_t pos = (size_t)((2u*y+1u)*h/36u)*w + (2u*x+1u)*w/64u;
@@ -677,7 +1008,64 @@ static int app_drawing_changed(const uint8_t* frame, uint32_t w, uint32_t h, uns
         sad += (uint32_t)abs((int)value - grid[index]);
         grid[index] = value;
     }
-    return sad >= 2u*576u*(1u << (bd-8u));
+    return sad * 256u >= threshold_q8 * 576u * (1u << (bd-8u));
+}
+
+/* Match each original neighbour independently. A block mismatch or a large
+ * pixel residual reduces its vote, especially across cuts and occlusions. */
+static void app_temporal_luma(const uint8_t* center, const uint8_t* past, const uint8_t* future,
+                              uint8_t* dst, int width, int height, unsigned depth) {
+    const unsigned scale = 1u << (depth - 8u);
+    const uint8_t* neighbours[2] = {past, future};
+    for (int by = 0; by < height; by += 16) for (int bx = 0; bx < width; bx += 16) {
+        const int h = height - by < 16 ? height - by : 16;
+        const int w = width - bx < 16 ? width - bx : 16;
+        const unsigned samples = (unsigned)(((h + 1) / 2) * ((w + 1) / 2));
+        ptrdiff_t offsets[2] = {0, 0};
+        unsigned weights[2] = {0, 0};
+        for (unsigned n = 0; n < 2; ++n) {
+            if (!neighbours[n]) continue;
+            unsigned best = UINT32_MAX;
+            int dx = 0, dy = 0;
+            for (int step = 8; step && best; step /= 2) {
+                const int ox = dx, oy = dy;
+                static const int dirs[5][2] = {{0,0},{-1,0},{1,0},{0,-1},{0,1}};
+                for (int k = step == 8 ? 0 : 1; k < 5; ++k) {
+                    const int tx = ox + step * dirs[k][0], ty = oy + step * dirs[k][1];
+                    if (bx+tx < 0 || by+ty < 0 || bx+tx+w > width || by+ty+h > height) continue;
+                    unsigned sad = 0;
+                    for (int y = 0; y < h && sad < best; y += 2) for (int x = 0; x < w; x += 2) {
+                        const size_t i = (size_t)(by+y)*width + bx+x;
+                        const size_t j = (size_t)(by+y+ty)*width + bx+x+tx;
+                        const int a = depth == 8 ? center[i] : ((const uint16_t*)center)[i];
+                        const int b = depth == 8 ? neighbours[n][j] : ((const uint16_t*)neighbours[n])[j];
+                        sad += (unsigned)abs(a-b);
+                    }
+                    if (sad < best) { best = sad; dx = tx; dy = ty; }
+                }
+            }
+            offsets[n] = (ptrdiff_t)dy * width + dx;
+            const unsigned mean = best / (samples * scale);
+            weights[n] = mean < 12u ? 12u - mean : 0u;
+        }
+        if (!weights[0] && !weights[1]) continue;
+        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+            const ptrdiff_t i = (ptrdiff_t)(by+y)*width + bx+x;
+            const unsigned a = depth == 8 ? center[i] : ((const uint16_t*)center)[i];
+            unsigned sum = 144u*a, count = 144u;
+            for (unsigned n = 0; n < 2; ++n) if (weights[n]) {
+                const ptrdiff_t j = i + offsets[n];
+                const unsigned b = depth == 8 ? neighbours[n][j] : ((const uint16_t*)neighbours[n])[j];
+                const unsigned delta = (unsigned)abs((int)a-(int)b) / scale;
+                const unsigned weight = delta < 16u ? weights[n]*(16u-delta) : 0u;
+                sum += weight*b;
+                count += weight;
+            }
+            const unsigned value = (sum + count/2u) / count;
+            if (depth == 8) dst[i] = (uint8_t)value;
+            else ((uint16_t*)dst)[i] = (uint16_t)value;
+        }
+    }
 }
 
 /* Fills a SvtAv2Picture view over tightly packed supported YUV data held in a
@@ -984,12 +1372,55 @@ int main(int argc, char** argv) {
     const char* motion_profile = getenv("SVT_AV2_MOTION_Q");
     unsigned lookahead = 0;
     const int adaptive_group = motion_profile && !strcmp(motion_profile, "adaptive-gop");
+    const int tree_group = motion_profile && (!strcmp(motion_profile, "tree-rd") || !strcmp(motion_profile, "tree-overlay"));
+    const int overlay_group = motion_profile && !strcmp(motion_profile, "overlay-rd");
     uint16_t previous_grid[576] = {0};
-    if (adaptive_group || (motion_profile && !strcmp(motion_profile, "quartet-refs"))) lookahead = 3u;
+    if (tree_group || overlay_group || adaptive_group || (motion_profile && !strcmp(motion_profile, "quartet-refs"))) lookahead = 3u;
     else if (motion_profile && (!strcmp(motion_profile, "paired-anchor") || !strcmp(motion_profile, "paired-refs"))) lookahead = 1u;
+    const char* dependency_mode = getenv("SVT_AV2_TEMPORAL_ALLOC");
+    const int dependencies = dependency_mode && !strcmp(dependency_mode,"propagate");
+    const int full_window = motion_profile && !strcmp(motion_profile,"pyramid-window");
+    const unsigned max_group = full_window ? 32u : motion_profile && !strcmp(motion_profile, "pyramid16") ? 16u : 8u;
+    int root_policy = 0;
+    if (max_group == 16u && dependency_mode) {
+        if (!strcmp(dependency_mode,"direct-roots")) root_policy = 1;
+        if (!strcmp(dependency_mode,"protected-roots")) root_policy = 2;
+    }
+    const int reuse_qp = max_group!=16u || !dependency_mode ? 0 :
+        !strcmp(dependency_mode,"local-reuse") ? 2 : !strcmp(dependency_mode,"reuse-drawing");
+    const int spatial_tpl = reuse_qp || root_policy || (max_group == 16u && dependency_mode && !strcmp(dependency_mode,"spatial"));
+    const int tpl = spatial_tpl || (max_group == 16u && dependency_mode && !strcmp(dependency_mode,"regions"));
+    const unsigned capacity = max_group+(unsigned)tpl;
+    const char* gop = getenv("SVT_AV2_GOP_SEARCH");
+    const int search_spans = full_window && gop && !strcmp(gop,"regions");
+    const char* runs = getenv("SVT_AV2_DRAWING_RUNS");
+    const int drawing_runs = max_group == 16u && runs && !strcmp(runs,"cadence");
+    const int motion_layers = motion_profile && !strcmp(motion_profile, "pyramid-motion");
+    const int pyramid_tail = motion_layers || max_group >= 16u || (motion_profile && (!strcmp(motion_profile, "pyramid-tail") || !strcmp(motion_profile, "pyramid-compound")));
+    const int adaptive_pyramid = pyramid_tail || (motion_profile && !strcmp(motion_profile, "pyramid8-rd"));
+    const int pyramid = adaptive_pyramid || (motion_profile && (!strcmp(motion_profile, "pyramid8") || !strcmp(motion_profile, "pyramid8-blend")));
     const int paired = lookahead != 0u;
     uint8_t* pending_input = paired && frame_bytes <= SIZE_MAX / lookahead ? (uint8_t*)malloc(frame_bytes * lookahead) : NULL;
-    uint8_t* pending_recon = paired && recon_output ? (uint8_t*)malloc(frame_bytes) : NULL;
+    uint8_t* pending_recon = paired && recon_output && frame_bytes <= SIZE_MAX / (tree_group ? 2u : 1u) ?
+        (uint8_t*)malloc(frame_bytes * (tree_group ? 2u : 1u)) : NULL;
+    const char* filter = getenv("SVT_AV2_TEMPORAL_FILTER");
+    const int filter_anchors = pyramid && filter && !strcmp(filter,"hidden");
+    const int filter_drawings = tpl && filter && !strcmp(filter,"held-drawings");
+    const int temporal_filter = motion_profile && !strcmp(motion_profile, "filtered-drawing");
+    uint8_t* originals = temporal_filter && frame_bytes <= SIZE_MAX / 3u ? (uint8_t*)malloc(3u * frame_bytes) : NULL;
+    unsigned group_count = 0u, group_index = 0u;
+    unsigned group_order[32] = {0};
+    uint8_t group_hidden[32] = {0};
+    int group_qp[32] = {0};
+    uint8_t* group_input = pyramid && frame_bytes <= SIZE_MAX/capacity ? (uint8_t*)malloc(capacity*frame_bytes) : NULL;
+    uint8_t* group_recon = pyramid && recon_output && group_input ? (uint8_t*)malloc(capacity*frame_bytes) : NULL;
+    const size_t superblocks=((size_t)y4m.width+63u)/64u*((y4m.height+63u)/64u);
+    uint16_t* group_weights=spatial_tpl ? malloc(capacity*superblocks*sizeof(*group_weights)) : NULL;
+    if (spatial_tpl && !group_weights) exit_code=7;
+    if (pyramid && (!group_input || (recon_output && !group_recon))) exit_code = 7;
+    uint32_t originals_read = 0;
+    int input_ended = 0;
+    if (temporal_filter && !originals) exit_code = 7;
     unsigned next_midpoint = 0u, midpoints = 0u;
     if (paired && (!pending_input || (recon_output && !pending_recon))) exit_code = 7;
     while (!exit_code) {
@@ -999,9 +1430,117 @@ int main(int argc, char** argv) {
 
         uint32_t display = frames_written;
         uint8_t* current = frame_buffer;
-        if (next_midpoint < midpoints) {
-            current = pending_input + frame_bytes * next_midpoint++;
-            display = frames_written - 1u;
+        if (pyramid) {
+            if (group_index == group_count) {
+                if ((tpl || dependencies || search_spans) && group_count)
+                    memcpy(frame_buffer,group_input+(group_count-1u)*frame_bytes,frame_bytes);
+                group_index = group_count = 0;
+                const unsigned i = frames_written % SVT_AV2_LOOKAHEAD_KEY_INTERVAL;
+                const unsigned limit = !i ? (tpl ? capacity : 1u) : max_group <= SVT_AV2_LOOKAHEAD_KEY_INTERVAL-i ? max_group :
+                    pyramid_tail ? SVT_AV2_LOOKAHEAD_KEY_INTERVAL-i : 1u;
+                while (group_count < limit &&
+                       (effective_limit < 0 || frames_written+group_count < (unsigned)effective_limit)) {
+                    const int tag = app_read_frame_tag(input);
+                    if (!tag) break;
+                    if (tag < 0 || app_read_frame_payload(input, group_input + group_count*frame_bytes, frame_bytes)) {
+                        fprintf(stderr, "error: malformed or truncated input frame %u\n", frames_written+group_count);
+                        exit_code = 3;
+                        break;
+                    }
+                    ++group_count;
+                }
+                if (exit_code || !group_count) break;
+                unsigned changed_at[32] = {0};
+                int sparse = 0;
+                int reordered = group_count == max_group || (pyramid_tail && group_count > 1u);
+                if (adaptive_pyramid && reordered) {
+                    unsigned changes = 0;
+                    for (unsigned j = 0; j < group_count; ++j) {
+                        const int changed = app_drawing_changed(group_input + j*frame_bytes, y4m.width, y4m.height,
+                            y4m.bit_depth, previous_grid, 128u);
+                        changed_at[j] = changed != 0;
+                        if (j) changes += changed != 0;
+                    }
+                    /* Repeated drawings at 8/12 fps benefit from keeping the last displayed
+                     * drawing as the predictor. Dense motion can use both endpoints. */
+                    sparse = drawing_runs && 2u*changes < group_count;
+                    reordered = sparse ? 0 : motion_layers ? 2u*changes >= group_count :
+                        pyramid_tail ? changes != 0u : changes >= 4u;
+                }
+                unsigned span_at[32]={0};
+                if (search_spans && reordered && i && app_choose_spans(group_input,frame_buffer,frame_bytes,
+                        group_count,y4m.width,y4m.height,y4m.bit_depth,span_at)) { exit_code=7; break; }
+                const int buffered_key = tpl && !i;
+                group_order[0]=0;
+                group_hidden[0]=0;
+                for (unsigned j = (unsigned)buffered_key; j < group_count;) {
+                    unsigned span = 1;
+                    if (span_at[j]) span=span_at[j];
+                    else if (full_window && reordered && group_count-j >= 2u) span = (group_count-j) & ~1u;
+                    else if (reordered) while (span < max_group && span*2u <= group_count-j) span *= 2u;
+                    for (unsigned k=0; k<span; ++k) {
+                        const unsigned pos = svt_av2_pyramid_offset(span,k);
+                        group_order[j+k] = j+pos-1u;
+                        group_hidden[j+k] = span>1u && !(pos & 1u);
+                    }
+                    j += span;
+                }
+                if (tpl) {
+                    if (app_tpl_group(group_input,frame_buffer,frame_bytes,group_count,group_order,
+                            buffered_key,(int)y4m.width,(int)y4m.height,y4m.bit_depth,options.qp,group_qp,group_weights,root_policy,reuse_qp)) {
+                        exit_code=7;
+                        break;
+                    }
+                } else if (dependencies && i) app_dependency_qp(group_input,frame_buffer,frame_bytes,
+                    group_count,group_order,(int)y4m.width,(int)y4m.height,y4m.bit_depth,options.qp,group_qp);
+                else if (sparse) {
+                    for (unsigned j=0; j<group_count; ++j) {
+                        unsigned duration = 1;
+                        while (j+duration<group_count && !changed_at[j+duration]) ++duration;
+                        int qp = changed_at[j] ? options.qp - (int)lround(9.0*log2(duration)) : options.qp+18;
+                        group_qp[j] = qp<1 ? 1 : qp>255 ? 255 : qp;
+                    }
+                } else memset(group_qp,0,sizeof(group_qp));
+            }
+            const unsigned offset = group_order[group_index];
+            display = frames_written - group_index + offset;
+            current = group_input + frame_bytes*offset;
+            if (filter_drawings && app_filter_drawing(group_input,group_count,offset,frame_bytes,
+                    y4m.width,y4m.height,y4m.bit_depth,frame_buffer)) {
+                current = frame_buffer;
+            } else if (filter_anchors && group_hidden[group_index]) {
+                memcpy(frame_buffer, current, frame_bytes);
+                app_temporal_luma(current, offset ? current-frame_bytes : NULL,
+                    offset+1u < group_count ? current+frame_bytes : NULL, frame_buffer,
+                    (int)y4m.width, (int)y4m.height, y4m.bit_depth);
+                current = frame_buffer;
+            }
+            ++group_index;
+        } else if (temporal_filter) {
+            while (!input_ended && originals_read - frames_written < 2u &&
+                   (effective_limit < 0 || originals_read < (uint32_t)effective_limit)) {
+                const int tag = app_read_frame_tag(input);
+                if (!tag) { input_ended = 1; break; }
+                uint8_t* next = originals + (originals_read % 3u) * frame_bytes;
+                if (tag < 0 || app_read_frame_payload(input, next, frame_bytes)) {
+                    fprintf(stderr, "error: malformed or truncated input frame %u\n", originals_read);
+                    exit_code = 3;
+                    break;
+                }
+                ++originals_read;
+            }
+            if (exit_code || originals_read == frames_written) break;
+            const uint8_t* center = originals + (frames_written % 3u) * frame_bytes;
+            memcpy(frame_buffer, center, frame_bytes);
+            if (frames_written)
+                app_temporal_luma(center, originals + ((frames_written-1u) % 3u) * frame_bytes,
+                    originals_read - frames_written > 1u ? originals + ((frames_written+1u) % 3u) * frame_bytes : NULL,
+                    frame_buffer, (int)y4m.width, (int)y4m.height, y4m.bit_depth);
+        } else if (next_midpoint < midpoints) {
+            unsigned slot = next_midpoint++;
+            if (tree_group && midpoints == 3u && slot < 2u) slot = 1u - slot;
+            current = pending_input + frame_bytes * slot;
+            display = frames_written - next_midpoint + slot;
         } else {
             const int tag = app_read_frame_tag(input);
             if (!tag) break;
@@ -1017,8 +1556,10 @@ int main(int argc, char** argv) {
             }
             next_midpoint = midpoints = 0u;
             const uint32_t gop_index = frames_written % SVT_AV2_LOOKAHEAD_KEY_INTERVAL;
-            const int changed = !adaptive_group || app_drawing_changed(frame_buffer, y4m.width, y4m.height, y4m.bit_depth, previous_grid);
-            while (changed && gop_index && midpoints < lookahead && gop_index + midpoints + 1u < SVT_AV2_LOOKAHEAD_KEY_INTERVAL &&
+            const int changed = (!adaptive_group && !overlay_group) || app_drawing_changed(frame_buffer,
+                y4m.width, y4m.height, y4m.bit_depth, previous_grid, overlay_group ? 64u : 512u);
+            const unsigned limit = overlay_group && changed ? 1u : lookahead;
+            while ((overlay_group || changed) && gop_index && midpoints < limit && gop_index + midpoints + 1u < SVT_AV2_LOOKAHEAD_KEY_INTERVAL &&
                    (effective_limit < 0 || frames_written + midpoints + 1u < (uint32_t)effective_limit)) {
                 const int next = app_read_frame_tag(input);
                 if (!next) break;
@@ -1029,18 +1570,25 @@ int main(int argc, char** argv) {
                     break;
                 }
                 ++midpoints;
+                if (overlay_group && app_drawing_changed(frame_buffer, y4m.width, y4m.height,
+                        y4m.bit_depth, previous_grid, 64u)) break;
             }
             if (exit_code) break;
             display += midpoints;
             if (adaptive_group && midpoints)
-                app_drawing_changed(frame_buffer, y4m.width, y4m.height, y4m.bit_depth, previous_grid);
+                app_drawing_changed(frame_buffer, y4m.width, y4m.height, y4m.bit_depth, previous_grid, 512u);
         }
 
         SvtAv2Picture picture;
         app_fill_picture(&picture, current, y4m.width, y4m.height, y4m.bit_depth, y4m.chroma_format);
         picture.pts = (int32_t)display;
 
-        err = svt_av2_enc_send_picture(handle, &picture);
+        if (group_weights)
+            err=svt_av2_enc_send_picture_weighted(handle,&picture,group_qp[group_index-1u],
+                group_weights+(group_index-1u)*superblocks,superblocks);
+        else err = pyramid && (dependencies || drawing_runs || tpl) && group_qp[group_index-1u] ?
+            svt_av2_enc_send_picture_at_qp(handle,&picture,group_qp[group_index-1u]) :
+            svt_av2_enc_send_picture(handle,&picture);
         if (err != SVT_AV2_ERROR_NONE) {
             fprintf(stderr,
                     "error: svt_av2_enc_send_picture failed for frame %u (%s)\n",
@@ -1140,8 +1688,20 @@ int main(int argc, char** argv) {
                 break;
             }
             if (paired && recon.byte_count != frame_bytes) { exit_code = 11; break; }
-            if (display > frames_written) memcpy(pending_recon, recon_buffer, recon.byte_count);
+            if (pyramid) {
+                if (recon.byte_count != frame_bytes) { exit_code = 11; break; }
+                const unsigned offset = display - (frames_written+1u-group_index);
+                memcpy(group_recon + frame_bytes*offset, recon_buffer, frame_bytes);
+                if (group_index == group_count && fwrite(group_recon, frame_bytes, group_count, recon_output) != group_count) {
+                    exit_code = 12;
+                    break;
+                }
+            } else if (tree_group && midpoints == 3u && next_midpoint == 1u)
+                memcpy(pending_recon + frame_bytes, recon_buffer, recon.byte_count);
+            else if (display > frames_written) memcpy(pending_recon, recon_buffer, recon.byte_count);
             else if (!recon.byte_count || fwrite(recon_buffer, 1, recon.byte_count, recon_output) != recon.byte_count ||
+                (tree_group && midpoints == 3u && next_midpoint == 2u &&
+                 fwrite(pending_recon + frame_bytes, 1, recon.byte_count, recon_output) != recon.byte_count) ||
                 (display < frames_written && next_midpoint == midpoints && fwrite(pending_recon, 1, recon.byte_count, recon_output) != recon.byte_count)) {
                 fprintf(stderr,
                         "error: writing reconstruction for frame %u to '%s' failed\n",
@@ -1237,6 +1797,10 @@ int main(int argc, char** argv) {
     }
 
     free(packet);
+    free(group_input);
+    free(group_weights);
+    free(group_recon);
+    free(originals);
     free(pending_input);
     free(pending_recon);
     free(recon_buffer);

@@ -53,6 +53,7 @@
 #endif
 #endif
 #include "inter_frame.h"
+#include "pyramid8.h"
 #include "obu_writer.h"
 #include "bit_writer.h" /* SVT_AV2_BW_ERROR_NO_SPACE */
 #include "intra_frame.h" /* svt_av2_intra_frame_encode (T012), M2 recon */
@@ -62,12 +63,15 @@
 /* Freeze the physical map and refresh decision before encoding, so RD and
  * the formal writer see the same logical references and expanded distances. */
 typedef struct SvtAv2VideoCdfState {
-    SvtAv2EntropyModels slots[2]; /* Decayed, committed banks for the physical DPB. */
+    SvtAv2ReferenceFrame extra_ref[4]; /* Interior reference levels beyond the two end anchors. */
+    SvtAv2EntropyModels slots[6]; /* Decayed, committed banks for the physical DPB. */
     SvtAv2EntropyModels rd_end, writer_end; /* Detached raw banks for exact comparison. */
     SvtAv2FrameHeaderConfig frame_header;
     SvtAv2MotionField motion_field;
+    uint16_t* video_qindex;
+    size_t video_qindex_count;
     int use_motion_field;
-    int64_t slot_frame[2];
+    int64_t slot_frame[6];
     int trace;
 #if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
     uint8_t cfl_sequence, cfl_key, cfl_p;
@@ -79,6 +83,7 @@ typedef struct SvtAv2PictureReference {
     const SvtAv2ReferenceFrame* secondary_reference;
     uint32_t dual_ref, retain_reference, refresh_mask, reference_slot;
     uint32_t slot_mask, rotate_anchor;
+    uint32_t secondary_slot, refresh_slot, paired_role;
     uint32_t ref_distance[2]; /* Populated only with a distinct [LAST, LONG]. */
 } SvtAv2PictureReference;
 
@@ -284,6 +289,8 @@ void svt_av2_context_release_pipeline(SvtAv2EncoderContext* context) {
     context->anchor_source_valid = 0u;
     context->latest_slot = 0u;
     context->anchor_display = context->previous_anchor_display = 0u;
+    memset(context->slot_display,0,sizeof(context->slot_display));
+    context->pyramid_span = context->tree_full = 0u;
     context->held_pictures = 0u;
     context->previous_motion_q8 = UINT32_MAX;
     context->quiet_frames = 0u;
@@ -291,8 +298,12 @@ void svt_av2_context_release_pipeline(SvtAv2EncoderContext* context) {
 
     svt_av2_reference_release(&context->reference);
     svt_av2_reference_release(&context->long_reference);
+    if (context->video_cdf && context->motion_q == 20u)
+        for (unsigned i = 0; i < 4; ++i) svt_av2_reference_release(&context->video_cdf->extra_ref[i]);
+    if (context->video_cdf) free(context->video_cdf->video_qindex);
     free(context->video_cdf);
     context->video_cdf = NULL;
+    free(context->picture_weights); context->picture_weights = NULL;
     free(context->partition_decisions); context->partition_decisions = NULL;
     context->partition_decision_capacity = context->partition_decision_count = 0;
     free(context->coded_modes); context->coded_modes = NULL;
@@ -694,6 +705,21 @@ SvtAv2Error svt_av2_enc_set_parameter(SvtAv2Handle handle, SvtAv2Parameter param
     return SVT_AV2_ERROR_NONE;
 }
 
+/* Match zenrav1e's 10-bit luma/chroma matrix schedules to the
+ * nearest AV1 AC step, including AV2's three fractional quantizer bits. */
+static void zen_matrix_levels(int q, int uv_delta, uint8_t* luma, uint8_t* chroma) {
+    static const int y_transition[] = {1284, 2008, 3052, 4880, 5848, 6920, 9840, 20632};
+    static const int uv_transition[] = {1284, 3560, 9840, 20632, 30136, 44240};
+    const int y = svt_av2_quant_qlookup(q);
+    *luma = 10u;
+    for (unsigned i=0; i<SVT_AV2_ARRAY_SIZE(y_transition); ++i) *luma -= y > y_transition[i];
+    if (!*chroma) {
+        const int uv = svt_av2_quant_qlookup(SVT_AV2_MIN(303, SVT_AV2_MAX(1, q+uv_delta)));
+        *chroma = 10u;
+        for (unsigned i=0; i<SVT_AV2_ARRAY_SIZE(uv_transition); ++i) *chroma -= uv > uv_transition[i];
+    }
+}
+
 static int ccso_config_supported(const SvtAv2EncoderConfig* q) {
     return q->still_picture && q->prediction_structure==SVT_AV2_PRED_ALL_INTRA && q->rd_mode==3u &&
         q->intra_mode_selection==4u && (q->partition_selection==5u || q->partition_selection==7u) && q->tree_refinement>=2u &&
@@ -807,7 +833,11 @@ SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle) {
     const int curve = level && !strcmp(level, "zen-curve");
     if (curve && (!context->config.still_picture || context->config.bit_depth != SVT_AV2_BIT_DEPTH_10))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
-    uint8_t qm_level = curve ? 8u : !level || !strcmp(level, "12") ? 12u :
+    const int inter_curve = level && !strcmp(level,"inter-curve");
+    if (inter_curve && (context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P ||
+        context->config.bit_depth != SVT_AV2_BIT_DEPTH_10 || !context->cdf_inherit))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    uint8_t qm_level = (curve || inter_curve) ? 8u : !level || !strcmp(level, "12") ? 12u :
         !strcmp(level, "8") ? 8u : !strcmp(level, "4") ? 4u : 0u;
     if (!qm_level) return SVT_AV2_ERROR_INVALID_PARAMETER;
     const uint8_t qm_scope = ((!qm12 && level) || (qm12 && !strcmp(qm12, "all"))) ? 3u :
@@ -819,23 +849,7 @@ SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle) {
     uint8_t qm_uv_level = !uv_level ? 0u : !strcmp(uv_level,"4") ? 4u :
         !strcmp(uv_level,"8") ? 8u : !strcmp(uv_level,"12") ? 12u : 0u;
     if (uv_level && (!qm_uv_level || !qm_scope)) return SVT_AV2_ERROR_INVALID_PARAMETER;
-    if (curve) {
-        /* zenrav1e Ssimulacra2 luma and all-intra 4:2:0 chroma schedules.
-         * Match the nearest AV1 10-bit AC step. These transition midpoints
-         * include AV2's three extra quantizer fractional bits. */
-        static const int y_transition[] = {1284, 2008, 3052, 4880, 5848, 6920, 9840, 20632};
-        static const int uv_transition[] = {1284, 3560, 9840, 20632, 30136, 44240};
-        const int q = context->config.qp + 48;
-        const int y = svt_av2_quant_qlookup(q);
-        const int uv = svt_av2_quant_qlookup(SVT_AV2_MIN(303, SVT_AV2_MAX(1, q + uv_delta)));
-        qm_level = 10u;
-        for (unsigned i = 0; i < SVT_AV2_ARRAY_SIZE(y_transition); ++i) qm_level -= y > y_transition[i];
-        if (!uv_level) {
-            qm_uv_level = 10u;
-            for (unsigned i = 0; i < SVT_AV2_ARRAY_SIZE(uv_transition); ++i)
-                qm_uv_level -= uv > uv_transition[i];
-        }
-    }
+    if (curve) zen_matrix_levels(context->config.qp+48,(int)uv_delta,&qm_level,&qm_uv_level);
     const char* edge = getenv("SVT_AV2_STILL_EDGE_FILTER");
     const char* ibp = getenv("SVT_AV2_IBP");
     const int enable_ibp = ibp && !strcmp(ibp, "1");
@@ -856,7 +870,9 @@ SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle) {
         (!context->config.still_picture && !context->cdf_inherit)))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
     const char* motion_q = getenv("SVT_AV2_MOTION_Q");
-    const int drawing_cadence = motion_q && !strcmp(motion_q, "drawing-rd");
+    const int full_window = motion_q && !strcmp(motion_q,"pyramid-window");
+    const int motion_layers = motion_q && !strcmp(motion_q, "pyramid-motion");
+    const int drawing_cadence = motion_q && (!strcmp(motion_q, "drawing-rd") || !strcmp(motion_q, "filtered-drawing"));
     const int adaptive_q = motion_q && !strcmp(motion_q, "adaptive") ? 1 :
         motion_q && !strcmp(motion_q, "hold") ? 2 :
         motion_q && !strcmp(motion_q, "reuse") ? 3 :
@@ -872,7 +888,11 @@ SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle) {
         motion_q && !strcmp(motion_q, "paired-anchor") ? 13 :
         motion_q && !strcmp(motion_q, "paired-refs") ? 14 :
         motion_q && !strcmp(motion_q, "quartet-refs") ? 15 :
-        motion_q && !strcmp(motion_q, "adaptive-gop") ? 16 : 0;
+        motion_q && !strcmp(motion_q, "adaptive-gop") ? 16 :
+        motion_q && !strcmp(motion_q, "overlay-rd") ? 17 :
+        motion_q && !strcmp(motion_q, "tree-rd") ? 18 :
+        motion_q && !strcmp(motion_q, "tree-overlay") ? 19 :
+        (motion_layers || full_window || (motion_q && (!strcmp(motion_q, "pyramid8") || !strcmp(motion_q, "pyramid8-blend") || !strcmp(motion_q, "pyramid8-rd") || !strcmp(motion_q, "pyramid-tail") || !strcmp(motion_q, "pyramid-compound") || !strcmp(motion_q, "pyramid16")))) ? 20 : 0;
     if (adaptive_q >= 11 && (context->dual_ref_policy != 3u || !context->cdf_inherit))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
     if (adaptive_q && (!context->dual_ref_cadence || !context->video_anchor_qp ||
@@ -880,9 +900,18 @@ SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle) {
         return SVT_AV2_ERROR_INVALID_PARAMETER;
     svt_av2_context_release_pipeline(context);
     context->motion_q = (uint8_t)adaptive_q;
+    const char* display_refs = getenv("SVT_AV2_DISPLAY_REFS");
+    const char* runs = getenv("SVT_AV2_DRAWING_RUNS");
+    context->drawing_runs = adaptive_q == 20 && runs && !strcmp(runs,"cadence");
+    context->display_all_slots = adaptive_q == 20 && display_refs && !strcmp(display_refs,"all");
+    context->motion_layers = (uint8_t)motion_layers;
+    context->adaptive_pyramid = full_window ? 4u : motion_q && !strcmp(motion_q, "pyramid16") ? 3u :
+        (motion_layers || (motion_q && (!strcmp(motion_q, "pyramid-tail") || !strcmp(motion_q, "pyramid-compound")))) ? 2u :
+        motion_q && !strcmp(motion_q, "pyramid8-rd");
     context->drawing_cadence = (uint8_t)drawing_cadence;
     context->intra_ist_scope = ist_scope;
     context->qm_scope = qm_scope;
+    context->inter_qm_curve = (uint8_t)inter_curve;
     context->qm_level = qm_level;
     context->qm_uv_level = qm_uv_level;
     context->uv_delta_q = (int8_t)uv_delta;
@@ -905,7 +934,10 @@ SvtAv2Error svt_av2_enc_init(SvtAv2Handle handle) {
         const char* field = getenv("SVT_AV2_TEMPORAL_ME");
         cdf->use_motion_field = context->dual_ref_policy == 3u && field && !strcmp(field, "1");
         if (cdf->use_motion_field) memset(&cdf->motion_field, 0, sizeof(cdf->motion_field));
-        cdf->slot_frame[0] = cdf->slot_frame[1] = -1;
+        cdf->video_qindex = NULL;
+        cdf->video_qindex_count = 0;
+        memset(cdf->extra_ref, 0, sizeof(cdf->extra_ref));
+        for (unsigned i = 0; i < 6; ++i) cdf->slot_frame[i] = -1;
         const char* trace = getenv("SVT_AV2_CDF_INHERIT_TRACE");
         cdf->trace = trace && trace[0] == '1' && trace[1] == '\0';
 #if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
@@ -1025,6 +1057,13 @@ static SvtAv2Error ensure_recon_buffers(SvtAv2EncoderContext* context,
         if (status == SVT_AV2_ERROR_NONE && context->dual_ref_period)
             status = svt_av2_reference_init(&context->long_reference, width, height,
                 (uint32_t)context->config.bit_depth, context->config.chroma_format);
+        if (context->motion_q == 20u) {
+            for (unsigned i = 0; i < (context->adaptive_pyramid > 2u ? context->adaptive_pyramid : 2u) && !status; ++i) {
+                svt_av2_reference_release(&context->video_cdf->extra_ref[i]);
+                status = svt_av2_reference_init(&context->video_cdf->extra_ref[i], width, height,
+                    (uint32_t)context->config.bit_depth, context->config.chroma_format);
+            }
+        }
         if (status != SVT_AV2_ERROR_NONE) {
             svt_av2_reference_release(&context->reference);
             svt_av2_reference_release(&context->long_reference);
@@ -1075,15 +1114,38 @@ SvtAv2Error svt_av2_enc_send_picture(SvtAv2Handle handle, const void* picture) {
         return SVT_AV2_ERROR_INVALID_STATE;
 
     const SvtAv2Picture* input = (const SvtAv2Picture*)picture;
-    if (context->motion_q >= 13u) {
+    if (context->motion_q == 20u) {
+        const unsigned i = context->pictures_sent % SVT_AV2_LOOKAHEAD_KEY_INTERVAL;
+        const unsigned base = context->pictures_sent - i;
+        unsigned offset = i;
+        if (i && i <= context->anchor_display) {
+            const unsigned begin = context->anchor_display - context->pyramid_span;
+            offset = begin + svt_av2_pyramid_offset(context->pyramid_span, i-begin-1u);
+        } else if (i && input->pts > (int64_t)(base+i)) {
+            const unsigned span = (unsigned)input->pts - base - i + 1u;
+            const int variable = context->adaptive_pyramid == 4u && span >= 2u && span <= 32u && !(span & 1u);
+            if (!variable && span != 8u && !(context->adaptive_pyramid == 3u && span == 16u) &&
+                (context->adaptive_pyramid < 2u || (span != 2u && span != 4u)))
+                return SVT_AV2_ERROR_INVALID_PARAMETER;
+            if (i != context->anchor_display+1u || (!variable && (i-1u) % span) || i+span > SVT_AV2_LOOKAHEAD_KEY_INTERVAL) return SVT_AV2_ERROR_INVALID_PARAMETER;
+            offset = i+span-1u;
+        }
+        if (input->pts < 0 || (unsigned)input->pts != base+offset) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    } else if (context->motion_q >= 13u) {
         const uint32_t i = context->pictures_sent % SVT_AV2_LOOKAHEAD_KEY_INTERVAL;
         const uint32_t pts = (uint32_t)input->pts % SVT_AV2_LOOKAHEAD_KEY_INTERVAL;
         const uint32_t lookahead = context->motion_q >= 15u ? 3u : 1u;
+        unsigned expected = i - 1u;
+        if (context->motion_q >= 18u && context->tree_full && i <= context->anchor_display) {
+            const unsigned remaining = context->anchor_display - i;
+            if (remaining == 2u) expected = i;
+            else if (remaining == 1u) expected = i - 2u;
+        }
         if (input->pts < 0 || (uint32_t)input->pts / SVT_AV2_LOOKAHEAD_KEY_INTERVAL !=
             context->pictures_sent / SVT_AV2_LOOKAHEAD_KEY_INTERVAL || (!i && pts) ||
-            (i && i <= context->anchor_display && pts != i - 1u) ||
-            (i > context->anchor_display && ((context->motion_q != 16u && i != context->anchor_display + 1u) ||
-                pts < i || pts - i > lookahead)))
+            (i && i <= context->anchor_display && pts != expected) ||
+            (i > context->anchor_display && ((context->motion_q < 16u && i != context->anchor_display + 1u) ||
+                pts < i || pts - i > lookahead || (context->motion_q >= 18u && pts > i && i != context->anchor_display+1u))))
             return SVT_AV2_ERROR_INVALID_PARAMETER;
     }
     uint32_t             chroma_width = 0;
@@ -1147,16 +1209,53 @@ SvtAv2Error svt_av2_enc_send_picture(SvtAv2Handle handle, const void* picture) {
         context->pictures_encoded = 0u;
         context->reference.valid = context->long_reference.valid = 0;
         context->anchor_display = context->previous_anchor_display = 0u;
-        context->latest_slot = context->held_pictures = 0u;
+        memset(context->slot_display,0,sizeof(context->slot_display));
+        context->latest_slot = context->held_pictures = context->tree_full = 0u;
         context->anchor_source_valid = 0u;
-        context->video_cdf->slot_frame[0] = context->video_cdf->slot_frame[1] = -1;
+        for (unsigned i = 0; i < 6; ++i) context->video_cdf->slot_frame[i] = -1;
+        if (context->motion_q == 20u)
+            for (unsigned i = 0; i < 4; ++i) context->video_cdf->extra_ref[i].valid = 0;
         if (context->video_cdf->use_motion_field)
             memset(&context->video_cdf->motion_field, 0, sizeof(context->video_cdf->motion_field));
     }
+    free(context->picture_weights);
+    context->picture_weights = NULL;
+    context->picture_qp = 0;
     context->frame_pts = input->pts;
     context->frame_pending = 1;
     context->pictures_sent++;
     return SVT_AV2_ERROR_NONE;
+}
+
+SvtAv2Error svt_av2_enc_send_picture_at_qp(SvtAv2Handle handle, const SvtAv2Picture* picture, int32_t qp) {
+    if (!context_from_handle(handle)) return SVT_AV2_ERROR_INVALID_HANDLE;
+    if (!picture || qp < 1 || qp > 255) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    SvtAv2Error err = svt_av2_enc_send_picture(handle,picture);
+    if (err == SVT_AV2_ERROR_NONE) handle->picture_qp = qp;
+    return err;
+}
+
+SvtAv2Error svt_av2_enc_send_picture_weighted(SvtAv2Handle handle, const SvtAv2Picture* picture,
+        int32_t qp, const uint16_t* weights, size_t count) {
+    SvtAv2EncoderContext* c=context_from_handle(handle);
+    if (!c) return SVT_AV2_ERROR_INVALID_HANDLE;
+    if (c->state!=SVT_AV2_STATE_INITIALIZED || c->packet_pending || c->frame_pending)
+        return SVT_AV2_ERROR_INVALID_STATE;
+    if (!picture || !weights || qp<1 || qp>255 ||
+        picture->width!=c->config.width || picture->height!=c->config.height ||
+        count!=(uint64_t)((c->config.width+UINT64_C(63))/64u)*((c->config.height+UINT64_C(63))/64u) ||
+        !count || count>SIZE_MAX/sizeof(*weights))
+        return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (c->config.prediction_structure!=SVT_AV2_PRED_LOW_DELAY_P || !c->config.rd_mode || c->tile_columns>1u)
+        return SVT_AV2_ERROR_UNSUPPORTED;
+    for (size_t i=0;i<count;++i) if (!weights[i]) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    uint16_t* copy=(uint16_t*)malloc(count*sizeof(*copy));
+    if (!copy) return SVT_AV2_ERROR_OUT_OF_MEMORY;
+    memcpy(copy,weights,count*sizeof(*copy));
+    SvtAv2Error err=svt_av2_enc_send_picture_at_qp(handle,picture,qp);
+    if (err) free(copy);
+    else c->picture_weights=copy;
+    return err;
 }
 
 /* Encodes the pending frame into context->packet, if a frame is waiting and no
@@ -1716,19 +1815,129 @@ static uint32_t lookahead_display(const SvtAv2EncoderContext* context) {
     return (uint32_t)context->frame_pts % SVT_AV2_LOOKAHEAD_KEY_INTERVAL;
 }
 
-static SvtAv2PictureReference picture_reference(const SvtAv2EncoderContext* context, SvtAv2AnchorProbe* probe) {
+/* Screen the zero-motion compound candidate against both single predictors
+ * locally. The stricter margin reserves moving, textured frames for ME. */
+static int compare_reference_pair(const SvtAv2FrameBuffer* src, const SvtAv2PictureReference* refs, uint64_t* cost) {
+    const SvtAv2FrameBuffer* a = svt_av2_reference_view(refs->predictor);
+    const SvtAv2FrameBuffer* b = svt_av2_reference_view(refs->secondary_reference);
+    const unsigned step = src->bit_depth > 8u ? 2u : 1u;
+    uint64_t single = 0, blend = 0, selected = 0;
+    for (unsigned by = 0; by < src->visible_height; by += 32u) for (unsigned bx = 0; bx < src->visible_width; bx += 32u) {
+        unsigned da = 0, db = 0, mixed = 0;
+        for (unsigned y = by; y < by+32u && y < src->visible_height; y += 8u) {
+            for (unsigned x = bx; x < bx+32u && x < src->visible_width; x += 8u) {
+                const int v = svt_av2_sample_load(src->planes[0]+(size_t)y*src->strides[0]+x*step, src->bit_depth);
+                const int l = svt_av2_sample_load(a->planes[0]+(size_t)y*a->strides[0]+x*step, src->bit_depth);
+                const int r = svt_av2_sample_load(b->planes[0]+(size_t)y*b->strides[0]+x*step, src->bit_depth);
+                da += (unsigned)abs(v-l);
+                db += (unsigned)abs(v-r);
+                mixed += (unsigned)abs(v-((l+r+1)/2));
+            }
+        }
+        const unsigned best = SVT_AV2_MIN(da,db);
+        single += best;
+        blend += mixed;
+        selected += refs->ref_distance[0]==refs->ref_distance[1] ? SVT_AV2_MIN(best,mixed) : best;
+    }
+    if (cost) *cost=selected;
+    return 10u*blend < 9u*single;
+}
+
+static SvtAv2ReferenceFrame* pyramid_slot(SvtAv2EncoderContext* c, unsigned slot) {
+    if (!slot) return &c->reference;
+    if (slot == 1u) return &c->long_reference;
+    return &c->video_cdf->extra_ref[slot-2u];
+}
+
+static SvtAv2PictureReference picture_reference(SvtAv2EncoderContext* context, SvtAv2AnchorProbe* probe) {
     SvtAv2PictureReference refs = {0};
     if (context->config.prediction_structure != SVT_AV2_PRED_LOW_DELAY_P) return refs;
     refs.dual_ref = context->dual_ref_period != 0u;
     if (context->dual_ref_cadence) refs.refresh_mask = anchor_probe(context, probe);
     if (context->pictures_encoded == 0u) return refs; /* CLK refreshes all slots implicitly. */
     refs.predictor = &context->reference;
+    if (context->motion_q == 20u) {
+        const unsigned i = context->pictures_encoded, pts = lookahead_display(context);
+        const int nested = i <= context->anchor_display;
+        const int outer = !nested && pts > i;
+        refs.reference_slot = context->latest_slot;
+        refs.refresh_slot = (pts & 7u) ? (context->latest_slot ^ 1u) : svt_av2_pyramid8_slot(pts);
+        refs.refresh_mask = 1u;
+        refs.ref_distance[0] = pts - context->anchor_display;
+        if (context->drawing_runs && !nested && !outer) {
+            refs.refresh_slot = context->latest_slot ^ 1u;
+            uint32_t distances[2];
+            SvtAv2ReferenceFrame* older = pyramid_slot(context, refs.refresh_slot);
+            if (older->valid && svt_av2_mvp_two_past_distances(pts, context->anchor_display,
+                    context->previous_anchor_display, distances)) {
+                refs.secondary_slot = refs.refresh_slot;
+                refs.secondary_reference = older;
+                memcpy(refs.ref_distance, distances, sizeof(distances));
+            }
+        }
+        if (outer) {
+            refs.paired_role = SVT_AV2_HIDDEN_ANCHOR;
+            refs.refresh_slot = context->latest_slot ^ 1u;
+        }
+        if (nested) {
+            const unsigned span = context->pyramid_span;
+            const unsigned begin = context->anchor_display-span, pos = pts-begin;
+            const unsigned prev = svt_av2_pyramid_offset(span,i-begin-2u);
+            const SvtAv2PyramidNode node = svt_av2_pyramid_node(span,i-begin-1u,context->latest_slot);
+            refs.reference_slot = node.right_slot;
+            refs.secondary_slot = node.left_slot;
+            refs.secondary_reference = pyramid_slot(context,refs.secondary_slot);
+            refs.ref_distance[0] = node.right-pos;
+            refs.ref_distance[1] = pos-node.left;
+            refs.refresh_slot = node.slot;
+            refs.refresh_mask = !(pos & 1u);
+            refs.paired_role = refs.refresh_mask ? (prev & 1u ? SVT_AV2_HIDDEN_BRANCH : SVT_AV2_HIDDEN_MIDPOINT) :
+                (prev & 1u ? SVT_AV2_LAST_MIDPOINT : SVT_AV2_ONLY_MIDPOINT);
+        }
+        refs.predictor = pyramid_slot(context, refs.reference_slot);
+        const char* bank = getenv("SVT_AV2_REF_SEARCH");
+        if (nested && bank && !strcmp(bank,"past-bank")) {
+            uint64_t best;
+            compare_reference_pair(&context->frame_source,&refs,&best);
+            for (unsigned slot=0;slot<context->adaptive_pyramid+2u;++slot) {
+                SvtAv2ReferenceFrame* ref=pyramid_slot(context,slot);
+                if (!ref->valid || slot==refs.secondary_slot || context->slot_display[slot]>=pts ||
+                    pts-context->slot_display[slot]>32u) continue;
+                SvtAv2PictureReference trial=refs;
+                trial.secondary_slot=slot;
+                trial.secondary_reference=ref;
+                trial.ref_distance[1]=pts-context->slot_display[slot];
+                uint64_t cost;
+                compare_reference_pair(&context->frame_source,&trial,&cost);
+                if (cost*16u<best*15u) { refs=trial; best=cost; }
+            }
+        }
+        refs.slot_mask = refs.refresh_mask ? 1u << refs.refresh_slot : 0u;
+        return refs;
+    }
     if (context->motion_q >= 13u) {
         const uint32_t pts = lookahead_display(context);
         const uint32_t anchor_pts = context->anchor_display;
+        if (context->motion_q >= 18u && context->tree_full &&
+            context->pictures_encoded <= anchor_pts && anchor_pts - context->pictures_encoded <= 2u) {
+            const uint32_t remaining = anchor_pts - context->pictures_encoded;
+            refs.reference_slot = context->latest_slot;
+            refs.refresh_mask = remaining == 2u;
+            refs.slot_mask = refs.refresh_mask ? 1u << (refs.reference_slot ^ 1u) : 0u;
+            if (remaining == 1u) {
+                refs.reference_slot ^= 1u;
+                refs.predictor = &context->long_reference;
+                refs.ref_distance[0] = 1u;
+            } else {
+                refs.secondary_reference = &context->long_reference;
+                refs.ref_distance[0] = remaining == 2u ? 2u : 1u;
+                refs.ref_distance[1] = refs.ref_distance[0];
+            }
+            return refs;
+        }
         refs.ref_distance[0] = pts > anchor_pts ? pts-anchor_pts : anchor_pts-pts;
         refs.slot_mask = refs.refresh_mask = pts > context->pictures_encoded ||
-            (context->motion_q == 16u && pts == context->pictures_encoded);
+            (context->motion_q >= 16u && pts == context->pictures_encoded);
         if (context->motion_q >= 14u) {
             refs.reference_slot = context->latest_slot;
             refs.rotate_anchor = refs.refresh_mask;
@@ -1808,6 +2017,7 @@ static void record_block_ref_stats(SvtAv2EncoderContext* context, const SvtAv2Pi
             if (!mode->is_inter) continue;
             /* The formal writer has already validated both the bitstream and rank. */
             const uint32_t rank = two ? mode->reference_rank : 0u;
+            if (rank == 2u) { ++stats.rank_leaves[0]; ++stats.rank_leaves[1]; continue; }
             ++stats.rank_leaves[rank];
             if (two && (mode->mv_x % 2 != 0 || mode->mv_y % 2 != 0))
                 ++stats.odd_mv_leaves[rank];
@@ -1846,18 +2056,25 @@ static int can_show_last(const SvtAv2EncoderContext* c, const SvtAv2AnchorProbe*
     return 1;
 }
 
-static SvtAv2Error show_last(SvtAv2EncoderContext* c) {
+static SvtAv2Error show_reference(SvtAv2EncoderContext* c, uint32_t slot, uint32_t pts, int first, int after_slot) {
     /* MFH and sequence IDs 0 (two uvlc(0)); physical LAST slot, explicit 8-bit hint. */
     uint8_t payload[2];
     SvtAv2BitWriter header, packet;
     svt_av2_bit_writer_init(&header, payload, sizeof(payload));
     svt_av2_bit_writer_init(&packet, c->packet, c->packet_capacity);
-    if (svt_av2_bit_writer_write_bits(&header, 12u | (c->latest_slot << 1u), 4u) ||
-        svt_av2_bit_writer_write_bits(&header, c->pictures_encoded & 255u, 8u) ||
+    const unsigned bits = c->adaptive_pyramid >= 3u ? 3u : c->motion_q == 20u ? 2u : 1u;
+    if (svt_av2_bit_writer_write_bits(&header, (6u << bits) | (slot << 1u), bits+3u) ||
+        svt_av2_bit_writer_write_bits(&header, pts & 255u, 8u) ||
         svt_av2_obu_payload_finalize(&header) ||
-        svt_av2_obu_write(&packet, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0u, NULL, 0u) ||
+        (!first && svt_av2_obu_write(&packet, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0u, NULL, 0u)) ||
         svt_av2_obu_write(&packet, SVT_AV2_OBU_REGULAR_SEF, 0u, payload, sizeof(payload)))
         return SVT_AV2_ERROR_INTERNAL;
+    if (after_slot >= 0) {
+        const uint8_t overlay = (uint8_t)(0xc0u | ((unsigned)after_slot << (6u-bits)) | (3u << (4u-bits)));
+        if (svt_av2_obu_write(&packet, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0u, NULL, 0u) ||
+            svt_av2_obu_write(&packet, SVT_AV2_OBU_REGULAR_SEF, 0u, &overlay, 1u))
+            return SVT_AV2_ERROR_INTERNAL;
+    }
     memset(&c->block_ref_stats, 0, sizeof(c->block_ref_stats));
     memset(&c->rd_stats, 0, sizeof(c->rd_stats));
     c->inter_skip_trials = c->inter_skip_accepts = 0;
@@ -1873,30 +2090,64 @@ static SvtAv2Error show_last(SvtAv2EncoderContext* c) {
 
 /* Compare the actual coded P packet against a 6-byte show-existing packet
  * before publishing its pixels, reference slots or inherited entropy bank. */
-static SvtAv2Error compare_last_display(SvtAv2EncoderContext* c,size_t bytes,int* reuse) {
-    const SvtAv2FrameBuffer* last=svt_av2_reference_view(&c->reference);
-    const uint32_t depth=c->frame_source.bit_depth, step=depth>8u?2u:1u;
-    uint64_t held[3]={0}, coded[3]={0};
-    for (uint32_t p=0;p<3;++p) {
-        const uint32_t width=svt_av2_picture_plane_width(last,p);
-        const uint32_t height=svt_av2_picture_plane_height(last,p);
-        for (uint32_t y=0;y<height;++y) {
-            const uint8_t* ref=last->planes[p]+(size_t)y*last->strides[p];
-            const uint8_t* rec=c->recon.planes[p]+(size_t)y*c->recon.strides[p];
-            const uint8_t* src=c->frame_source.planes[p]+(size_t)y*c->frame_source.strides[p];
-            for (uint32_t x=0;x<width;++x) {
-                const int orig=svt_av2_sample_load(src+x*step,depth);
-                const int a=orig-svt_av2_sample_load(ref+x*step,depth), b=orig-svt_av2_sample_load(rec+x*step,depth);
-                held[p]+=(uint64_t)(a*a); coded[p]+=(uint64_t)(b*b);
+static SvtAv2Error display_cost(const SvtAv2EncoderContext* c, const SvtAv2FrameBuffer* pixels,
+        size_t bytes, uint64_t* cost) {
+    const uint32_t depth = c->frame_source.bit_depth, step = depth > 8u ? 2u : 1u;
+    uint64_t sse[3] = {0};
+    const char* detail=getenv("SVT_AV2_DETAIL_RD");
+    const int contrast=detail && !strcmp(detail,"inter-contrast");
+    if (contrast) {
+        SvtAv2BlockView view={0,0,pixels->visible_width,pixels->visible_height,NULL};
+        sse[0]=svt_av2_contrast_distortion(&c->frame_source,pixels,&view);
+    }
+    for (uint32_t p = (unsigned)contrast; p < 3; ++p) {
+        const uint32_t width = svt_av2_picture_plane_width(pixels, p);
+        const uint32_t height = svt_av2_picture_plane_height(pixels, p);
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* ref = pixels->planes[p] + (size_t)y * pixels->strides[p];
+            const uint8_t* src = c->frame_source.planes[p] + (size_t)y * c->frame_source.strides[p];
+            for (uint32_t x = 0; x < width; ++x) {
+                const int delta = (int)svt_av2_sample_load(src + x * step, depth) -
+                    (int)svt_av2_sample_load(ref + x * step, depth);
+                sse[p] += (uint64_t)(delta * delta);
             }
         }
     }
-    uint64_t held_j=0,coded_j=0;
-    SvtAv2Error err=ccso_auto_cost(c,held,6u*32768u,&held_j);
-    if (!err) err=ccso_auto_cost(c,coded,(uint64_t)bytes*32768u,&coded_j);
-    *reuse=!err && held_j<=coded_j;
-    if (*reuse) err=svt_av2_picture_copy_in(&c->recon,last);
-    return err;
+    return ccso_auto_cost(c, sse, (uint64_t)bytes * 32768u, cost);
+}
+
+/* A hidden anchor and its first midpoint share one temporal unit. Only the
+ * last midpoint appends a second unit to display the anchor at its own PTS. */
+static SvtAv2Error select_reference_display(SvtAv2EncoderContext* c, size_t bytes, int midpoint, const SvtAv2PictureReference* refs, int* used) {
+    const unsigned role = midpoint ? c->video_cdf->frame_header.paired_role : 0u;
+    const int first = role == SVT_AV2_FIRST_MIDPOINT || role == SVT_AV2_ONLY_MIDPOINT;
+    const uint32_t pts = c->motion_q >= 13u ? lookahead_display(c) : c->pictures_encoded;
+    const int last = role == SVT_AV2_LAST_MIDPOINT || role == SVT_AV2_ONLY_MIDPOINT;
+    const size_t overlay_bytes = 6u - 2u * first + 5u * last;
+    uint64_t best;
+    SvtAv2Error err = display_cost(c, &c->recon, bytes, &best);
+    if (err) return err;
+    const SvtAv2FrameBuffer* selected = NULL;
+    uint32_t slot = c->latest_slot;
+    const unsigned count = c->display_all_slots ? c->video_cdf->frame_header.pyramid_slots : 1u+(unsigned)midpoint;
+    for (unsigned rank = 0; rank < count; ++rank) {
+        const SvtAv2ReferenceFrame* stored = c->display_all_slots ? pyramid_slot(c,rank) : c->motion_q == 20u ? (rank ? refs->secondary_reference : refs->predictor) :
+            (rank ? &c->long_reference : &c->reference);
+        const SvtAv2FrameBuffer* ref = stored ? svt_av2_reference_view(stored) : NULL;
+        if (!ref) continue;
+        uint64_t cost;
+        err = display_cost(c, ref, overlay_bytes, &cost);
+        if (err) return err;
+        if (cost <= best) {
+            best = cost;
+            selected = ref;
+            slot = c->display_all_slots ? rank : c->motion_q == 20u ? (rank ? refs->secondary_slot : refs->reference_slot) : c->latest_slot ^ rank;
+        }
+    }
+    *used = selected != NULL;
+    if (!selected) return SVT_AV2_ERROR_NONE;
+    err = svt_av2_picture_copy_in(&c->recon, selected);
+    return err ? err : show_reference(c, slot, pts, first, last ? (int)c->video_cdf->frame_header.reference_slot : -1);
 }
 
 #include "still_columns.inc"
@@ -1958,7 +2209,7 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
         const int can_hold = can_show_last(context, &anchor);
         clean = mask_motion && can_hold && context->previous_motion_q8 >= 5u * 256u &&
             anchor.last_q8 >= 384u && context->pictures_encoded - context->last_clean_frame >= 8u;
-        if (can_hold && !clean) return show_last(context);
+        if (can_hold && !clean) return show_reference(context, context->latest_slot, context->pictures_encoded, 0, -1);
         if (mask_motion && anchor.source_q8 >= 5u * 256u)
             qp = context->config.qp;
         else if (clean || context->held_pictures || anchor.source_q8 >= 384u)
@@ -1997,6 +2248,39 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
             (context->config.qp + context->video_anchor_qp)/2 :
             (phase & 1u) ? SVT_AV2_MIN(255, context->config.qp+12) : context->config.qp;
     }
+    if (context->motion_q >= 18u && refs.predictor)
+        qp = disposable ? SVT_AV2_MIN(255, context->config.qp + 12) :
+            lookahead_display(context) > context->pictures_encoded ? context->video_anchor_qp : context->config.qp;
+    if (context->motion_q == 20u && refs.predictor) {
+        const unsigned pts = lookahead_display(context);
+        const int delta = !refs.paired_role ? -6 : !(pts & 7u) ? -28 : !(pts & 3u) ? -16 : !(pts & 1u) ? -4 : 12;
+        qp = SVT_AV2_MAX(1, SVT_AV2_MIN(255, context->config.qp + delta));
+        if (context->adaptive_pyramid == 3u && refs.paired_role) {
+            const int shift = !(pts & 15u) ? -36 : !(pts & 7u) ? -24 : !(pts & 3u) ? -12 : !(pts & 1u) ? -3 : 12;
+            qp = SVT_AV2_MAX(1, SVT_AV2_MIN(255, context->config.qp+shift));
+        }
+        if (context->adaptive_pyramid == 4u && refs.paired_role) {
+            const unsigned reach = refs.paired_role == SVT_AV2_HIDDEN_ANCHOR ?
+                pts-context->pictures_encoded+1u : SVT_AV2_MAX(refs.ref_distance[0],refs.ref_distance[1]);
+            const int shift = reach >= 16u ? -36 : reach >= 8u ? -24 : reach >= 4u ? -12 : reach >= 2u ? -3 : 12;
+            qp = SVT_AV2_MAX(1,SVT_AV2_MIN(255,context->config.qp+shift));
+        }
+        if (context->motion_layers && refs.paired_role) {
+            const unsigned span = refs.paired_role == SVT_AV2_HIDDEN_ANCHOR ?
+                pts-context->pictures_encoded+1u : refs.ref_distance[0];
+            const unsigned percent = span >= 8u ? 46u : span >= 4u ? 62u : span >= 2u ? 80u : 100u;
+            const int offset = context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48 : 0;
+            qp = SVT_AV2_MIN(255, context->config.qp + 16);
+            const int target = (svt_av2_quant_qlookup(qp+offset)*(int)percent+50)/100;
+            while (qp > 1 && svt_av2_quant_qlookup(qp-1+offset) >= target) --qp;
+        }
+        if (context->adaptive_pyramid && !refs.paired_role)
+            qp = anchor.source_q8 < 48u ? SVT_AV2_MIN(255, context->config.qp+12) :
+                context->held_pictures ? (context->config.qp + context->video_anchor_qp)/2 : context->config.qp;
+    }
+    if (context->motion_q == 17u && refs.predictor)
+        qp = disposable ? SVT_AV2_MIN(255, context->config.qp + 12) : (context->config.qp + context->video_anchor_qp) / 2;
+    if (context->picture_qp) qp = context->picture_qp;
     const uint32_t base_q_idx = (uint32_t)qp + (context->config.bit_depth == SVT_AV2_BIT_DEPTH_10 ? 48u : 0u);
     const int use_ccso_search = ccso_config_supported(&context->config) && width >= 8u && width <= 4096u &&
         height >= 8u && height <= 2160u && !(width & 7u) && !(height & 7u);
@@ -2181,18 +2465,46 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
         if (refs.predictor) cdf_seed_frame = (int64_t)refs.predictor->frame_index;
         svt_av2_entropy_models_decay(&cdf->writer_end);
     }
-    const int displayed_anchor = context->motion_q == 16u && lookahead_display(context) == context->pictures_encoded;
-    if (((context->motion_q >= 5u && context->motion_q < 13u) || displayed_anchor) && refs.predictor &&
+    const int overlay_midpoint = disposable && (context->adaptive_pyramid ||
+        ((context->motion_q == 17u || context->motion_q == 19u) && lookahead_display(context) < context->pictures_encoded));
+    const int sequential_hold = context->adaptive_pyramid && !refs.paired_role && refs.predictor &&
+        (lookahead_display(context) & (context->display_all_slots && context->adaptive_pyramid == 3u ? 15u : 7u)) &&
+        (context->display_all_slots || anchor.source_q8 < 2u*256u);
+    const int displayed_anchor = context->motion_q >= 16u && context->motion_q != 20u && context->pictures_encoded > context->anchor_display &&
+        lookahead_display(context) == context->pictures_encoded;
+    if (sequential_hold || overlay_midpoint || (((context->motion_q >= 5u && context->motion_q < 13u) || displayed_anchor) && refs.predictor &&
         context->held_pictures < (context->motion_q >= 8u ? 31u : 8u) &&
-        (context->motion_q >= 8u || context->pictures_encoded != 4u) && anchor.source_q8 < 2u * 256u) {
+        (context->motion_q >= 8u || context->pictures_encoded != 4u) && anchor.source_q8 < 2u * 256u)) {
         int reuse=0;
-        SvtAv2Error e=compare_last_display(context,stream_size,&reuse);
+        SvtAv2Error e=select_reference_display(context,stream_size,overlay_midpoint,&refs,&reuse);
         if (e) { context->fatal_error=1; return e; }
-        if (reuse) return show_last(context);
+        if (reuse) return SVT_AV2_ERROR_NONE;
     }
     SVT_AV2_IP_START(profile_dpb);
     SvtAv2Error ref_status = SVT_AV2_ERROR_NONE;
-    if ((context->motion_q == 11u || context->motion_q == 12u || context->motion_q >= 14u) && refs.predictor && !disposable) {
+    const int inner_anchor = context->motion_q >= 18u && refs.predictor &&
+        context->pictures_encoded < context->anchor_display && lookahead_display(context) == context->pictures_encoded;
+    if (context->motion_q == 20u && refs.predictor) {
+        if (!disposable) {
+            ref_status = svt_av2_reference_store(pyramid_slot(context, refs.refresh_slot),
+                &context->recon, context->pictures_encoded);
+            context->slot_display[refs.refresh_slot]=lookahead_display(context);
+        }
+        if (refs.paired_role == SVT_AV2_HIDDEN_ANCHOR || !refs.paired_role) {
+            context->previous_anchor_display = context->anchor_display;
+            context->latest_slot = (uint8_t)refs.refresh_slot;
+            context->pyramid_span = (uint8_t)(lookahead_display(context)-context->pictures_encoded+1u);
+            context->anchor_display = lookahead_display(context);
+        }
+    } else if (context->motion_q >= 18u && refs.predictor && !disposable) {
+        ref_status = svt_av2_reference_store(&context->long_reference, &context->recon, context->pictures_encoded);
+        if (!ref_status && !inner_anchor) {
+            const SvtAv2ReferenceFrame swap = context->reference;
+            context->reference = context->long_reference;
+            context->long_reference = swap;
+            context->latest_slot ^= 1u;
+        }
+    } else if ((context->motion_q == 11u || context->motion_q == 12u || context->motion_q >= 14u) && refs.predictor && !disposable) {
         ref_status = svt_av2_reference_refresh_anchor(&context->reference, &context->long_reference,
             &context->recon, context->pictures_encoded, context->held_pictures, (int)refs.rotate_anchor);
         if (ref_status == SVT_AV2_ERROR_NONE) context->latest_slot ^= (uint8_t)refs.rotate_anchor;
@@ -2209,8 +2521,9 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
     }
     SVT_AV2_IP_START(profile_publish);
     if (ref_status != SVT_AV2_ERROR_NONE) { context->fatal_error = 1; return ref_status; }
-    if (context->motion_q >= 13u && refs.predictor && !disposable) {
+    if (context->motion_q >= 13u && context->motion_q != 20u && refs.predictor && !disposable && !inner_anchor) {
         context->previous_anchor_display = context->anchor_display;
+        context->tree_full = lookahead_display(context) == context->pictures_encoded+3u;
         context->anchor_display = lookahead_display(context);
     }
     if (cdf != NULL) {
@@ -2224,6 +2537,10 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
         if (refs.dual_ref && (refs.slot_mask & 2u)) {
             cdf->slots[1] = cdf->writer_end;
             cdf->slot_frame[1] = frame;
+        }
+        if (context->motion_q == 20u && refs.refresh_mask && refs.refresh_slot >= 2u) {
+            cdf->slots[refs.refresh_slot] = cdf->writer_end;
+            cdf->slot_frame[refs.refresh_slot] = frame;
         }
         if (cdf->trace)
             fprintf(stderr, "inter_cdf frame=%u seed=%lld slot0=%lld slot1=%lld\n", frame,
@@ -2257,11 +2574,16 @@ static SvtAv2Error encode_pending_frame(SvtAv2EncoderContext* context) {
         for (size_t i = 0; i < context->coded_block_count / 3u; ++i) {
             const SvtAv2TileCoeffBlock* b = &context->coded_blocks[i * 3u];
             const SvtAv2TileBlockMode* mode = &context->coded_modes[i];
-            const int distance = mode->is_inter ? (int)refs.ref_distance[refs.secondary_reference ? mode->reference_rank : 0u] : 0;
+            const unsigned rank = refs.secondary_reference ? mode->reference_rank : 0u;
+            const int distance = mode->is_inter && rank < 2u ? (int)refs.ref_distance[rank] : 0;
             SvtAv2MotionVector velocity = {0, 0};
             if (distance) {
                 velocity.mv_x = (mode->mv_x * scale + (mode->mv_x < 0 ? -distance : distance) / 2) / distance;
                 velocity.mv_y = (mode->mv_y * scale + (mode->mv_y < 0 ? -distance : distance) / 2) / distance;
+                if (context->motion_layers && !rank && refs.paired_role >= SVT_AV2_ONLY_MIDPOINT) {
+                    velocity.mv_x = -velocity.mv_x;
+                    velocity.mv_y = -velocity.mv_y;
+                }
             }
             const uint32_t x0 = (b->x * SVT_AV2_ME_FIELD_COLS + width - 1u) / width;
             const uint32_t y0 = (b->y * SVT_AV2_ME_FIELD_ROWS + height - 1u) / height;
@@ -2419,6 +2741,9 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
     context->path_state.uv_delta_q = context->uv_delta_q;
     context->path_state.qm_level = (context->qm_scope & (qm_is_p ? 2u : 1u)) ? context->qm_level : 0u;
     context->path_state.qm_uv_level = context->path_state.qm_level ? context->qm_uv_level : 0u;
+    if (qm_is_p && context->inter_qm_curve && context->path_state.qm_level)
+        zen_matrix_levels((int)base_q_idx,context->uv_delta_q,&context->path_state.qm_level,
+                          &context->path_state.qm_uv_level);
 #if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
     const char* dct64_scope = getenv("SVT_AV2_DCT64_MATCH");
     const int dct64_p = context->config.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P &&
@@ -2440,6 +2765,7 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         memset(&rd, 0, sizeof(rd));
         rd.transform = config.transform;
         rd.sb_qindex=context->column_qindex;
+        rd.sb_lambda_weights=context->picture_weights;
         rd.matrix_rounding = context->path_state.matrix_rounding;
         rd.avm_fp_round = context->path_state.avm_fp_round;
         rd.rd_mode = context->config.rd_mode;
@@ -2491,8 +2817,8 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         rd.frame_header.mv_half = motion_precision(rd.motion_optimization);
         rd.frame_header.sharp_filter = rd.frame_header.inter_frame && rd.motion_optimization >= 4u;
         const char* range = getenv("SVT_AV2_ME_RANGE");
-        rd.frame_header.wide_motion = context->video_cdf && rd.frame_header.mv_half == 2u &&
-            range && !strcmp(range, "31");
+        rd.frame_header.wide_motion = context->video_cdf && rd.frame_header.mv_half == 2u && range ?
+            (!strcmp(range, "63") ? 2u : (unsigned)!strcmp(range, "31")) : 0u;
         const char* filter = getenv("SVT_AV2_VIDEO_INTERPOLATION");
         rd.frame_header.regular_filter = context->video_cdf && rd.frame_header.mv_half == 2u &&
             filter && !strcmp(filter, "regular");
@@ -2504,7 +2830,37 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         rd.frame_header.dual_ref = refs->dual_ref;
         rd.frame_header.refresh_mask = refs->slot_mask;
         rd.frame_header.reference_slot = refs->reference_slot;
+        const char* inter_intra = getenv("SVT_AV2_VIDEO_INTRA_REFINE");
+        rd.frame_header.inter_intra_search = rd.frame_header.inter_frame && context->video_cdf &&
+            inter_intra && !strcmp(inter_intra,"directional");
+        rd.frame_header.pyramid_slots = context->motion_q == 20u ? (context->adaptive_pyramid > 2u ? context->adaptive_pyramid+2u : 4u) : 0u;
+        rd.frame_header.secondary_slot = refs->secondary_slot;
+        const char* aq = getenv("SVT_AV2_VIDEO_AQ");
+        if (refs->predictor && context->video_cdf && aq && !strcmp(aq,"variance")) {
+            SvtAv2VideoCdfState* bank = context->video_cdf;
+            const size_t count = ((width+63u)/64u)*(size_t)((height+63u)/64u);
+            if (bank->video_qindex_count != count) {
+                uint16_t* map = (uint16_t*)realloc(bank->video_qindex,count*sizeof(*map));
+                if (!map) return SVT_AV2_ERROR_OUT_OF_MEMORY;
+                bank->video_qindex = map;
+                bank->video_qindex_count = count;
+            }
+            rd.sb_qindex = bank->video_qindex;
+            rd.frame_header.sb_qindex = rd.sb_qindex;
+        }
         rd.secondary_reference = refs->secondary_reference;
+        const char* motion_profile = getenv("SVT_AV2_MOTION_Q");
+        const char* compound_refs = getenv("SVT_AV2_COMPOUND_REFS");
+        const int bidirectional_anchor = compound_refs && !strcmp(compound_refs,"anchors") &&
+            refs->paired_role >= SVT_AV2_HIDDEN_MIDPOINT && refs->ref_distance[0] == refs->ref_distance[1];
+        const int equidistant = refs->ref_distance[0] == refs->ref_distance[1];
+        if (refs->secondary_reference && equidistant && (!refs->refresh_mask || bidirectional_anchor) && (context->adaptive_pyramid == 4u || context->motion_layers || (motion_profile && (!strcmp(motion_profile, "pyramid-compound") || !strcmp(motion_profile, "pyramid16"))))) {
+            rd.frame_header.compound_average = 2u;
+        } else if (refs->secondary_reference && equidistant && !refs->refresh_mask && ((motion_profile && !strcmp(motion_profile, "pyramid8-blend")) ||
+                (context->adaptive_pyramid && compare_reference_pair(&context->frame_source, refs, NULL)))) {
+            rd.frame_header.compound_average = 1;
+            rd.inter_near = rd.inter_fine = 0;
+        }
         if (refs->secondary_reference != NULL) {
             rd.frame_header.logical_ref_count = 2u;
             rd.frame_header.ref_distance[0] = refs->ref_distance[0];
@@ -2514,7 +2870,13 @@ static SvtAv2Error encode_reconstruction(SvtAv2EncoderContext* context,
         if (context->motion_q >= 13u) {
             const uint32_t pts = lookahead_display(context);
             rd.frame_header.order_hint = pts & 255u;
-            if (pts > context->pictures_encoded) rd.frame_header.paired_role = SVT_AV2_HIDDEN_ANCHOR;
+            if (context->motion_q == 20u) rd.frame_header.paired_role = refs->paired_role;
+            else if (context->motion_q >= 18u && context->tree_full &&
+                    context->pictures_encoded && context->pictures_encoded <= context->anchor_display) {
+                const unsigned remaining = context->anchor_display - context->pictures_encoded;
+                rd.frame_header.paired_role = remaining == 2u ? SVT_AV2_HIDDEN_MIDPOINT :
+                    remaining == 1u ? SVT_AV2_ONLY_MIDPOINT : SVT_AV2_LAST_MIDPOINT;
+            } else if (pts > context->pictures_encoded) rd.frame_header.paired_role = SVT_AV2_HIDDEN_ANCHOR;
             else if (pts < context->pictures_encoded) {
                 const int first = context->pictures_encoded == context->reference.frame_index + 1u;
                 const int last = pts + 1u == context->anchor_display;

@@ -282,7 +282,7 @@ static void test_half_class7_and_predictor(void) {
     SvtAv2MotionSyntax motion;
     SvtAv2EntropyEncoder actual, expected;
     SvtAv2BlockView b = {0};
-    SvtAv2TileBlockMode m = {1u, -32, -32,0u};
+    SvtAv2TileBlockMode m = {1u, -32, -32,0u, 0, 0};
     b.w = b.h = 64u;
     const int init = svt_av2_motion_syntax_init_precision(&motion, 192u, 64u, 1u);
     SVT_TEST_CHECK_EQ_INT(init, 0);
@@ -329,8 +329,8 @@ static void test_half_class7_and_predictor(void) {
     SVT_TEST_CHECK_EQ_INT(grid, 0);
     if (grid != 0) return;
     SvtAv2MotionCell* above = motion.cells + 15u * motion.cols;
-    above[0] = (SvtAv2MotionCell){-1, 3, 1u, 1u, 1u, 1u};
-    above[1] = (SvtAv2MotionCell){3, -1, 1u, 1u, 1u, 1u};
+    above[0] = (SvtAv2MotionCell){-1, 3, 1u, 1u, 1u, 1u, 0, 0};
+    above[1] = (SvtAv2MotionCell){3, -1, 1u, 1u, 1u, 1u, 0, 0};
     b.x = b.w = b.h = 8u;
     b.y = 64u;
     m.mv_x = -1; m.mv_y = 3;
@@ -343,7 +343,7 @@ static void test_half_class7_and_predictor(void) {
 
 static void test_half_adaptive_trajectory(void) {
     static SvtAv2EntropyModels written_models, trial_models;
-    const SvtAv2TileBlockMode modes[] = {{1u,-32,-32,0u},{1u,32,32,0u},{1u,32,32,0u},{1u,31,29,0u}};
+    const SvtAv2TileBlockMode modes[] = {{1u,-32,-32,0u, 0, 0},{1u,32,32,0u, 0, 0},{1u,32,32,0u, 0, 0},{1u,31,29,0u, 0, 0}};
     uint8_t bytes[128];
     uint16_t carry[130];
     for (uint32_t qctx = 0u; qctx < 4u; ++qctx) {
@@ -384,7 +384,7 @@ static void test_half_rate_packet(void) {
     SvtAv2TileRateSession* session = NULL;
     SvtAv2TileCoeffBlock blocks[6] = {0};
     static const int32_t zero_coeff[1024] = {0};
-    const SvtAv2TileBlockMode modes[] = {{1u,-32,-32,0u}, {1u,32,32,0u}};
+    const SvtAv2TileBlockMode modes[] = {{1u,-32,-32,0u, 0, 0}, {1u,32,32,0u, 0, 0}};
     uint8_t packet[128];
     size_t bytes = 0u;
     svt_av2_frame_header_config_default(&cfg, 128u, 64u);
@@ -430,7 +430,7 @@ static void test_half_rate_packet(void) {
 static void test_dual_ref_packets(void) {
     static const int32_t zero_coeff[1024] = {0};
     SvtAv2TileCoeffBlock blocks[3] = {0};
-    const SvtAv2TileBlockMode mode = {1u, 1, -3,0u};
+    const SvtAv2TileBlockMode mode = {1u, 1, -3,0u, 0, 0};
     uint8_t legacy[128], dual[128], retry[128];
     size_t legacy_bytes = 0u, dual_bytes = 0u, retry_bytes = 0u;
     for (uint32_t p = 0u; p < 3u; ++p) {
@@ -484,7 +484,7 @@ static void test_dual_ref_packets(void) {
 static void test_two_logical_ref_packets(void) {
     static const int32_t zero[1024] = {0};
     SvtAv2TileCoeffBlock blocks[3] = {0};
-    SvtAv2TileBlockMode mode = {1u, 0, 0, 1u};
+    SvtAv2TileBlockMode mode = {1u, 0, 0, 1u, 0, 0};
     for (uint32_t p = 0u; p < 3u; ++p) {
         blocks[p].plane = p;
         blocks[p].width = blocks[p].height = p ? 32u : 64u;

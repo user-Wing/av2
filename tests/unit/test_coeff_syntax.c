@@ -575,12 +575,12 @@ static void test_m4_far_left_is_not_mvp(void) {
         SVT_TEST_CHECK_EQ_INT(svt_av2_motion_syntax_init(&state, 176u, 144u), 0);
         if (state.cells == NULL) return;
         if (pass) {
-            SvtAv2MotionCell far = {8,-2,1u,1u,1u,0u};
+            SvtAv2MotionCell far = {8,-2,1u,1u,1u,0u, 0, 0};
             state.cells[32u * state.cols + 15u] = far;
             state.cells[35u * state.cols + 15u] = far;
         }
         const SvtAv2BlockView block = {80u,128u,16u,16u,NULL};
-        const SvtAv2TileBlockMode mode = {1u,2,-2,0u};
+        const SvtAv2TileBlockMode mode = {1u,2,-2,0u, 0, 0};
         uint16_t precarry[64];
         SvtAv2EntropyEncoder enc;
         svt_av2_entropy_encoder_init(&enc, coded[pass], 64u, precarry, 64u);

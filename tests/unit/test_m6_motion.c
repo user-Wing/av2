@@ -720,9 +720,9 @@ static void check_projected_motion_parity(void) {
     SvtAv2EntropyEncoder enc;
     svt_av2_entropy_rate_init(&enc);
     const SvtAv2BlockView first = {0,0,64,64,NULL}, second = {64,0,16,16,NULL};
-    const SvtAv2TileBlockMode old = {1u,-2,2,1u}, bad = {1u,0,0,0u}, exact = {1u,-1,1,0u};
-    const SvtAv2MotionCell speculative = {-2,2,1u,2u,1u,1u};
-    const SvtAv2MotionCell intra = {0,0,1u,0u,0u,1u};
+    const SvtAv2TileBlockMode old = {1u,-2,2,1u, 0, 0}, bad = {1u,0,0,0u, 0, 0}, exact = {1u,-1,1,0u, 0, 0};
+    const SvtAv2MotionCell speculative = {-2,2,1u,2u,1u,1u, 0, 0};
+    const SvtAv2MotionCell intra = {0,0,1u,0u,0u,1u, 0, 0};
     SvtAv2MotionPrefix prefix = {&first, &speculative, 1u};
     int32_t px = 77, py = 88;
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &second, 0u, NULL, &px, &py), 0);
@@ -755,14 +755,14 @@ static void check_projected_motion_parity(void) {
     SVT_TEST_CHECK(enc.rate_q12 > before && enc.rate_symbols > symbols);
     const SvtAv2BlockView edge = {80,0,8,8,NULL};
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &edge, 0u, NULL, &px, &py), 0);
-    const SvtAv2TileBlockMode edge_mode = {1u,px,py,0u};
+    const SvtAv2TileBlockMode edge_mode = {1u,px,py,0u, 0, 0};
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &edge, &edge_mode, 1u), 0);
     SVT_TEST_CHECK(motion.cells[edge.x / 4u].valid && !motion.cells[edge.x / 4u].is_new);
     const SvtAv2BlockView rectangles[] = {{64,32,16,32,NULL}, {96,48,32,16,NULL}};
     for (unsigned i = 0; i < 2u; ++i) {
         const SvtAv2BlockView* b = &rectangles[i];
         SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, b, i, NULL, &px, &py), 0);
-        const SvtAv2TileBlockMode mode = {1u,px,py,i};
+        const SvtAv2TileBlockMode mode = {1u,px,py,i, 0, 0};
         SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, b, &mode, 1u), 0);
         for (unsigned y = b->y; y < b->y + b->h; y += 4u)
             for (unsigned x = b->x; x < b->x + b->w; x += 4u) {
@@ -773,9 +773,15 @@ static void check_projected_motion_parity(void) {
     motion.wide_motion = 1u;
     const SvtAv2BlockView wide_block = {96,0,16,16,NULL};
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &wide_block, 0u, NULL, &px, &py), 0);
-    const SvtAv2TileBlockMode wide_mode = {1u, 240 + abs(px % 2), -240 + abs(py % 2), 0u};
+    const SvtAv2TileBlockMode wide_mode = {1u, 240 + abs(px % 2), -240 + abs(py % 2), 0u, 0, 0};
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &wide_block, &wide_mode, 0), 0);
     SVT_TEST_CHECK_EQ_INT(motion.cells[wide_block.x / 4u].mv_x, wide_mode.mv_x);
+    motion.two_refs = 0;
+    motion.wide_motion = 2;
+    const SvtAv2BlockView bottom = {64,56,8,8,NULL};
+    motion.cells[15u*motion.cols+15u] = (SvtAv2MotionCell){0,252,1,1,0,0,0,0};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion,&bottom,0,NULL,&px,&py),0);
+    SVT_TEST_CHECK_EQ_INT(py,96); /* Eight visible pixels plus the 16-pixel border, in Q2. */
     svt_av2_motion_syntax_free(&motion);
 }
 

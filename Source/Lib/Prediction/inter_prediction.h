@@ -42,6 +42,9 @@ typedef struct SvtAv2EighthPelMotionVector {
     int32_t mv_x, mv_y;
 } SvtAv2EighthPelMotionVector;
 
+SvtAv2Error svt_av2_inter_predict_compound(const SvtAv2FrameBuffer* first, const SvtAv2FrameBuffer* second,
+    uint32_t plane, const SvtAv2BlockView* block, SvtAv2EighthPelMotionVector mv0,
+    SvtAv2EighthPelMotionVector mv1, int regular, uint16_t* prediction);
 SvtAv2Error svt_av2_inter_predict_eighth_regular(const SvtAv2FrameBuffer* reference, uint32_t plane,
     const SvtAv2BlockView* block, SvtAv2EighthPelMotionVector mv, uint16_t* prediction,
     uint32_t prediction_stride);

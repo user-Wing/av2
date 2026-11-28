@@ -98,6 +98,14 @@ SvtAv2Error svt_av2_reference_refresh_after_holds(SvtAv2ReferenceFrame* slot0,
     return refresh_pair_unchecked(slot0, slot1, reconstruction, frame_index, (refresh_mask & 2u) != 0u);
 }
 
+SvtAv2Error svt_av2_reference_store(SvtAv2ReferenceFrame* slot, const SvtAv2FrameBuffer* recon, uint64_t index) {
+    if (!slot || !recon || slot->prepared_valid || (slot->valid && slot->frame_index >= index))
+        return SVT_AV2_ERROR_INVALID_STATE;
+    SvtAv2Error err = stage_unchecked(slot, recon, index);
+    if (!err) publish_prepared(slot);
+    return err;
+}
+
 SvtAv2Error svt_av2_reference_refresh_anchor(SvtAv2ReferenceFrame* recent, SvtAv2ReferenceFrame* older,
     const SvtAv2FrameBuffer* reconstruction, uint64_t frame_index, uint32_t held, int rotate) {
     if (!recent || !older || !reconstruction || recent == older) return SVT_AV2_ERROR_INVALID_PARAMETER;

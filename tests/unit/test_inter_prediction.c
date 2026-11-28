@@ -595,6 +595,34 @@ static void check_eighth_sharp_bounded_sad(void) {
     }
 }
 
+/* The first half-pel filter overshoots at the step. Clipping each reference
+ * before averaging would give a different answer on both sides of the edge. */
+static void check_compound_rounding(void) {
+    SvtAv2FrameBuffer a={0}, b={0};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_picture_alloc_ex(&a,8,8,10,SVT_AV2_CHROMA_420),SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_picture_alloc_ex(&b,8,8,10,SVT_AV2_CHROMA_420),SVT_AV2_ERROR_NONE);
+    for (unsigned y=0;y<8;++y) for (unsigned x=0;x<8;++x) {
+        svt_av2_sample_store(a.planes[0]+(size_t)y*a.strides[0]+2u*x,10,x<4u?1023u:0u);
+        svt_av2_sample_store(b.planes[0]+(size_t)y*b.strides[0]+2u*x,10,(uint16_t)(250u+x));
+    }
+    SvtAv2BlockView block={0};
+    block.w=block.h=8;
+    uint16_t prediction[64];
+    SVT_TEST_CHECK_EQ_INT(svt_av2_inter_predict_compound(&a,&b,0,&block,
+        (SvtAv2EighthPelMotionVector){4,0},(SvtAv2EighthPelMotionVector){-8,0},
+        1,prediction),SVT_AV2_ERROR_NONE);
+    const int tap[8]={0,1,-7,38,38,-7,1,0};
+    for (int x=0;x<8;++x) {
+        int filtered=0;
+        for (int k=0;k<8;++k) filtered+=tap[k]*(int)edge_sample(&a,0,x+k-3,0);
+        const int q4=(filtered+65536+2)/4-16384;
+        const int expected=(q4+16*(int)edge_sample(&b,0,x-1,0)+16)/32;
+        for (int y=0;y<8;++y) SVT_TEST_CHECK_EQ_INT(prediction[y*8+x],expected);
+    }
+    svt_av2_picture_free(&b);
+    svt_av2_picture_free(&a);
+}
+
 int main(void) {
     uint32_t seed = 0x31415926u;
     for (uint32_t f = 0; f < 3; ++f) {
@@ -632,6 +660,7 @@ int main(void) {
     check_sharp();
     check_sharp_vector_footprints();
     check_eighth_sharp();
+    check_compound_rounding();
     check_sharp_bounded_sad();
     check_eighth_sharp_bounded_sad();
     SVT_TEST_REPORT("test_inter_prediction");

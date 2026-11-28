@@ -131,7 +131,7 @@ static void test_m5_p_modes_and_inter_metadata(void) {
             block->intra_mode = b == 0u ? 1u : 2u;
         }
     }
-    const SvtAv2TileBlockMode modes[3] = {{0u,0,0,0u},{1u,0,0,0u},{0u,0,0,0u}};
+    const SvtAv2TileBlockMode modes[3] = {{0u,0,0,0u, 0, 0},{1u,0,0,0u, 0, 0},{0u,0,0,0u, 0, 0}};
     uint8_t first[1024], second[1024];
     size_t first_size = 0u, second_size = 0u;
     SVT_TEST_CHECK_EQ_INT(svt_av2_tile_writer_write_inter_coeffs(&cfg,
@@ -153,7 +153,7 @@ static void test_m5_p_modes_and_inter_metadata(void) {
 
 static void test_m52_partition_plan_controls_coeff_order(void) {
     const int32_t zero[1024] = {0};
-    const SvtAv2TileBlockMode modes[4] = {{0u,0,0,0u},{1u,0,0,0u},{0u,0,0,0u},{1u,0,0,0u}};
+    const SvtAv2TileBlockMode modes[4] = {{0u,0,0,0u, 0, 0},{1u,0,0,0u, 0, 0},{0u,0,0,0u, 0, 0},{1u,0,0,0u, 0, 0}};
     for (uint32_t format = 0; format < 3u; ++format) {
         SvtAv2FrameHeaderConfig cfg;
         svt_av2_frame_header_config_default(&cfg, 64u, 64u);
@@ -244,7 +244,7 @@ static void test_two_logical_ref_rate_rollback(void) {
     cfg.reduced_tx_set = 2u;
     cfg.logical_ref_count = 2u;
     SvtAv2TileCoeffBlock blocks[6] = {0};
-    SvtAv2TileBlockMode modes[2] = {{1u,0,0,0u},{1u,0,0,1u}};
+    SvtAv2TileBlockMode modes[2] = {{1u,0,0,0u, 0, 0},{1u,0,0,1u, 0, 0}};
     for (uint32_t i = 0; i < 6u; ++i) {
         const uint32_t p = i % 3u;
         blocks[i].plane = p;

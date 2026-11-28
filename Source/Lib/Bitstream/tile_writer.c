@@ -73,7 +73,7 @@ static const uint16_t rect_cdf[64] = {
  * a null trace pointer and never query the environment or snapshot the coder. */
 typedef struct TileInterTrace {
     uint64_t intra_leaves, inter_leaves, skip_txfm_leaves, newmv_leaves;
-    uint64_t zero_mv_leaves, fractional_mv_leaves;
+    uint64_t zero_mv_leaves, fractional_mv_leaves, compound_leaves, moving_compound;
     uint64_t coeff_slots[3], nonzero[3], inter_nonzero[3];
     uint64_t partition_q12, motion_q12, intra_mode_q12, coeff_q12[3];
 } TileInterTrace;
@@ -99,7 +99,7 @@ static void tile_trace_print(const TileInterTrace* t, const SvtAv2FrameHeaderCon
         ",\"chroma_format\":%" PRIu32 ",\"base_q_idx\":%" PRIu32
         ",\"mv_half\":%" PRIu32 ",\"entropy_adaptation\":%" PRIu32
         ",\"leaf_counts\":{\"intra\":%" PRIu64 ",\"inter\":%" PRIu64
-        ",\"skip_txfm\":%" PRIu64 ",\"newmv\":%" PRIu64 ",\"zero_mv\":%" PRIu64 ",\"fractional_mv\":%" PRIu64 "}"
+        ",\"compound\":%" PRIu64 ",\"moving_compound\":%" PRIu64 ",\"skip_txfm\":%" PRIu64 ",\"newmv\":%" PRIu64 ",\"zero_mv\":%" PRIu64 ",\"fractional_mv\":%" PRIu64 "}"
         ",\"coeff_slots_yuv\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]"
         ",\"nonzero_yuv\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]"
         ",\"inter_nonzero_yuv\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]"
@@ -108,7 +108,7 @@ static void tile_trace_print(const TileInterTrace* t, const SvtAv2FrameHeaderCon
         ",\"tile_header_bytes\":%zu,\"tile_entropy_bytes\":%zu,\"tile_payload_bytes\":%zu}\n",
         cfg->order_hint, cfg->frame_width, cfg->frame_height, cfg->bit_depth, cfg->chroma_format,
         cfg->base_q_idx, cfg->mv_half, cfg->entropy_adaptation, t->intra_leaves, t->inter_leaves,
-        t->skip_txfm_leaves, t->newmv_leaves, t->zero_mv_leaves, t->fractional_mv_leaves,
+        t->compound_leaves, t->moving_compound, t->skip_txfm_leaves, t->newmv_leaves, t->zero_mv_leaves, t->fractional_mv_leaves,
         t->coeff_slots[0], t->coeff_slots[1], t->coeff_slots[2], t->nonzero[0], t->nonzero[1], t->nonzero[2],
         t->inter_nonzero[0], t->inter_nonzero[1], t->inter_nonzero[2], t->partition_q12, t->motion_q12,
         t->intra_mode_q12, t->coeff_q12[0], t->coeff_q12[1], t->coeff_q12[2], range_q12,
@@ -475,7 +475,7 @@ static int tile_sb_tools_write(TileTree* tree,const SvtAv2BlockView* b) {
         st=svt_av2_ccso64_symbol(tree->enc,tree->gdf_cdf,
             tree->gdf_flags[(b->y/64u)*tree->geometry.sb_cols+b->x/64u],tree->enc->models!=NULL);
     if (st == 0) st = tile_ccso64_write(tree, b);
-    if (!st && tree->sb_qindex && b->x%64u==0u && b->y%64u==0u) {
+    if (!st && !tree->modes && tree->sb_qindex && b->x%64u==0u && b->y%64u==0u) {
         const uint32_t q=tree->sb_qindex[(b->y/64u)*tree->geometry.sb_cols+b->x/64u];
         const int delta=(int)q-(int)tree->current_qindex;
         const unsigned symbol=(unsigned)abs(delta)/4u;
@@ -519,7 +519,15 @@ static int tile_leaf_write(TileTree* tree, const SvtAv2BlockView* b) {
                 for (uint32_t c = 0; c < dim * height; ++c) if (in->qcoeff[c] != 0) skip_txfm = 0;
             }
         }
-        st = svt_av2_motion_write_block(&tree->motion, tree->enc, b, mode, skip_txfm);
+        int delta = 0;
+        const int signal_q = tree->sb_qindex && !(b->x%64u) && !(b->y%64u) &&
+            !(skip_txfm && b->w == 64u && b->h == 64u);
+        if (signal_q) {
+            const uint32_t q = tree->sb_qindex[(b->y/64u)*tree->geometry.sb_cols+b->x/64u];
+            delta = (int)q-(int)tree->current_qindex;
+            tree->current_qindex = q;
+        }
+        st = svt_av2_motion_write_block_delta(&tree->motion, tree->enc, b, mode, skip_txfm, signal_q ? &delta : NULL);
         if (trace && st == 0) {
             const uint64_t after = tile_trace_tell_q12(tree->enc);
             trace->motion_q12 += after - tell;
@@ -528,6 +536,9 @@ static int tile_leaf_write(TileTree* tree, const SvtAv2BlockView* b) {
                 const SvtAv2MotionCell* written = tree->motion.cells +
                     (size_t)(b->y / 4u) * tree->motion.cols + b->x / 4u;
                 ++trace->inter_leaves;
+                trace->compound_leaves += mode->reference_rank == 2u;
+                trace->moving_compound += mode->reference_rank == 2u &&
+                    (mode->mv_x || mode->mv_y || mode->second_x || mode->second_y);
                 trace->skip_txfm_leaves += skip_txfm;
                 trace->newmv_leaves += written->is_new;
                 trace->zero_mv_leaves += mode->mv_x == 0 && mode->mv_y == 0;
@@ -647,9 +658,10 @@ static int tile_tree_write(TileTree* tree, const SvtAv2BlockView* b) {
 static int tile_mv_precision_valid(const SvtAv2FrameHeaderConfig* cfg) {
     if (cfg->logical_ref_count > 2u || (cfg->logical_ref_count == 2u &&
         (cfg->dual_ref != 1u || cfg->inter_frame != 1u || !cfg->multi_frame ||
-         cfg->reference_slot > 1u || cfg->retain_reference))) return 0;
+         cfg->reference_slot > (cfg->pyramid_slots ? cfg->pyramid_slots-1u : 1u) || cfg->retain_reference))) return 0;
     const uint32_t d0 = cfg->ref_distance[0], d1 = cfg->ref_distance[1];
-    if ((d0 || d1) && (cfg->logical_ref_count != 2u || d0 < 1u || d0 > 8u || d1 < 1u || d1 > 8u ||
+    if ((d0 || d1) && (cfg->logical_ref_count != 2u || d0 < 1u || d0 > svt_av2_frame_max_ref_distance(cfg) ||
+        d1 < 1u || d1 > svt_av2_frame_max_ref_distance(cfg) ||
         (cfg->paired_role < SVT_AV2_ONLY_MIDPOINT && d0 == d1) || cfg->mv_half != 2u || !cfg->sharp_filter)) return 0;
     return cfg->mv_half == 0u || (cfg->mv_half <= 2u && cfg->inter_frame == 1u &&
         cfg->multi_frame && cfg->sb_shift == SVT_AV2_FRAME_SB_SHIFT_64);
@@ -661,6 +673,7 @@ static int tile_motion_init(SvtAv2MotionSyntax* motion, const SvtAv2FrameHeaderC
     if (st == 0) {
         motion->wide_motion = cfg->wide_motion;
         motion->two_refs = cfg->logical_ref_count == 2u;
+        motion->compound_average = cfg->compound_average;
         motion->opposite_directions = cfg->paired_role >= SVT_AV2_ONLY_MIDPOINT;
         motion->ref_distance[0] = cfg->ref_distance[0];
         motion->ref_distance[1] = cfg->ref_distance[1];
@@ -687,7 +700,7 @@ static int tile_write_coeffs(SvtAv2EntropyEncoder* enc, const SvtAv2FrameHeaderC
     tree.modes = modes; tree.mode_count = mode_count;
     tree.partition_decisions = cfg->partition_decisions;
     tree.partition_decision_count = cfg->partition_decision_count;
-    tree.m5_intra_modes = cfg->m5_intra_modes;
+    tree.m5_intra_modes = cfg->inter_intra_search ? 3u : cfg->m5_intra_modes;
     tree.reduced_tx_set = cfg->reduced_tx_set;
     tree.enable_mrls = cfg->enable_mrls;
     tree.enable_cfl_intra = svt_av2_frame_header_use_cfl(cfg);
@@ -777,7 +790,7 @@ int svt_av2_tile_rate_create(const SvtAv2FrameHeaderConfig* cfg,
     if (s->plan == NULL) { free(s); return SVT_AV2_ENTROPY_ERROR_NO_SPACE; }
     s->tree.partition_decisions = s->plan;
     s->tree.partition_decision_count = s->sb_count;
-    s->tree.m5_intra_modes = cfg->m5_intra_modes;
+    s->tree.m5_intra_modes = cfg->inter_intra_search ? 3u : cfg->m5_intra_modes;
     s->tree.reduced_tx_set = cfg->reduced_tx_set;
     s->tree.enable_mrls = cfg->enable_mrls;
     s->tree.enable_cfl_intra = svt_av2_frame_header_use_cfl(cfg);
@@ -813,6 +826,13 @@ void svt_av2_tile_rate_free(SvtAv2TileRateSession* session) {
     svt_av2_motion_syntax_free(&session->tree.motion);
     free(session->plan);
     free(session);
+}
+
+const SvtAv2EntropyModels* svt_av2_tile_rate_coeff_context(const SvtAv2TileRateSession* s,
+    uint32_t plane, SvtAv2CoeffNeighbours* neighbours) {
+    if (!s || !s->adaptive || s->cursor >= s->sb_count || plane >= 3u || !neighbours) return NULL;
+    *neighbours = s->tree.neighbours[plane];
+    return &s->committed_models;
 }
 
 int svt_av2_tile_rate_end_models(const SvtAv2TileRateSession* s, SvtAv2EntropyModels* models) {

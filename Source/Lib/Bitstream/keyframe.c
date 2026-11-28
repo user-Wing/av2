@@ -232,7 +232,8 @@ static int encode_sequence_header_ex(uint32_t width, uint32_t height,
     scfg.bit_depth = bit_depth;
     scfg.chroma_format = chroma_format;
     scfg.low_delay_p = low_delay_p;
-    scfg.dual_ref = dual_ref;
+    scfg.pyramid_slots = dual_ref >= 3u ? dual_ref+1u : 0u;
+    scfg.dual_ref = dual_ref != 0u;
     scfg.chroma_dct_only = chroma_dct_only;
     scfg.enable_cfl_intra = enable_cfl_intra;
     scfg.enable_intra_ist = enable_intra_ist;
@@ -409,9 +410,10 @@ static int emit_frame_packet(const SvtAv2FrameHeaderConfig* cfg, uint32_t frame_
         st = encode_sequence_header_ex(cfg->frame_width, cfg->frame_height, cfg->bit_depth,
             cfg->chroma_format, low_delay_p, !cfg->multi_frame, cfg->m5_intra_modes >= 2u,
             svt_av2_frame_header_use_cfl(cfg), cfg->enable_mrls, cfg->enable_mhccp,
-            cfg->ccso64 != NULL, cfg->enable_pc_wiener, cfg->dual_ref, cfg->enable_intra_ist,
+            cfg->ccso64 != NULL, cfg->enable_pc_wiener, cfg->pyramid_slots ? cfg->pyramid_slots-1u : cfg->dual_ref, cfg->enable_intra_ist,
             cfg->enable_intra_edge_filter, cfg->enable_ibp, cfg->cdef_primary != 0u, cfg->enable_gdf, cfg->uv_delta_q, out, out_cap, &prefix);
-    } else if (cfg->paired_role != SVT_AV2_ONLY_MIDPOINT && cfg->paired_role != SVT_AV2_FIRST_MIDPOINT) {
+    } else if (cfg->paired_role != SVT_AV2_ONLY_MIDPOINT && cfg->paired_role != SVT_AV2_FIRST_MIDPOINT &&
+               cfg->paired_role != SVT_AV2_HIDDEN_MIDPOINT) {
         SvtAv2BitWriter delimiter;
         svt_av2_bit_writer_init(&delimiter, out, out_cap);
         st = svt_av2_obu_write(&delimiter, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0, NULL, 0);
@@ -440,7 +442,8 @@ static int emit_frame_packet(const SvtAv2FrameHeaderConfig* cfg, uint32_t frame_
         if (st == 0 && (cfg->paired_role == SVT_AV2_ONLY_MIDPOINT || cfg->paired_role == SVT_AV2_LAST_MIDPOINT)) {
             /* Sequence and MFH ID zero, physical slot of rank zero, derive order hint
              * from the hidden anchor, then trailing_one_bit and zero padding. */
-            const uint8_t show_anchor = (uint8_t)(0xd8u | (cfg->reference_slot << 5u));
+            const unsigned bits = cfg->pyramid_slots >= 5u ? 3u : cfg->pyramid_slots ? 2u : 1u;
+            const uint8_t show_anchor = (uint8_t)(0xc0u | (cfg->reference_slot << (6u-bits)) | (3u << (4u-bits)));
             st = svt_av2_obu_write(&bw, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0, NULL, 0);
             if (!st) st = svt_av2_obu_write(&bw, SVT_AV2_OBU_REGULAR_SEF, 0, &show_anchor, 1);
         }

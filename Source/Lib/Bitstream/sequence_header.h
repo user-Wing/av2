@@ -114,6 +114,7 @@ typedef struct SvtAv2SequenceHeaderConfig {
     int8_t uv_delta_q;
     uint32_t enable_cdef;
     uint32_t enable_pc_wiener; /* Single-picture luma PC-Wiener, RU256. */
+    uint32_t pyramid_slots; /* Two active references selected from four physical slots. */
     uint32_t dual_ref; /* Low-delay multi-frame only: two physical DPB slots (default 0). */
 } SvtAv2SequenceHeaderConfig;
 

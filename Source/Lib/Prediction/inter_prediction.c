@@ -692,6 +692,43 @@ SvtAv2Error svt_av2_inter_luma_sad_eighth_sharp(const SvtAv2FrameBuffer* source,
     return sharp_luma_sad(source, reference, block, mv.mv_x, mv.mv_y, limit, sad, 0);
 }
 
+/* Keep four fractional bits for each reference until the two predictors
+ * have been combined, as required by AV2 compound convolution. */
+SvtAv2Error svt_av2_inter_predict_compound(const SvtAv2FrameBuffer* first, const SvtAv2FrameBuffer* second,
+    uint32_t plane, const SvtAv2BlockView* block, SvtAv2EighthPelMotionVector mv0,
+    SvtAv2EighthPelMotionVector mv1, int regular, uint16_t* prediction) {
+    if (!first || !second || !block || !prediction || plane >= 3u || !block->w || !block->h ||
+        block->w > 64u || block->h > 64u || first->bit_depth != second->bit_depth ||
+        first->chroma_format != second->chroma_format) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    const SvtAv2FrameBuffer* refs[2] = {first, second};
+    const SvtAv2EighthPelMotionVector vectors[2] = {mv0, mv1};
+    const int factor = plane && first->chroma_format == SVT_AV2_CHROMA_420 ? 1 : 2;
+    int32_t previous[64*64], rows[71][64];
+    const unsigned depth = first->bit_depth;
+    for (unsigned r=0; r<2; ++r) {
+        const SvtAv2FrameBuffer* ref = refs[r];
+        const unsigned width = svt_av2_picture_plane_width(ref,plane), height = svt_av2_picture_plane_height(ref,plane);
+        uint32_t px, py;
+        const int64_t left = block->x + split_sixteenth_offset((int64_t)factor*vectors[r].mv_x,&px);
+        const int64_t top = block->y + split_sixteenth_offset((int64_t)factor*vectors[r].mv_y,&py);
+        const SharpAxis horizontal = sharp_axis(px,block->w,regular), vertical = sharp_axis(py,block->h,regular);
+        for (unsigned y=0; y<block->h+vertical.taps-1u; ++y) {
+            const unsigned source_y = clamp_sample_pos(top + vertical.first + y,height);
+            sharp_horizontal_row(ref->planes[plane]+(size_t)source_y*ref->strides[plane],width,depth,
+                left,block->w,horizontal,rows[y]);
+        }
+        for (unsigned y=0; y<block->h; ++y) for (unsigned x=0; x<block->w; ++x) {
+            int32_t sum = 0;
+            for (unsigned k=0; k<vertical.taps; ++k) sum += vertical.weights[k]*rows[y+k][x];
+            const int32_t value = ((sum+32)>>6) - (1<<(depth+3));
+            const unsigned i = y*block->w+x;
+            if (!r) previous[i] = value;
+            else prediction[i] = sharp_clip((previous[i]+value+16)>>5,(1<<depth)-1);
+        }
+    }
+    return SVT_AV2_ERROR_NONE;
+}
+
 SvtAv2Error svt_av2_inter_predict_eighth_regular(const SvtAv2FrameBuffer* reference, uint32_t plane,
     const SvtAv2BlockView* block, SvtAv2EighthPelMotionVector mv, uint16_t* prediction,
     uint32_t prediction_stride) {

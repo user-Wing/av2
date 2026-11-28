@@ -104,6 +104,10 @@ int svt_av2_tile_rate_create(const SvtAv2FrameHeaderConfig* cfg,
                              SvtAv2TileRateSession** session);
 void svt_av2_tile_rate_free(SvtAv2TileRateSession* session);
 /* Raw end bank, before frame-boundary count decay; only after all commits. */
+/* Seed a coefficient proposal from the committed start of the current SB. */
+struct SvtAv2CoeffNeighbours;
+const struct SvtAv2EntropyModels* svt_av2_tile_rate_coeff_context(const SvtAv2TileRateSession* session,
+    uint32_t plane, struct SvtAv2CoeffNeighbours* neighbours);
 int svt_av2_tile_rate_end_models(const SvtAv2TileRateSession* session,
     struct SvtAv2EntropyModels* models);
 /* Writes a normal adaptive video tile; end bank is untouched on failure. */

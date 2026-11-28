@@ -100,7 +100,7 @@ void svt_av2_sequence_header_config_default(SvtAv2SequenceHeaderConfig* cfg,
     cfg->uv_delta_q = 0;
     cfg->enable_cdef = 0u;
     cfg->enable_pc_wiener = 0u;
-    cfg->dual_ref = 0u;
+    cfg->dual_ref = cfg->pyramid_slots = 0u;
 }
 
 /* Shared body validation (everything the M1 subset checks except the
@@ -112,6 +112,7 @@ static int seq_validate_config(const SvtAv2SequenceHeaderConfig* cfg,
                               uint32_t* height_bits) {
     if (cfg->low_delay_p > 1u || cfg->dual_ref > 1u || cfg->chroma_dct_only > 1u || cfg->enable_cfl_intra > 1u || cfg->enable_mrls > 1u || cfg->enable_mhccp > 1u || cfg->enable_intra_ist > 1u ||
         cfg->uv_delta_q < -23 || cfg->uv_delta_q > 8 || cfg->enable_gdf > 1u || cfg->enable_cdef > 1u || cfg->enable_ibp > 1u || cfg->enable_intra_edge_filter > 1u) return SVT_AV2_BW_ERROR_RANGE;
+    if (cfg->pyramid_slots && ((cfg->pyramid_slots < 4u || cfg->pyramid_slots > 6u) || !cfg->dual_ref)) return SVT_AV2_BW_ERROR_RANGE;
     if (cfg->dual_ref && !cfg->low_delay_p) return SVT_AV2_BW_ERROR_UNSUPPORTED;
     if (cfg->enable_pc_wiener > 1u || (cfg->enable_pc_wiener &&
         ((cfg->max_frame_width & 7u) || (cfg->max_frame_height & 7u) ||
@@ -338,7 +339,7 @@ int svt_av2_sequence_header_write_multi(SvtAv2BitWriter* bw,
     /* Explicit NumRefFrames = num_ref_frames_minus_1 + 1: low-delay
      * uses one or two physical slots, independently of the per-frame map.
      * Otherwise the decoder infers eight slots and there is no count field. */
-    if (cfg->low_delay_p && (status = seq_write_bits(bw, cfg->dual_ref, 4u)) != SVT_AV2_BW_OK) return status;
+    if (cfg->low_delay_p && (status = seq_write_bits(bw, cfg->pyramid_slots ? cfg->pyramid_slots-1u : cfg->dual_ref, 4u)) != SVT_AV2_BW_OK) return status;
     if ((status = seq_write_bits(bw, 0u, 3u)) != SVT_AV2_BW_OK) { /* long_term_frame_id_bits */
         return status;
     }

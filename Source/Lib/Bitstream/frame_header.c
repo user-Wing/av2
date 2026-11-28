@@ -48,7 +48,7 @@ void svt_av2_frame_header_config_default(SvtAv2FrameHeaderConfig* cfg,
     cfg->retain_reference = 0u;
     cfg->dual_ref = 0u;
     cfg->refresh_mask = 0u;
-    cfg->reference_slot = 0u;
+    cfg->reference_slot = cfg->secondary_slot = cfg->pyramid_slots = cfg->compound_average = cfg->inter_intra_search = 0u;
     cfg->logical_ref_count = 0u;
     cfg->ref_distance[0] = cfg->ref_distance[1] = 0u;
     cfg->primary_models = NULL;
@@ -200,12 +200,20 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
     if (cfg->inter_frame > 1u || (cfg->inter_frame && !cfg->multi_frame) ||
         (cfg->primary_models != NULL && (!cfg->inter_frame || cfg->entropy_adaptation != 1u)))
         return SVT_AV2_BW_ERROR_UNSUPPORTED;
-    if (cfg->paired_role > SVT_AV2_LAST_MIDPOINT || (cfg->paired_role && (!cfg->multi_frame || !cfg->inter_frame ||
-        !cfg->dual_ref || (cfg->paired_role == SVT_AV2_HIDDEN_ANCHOR ? (cfg->refresh_mask != 1u && cfg->refresh_mask != 2u) : cfg->refresh_mask != 0u)))) return SVT_AV2_BW_ERROR_RANGE;
+    const int hidden = cfg->paired_role == SVT_AV2_HIDDEN_ANCHOR ||
+        cfg->paired_role == SVT_AV2_HIDDEN_MIDPOINT || cfg->paired_role == SVT_AV2_HIDDEN_BRANCH;
+    if (cfg->paired_role > SVT_AV2_HIDDEN_BRANCH || (cfg->paired_role && (!cfg->multi_frame || !cfg->inter_frame ||
+        !cfg->dual_ref || (hidden ? (!cfg->refresh_mask || (cfg->refresh_mask & (cfg->refresh_mask - 1u))) : cfg->refresh_mask != 0u)))) return SVT_AV2_BW_ERROR_RANGE;
     if (cfg->mv_half > 2u || cfg->retain_reference > 1u || cfg->sharp_filter > 1u ||
-        cfg->wide_motion > 1u || (cfg->wide_motion && cfg->mv_half != 2u) ||
+        cfg->wide_motion > 2u || (cfg->wide_motion && cfg->mv_half != 2u) ||
         cfg->regular_filter > 1u || (cfg->regular_filter && (!cfg->sharp_filter || cfg->mv_half != 2u)) ||
-        cfg->dual_ref > 1u || cfg->refresh_mask > 3u || cfg->reference_slot > 1u ||
+        cfg->compound_average > 2u || (cfg->compound_average && (cfg->logical_ref_count != 2u ||
+            cfg->ref_distance[0] != cfg->ref_distance[1] || cfg->paired_role < SVT_AV2_ONLY_MIDPOINT)) ||
+        (cfg->pyramid_slots && ((cfg->pyramid_slots < 4u || cfg->pyramid_slots > 6u) || !cfg->dual_ref)) ||
+        cfg->dual_ref > 1u || cfg->refresh_mask > (cfg->pyramid_slots ? (1u<<cfg->pyramid_slots)-1u : 3u) ||
+        cfg->reference_slot > (cfg->pyramid_slots ? cfg->pyramid_slots-1u : 1u) ||
+        (cfg->pyramid_slots && cfg->logical_ref_count == 2u &&
+            (cfg->secondary_slot >= cfg->pyramid_slots || cfg->secondary_slot == cfg->reference_slot)) ||
         cfg->logical_ref_count > 2u)
         return SVT_AV2_BW_ERROR_RANGE;
     if (((cfg->mv_half || cfg->retain_reference) && !cfg->inter_frame) ||
@@ -260,7 +268,7 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
          * frame size comes from the sequence header (spec 5.18.2 p.98; AVM
          * decodeframe.c:8100-8102, :8167). order_hint is written below using the sequence
          * header's eight-bit width. */
-        if ((st = svt_av2_bit_writer_write_bit(bw, cfg->paired_role != SVT_AV2_HIDDEN_ANCHOR)) != SVT_AV2_BW_OK) {
+        if ((st = svt_av2_bit_writer_write_bit(bw, !hidden)) != SVT_AV2_BW_OK) {
             return st;
         }
         if ((st = svt_av2_bit_writer_write_bit(bw, 0u)) != SVT_AV2_BW_OK) {
@@ -280,13 +288,13 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
          * CLOSED_LOOP_KEY instead infers an all-slots refresh (no bits). */
         if ((st = svt_av2_bit_writer_write_bits(bw,
              cfg->dual_ref ? cfg->refresh_mask : !cfg->retain_reference,
-             cfg->dual_ref ? 2u : 1u)) != 0) return st;
+             cfg->pyramid_slots ? cfg->pyramid_slots : cfg->dual_ref ? 2u : 1u)) != 0) return st;
         if ((st = svt_av2_bit_writer_write_bit(bw, 1u)) != 0) return st; /* explicit map */
         const uint32_t two_refs = cfg->logical_ref_count == 2u;
         if ((st = svt_av2_bit_writer_write_bits(bw, 1u + two_refs, 3u)) != 0) return st;
         /* ceil(log2(NumRefFrames)) is zero with one slot, one with two. */
-        if (cfg->dual_ref && (st = svt_av2_bit_writer_write_bit(bw, cfg->reference_slot)) != 0) return st;
-        if (two_refs && (st = svt_av2_bit_writer_write_bit(bw, 1u ^ cfg->reference_slot)) != 0) return st;
+        if (cfg->dual_ref && (st = svt_av2_bit_writer_write_bits(bw, cfg->reference_slot, cfg->pyramid_slots >= 5u ? 3u : cfg->pyramid_slots ? 2u : 1u)) != 0) return st;
+        if (two_refs && (st = svt_av2_bit_writer_write_bits(bw, cfg->pyramid_slots ? cfg->secondary_slot : 1u ^ cfg->reference_slot, cfg->pyramid_slots >= 5u ? 3u : cfg->pyramid_slots ? 2u : 1u)) != 0) return st;
         if ((st = svt_av2_bit_writer_write_bit(bw, 1u)) != 0) return st; /* screen content */
         if ((st = svt_av2_bit_writer_write_bit(bw, !cfg->mv_half)) != 0) return st; /* force integer MV */
         if ((st = svt_av2_bit_writer_write_bit(bw, 0u)) != 0) return st; /* intrabc */
@@ -410,7 +418,7 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
     if ((st = svt_av2_bit_writer_write_bit(bw, 0u)) != SVT_AV2_BW_OK) {
         return st;
     }
-    if (cfg->inter_frame && (st = svt_av2_bit_writer_write_bit(bw, 0u)) != 0) return st; /* SINGLE_REFERENCE */
+    if (cfg->inter_frame && (st = svt_av2_bit_writer_write_bit(bw, cfg->compound_average != 0u)) != 0) return st; /* REFERENCE_MODE_SELECT */
     /* AVM v1.0.0 permits skip mode even with a single reference. */
     if (cfg->inter_frame && (st = svt_av2_bit_writer_write_bit(bw, 0u)) != 0) return st; /* skip_mode_flag */
     /* reduced_tx_set: 2 implies intra DCT; inter small transforms signal DCT_IDTX. */

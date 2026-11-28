@@ -41,6 +41,8 @@ SvtAv2Error svt_av2_reference_refresh_after_holds(SvtAv2ReferenceFrame* slot0,
     SvtAv2ReferenceFrame* slot1, const SvtAv2FrameBuffer* reconstruction,
     uint64_t frame_index, uint32_t refresh_mask, uint32_t held_pictures);
 /* Preserve the last anchor when opening a new short-reference chain. */
+/* Store a reordered picture into its explicitly selected slot. */
+SvtAv2Error svt_av2_reference_store(SvtAv2ReferenceFrame* slot, const SvtAv2FrameBuffer* recon, uint64_t index);
 SvtAv2Error svt_av2_reference_refresh_anchor(SvtAv2ReferenceFrame* recent, SvtAv2ReferenceFrame* older,
     const SvtAv2FrameBuffer* reconstruction, uint64_t frame_index, uint32_t held, int rotate);
 /* Luma patch SAD with bounded local integer translation. Slot 1 must beat

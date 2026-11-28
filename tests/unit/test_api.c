@@ -626,6 +626,37 @@ static void test_consecutive_frames_use_their_own_input(void) {
 }
 
 /* Every submitted frame retains its own PTS and coefficients. */
+static void test_picture_qp_override(void) {
+    SvtAv2Handle normal = NULL, variable = NULL;
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init_handle(&normal,NULL),SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init_handle(&variable,NULL),SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(configure_valid(normal,64,64),SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(configure_valid(variable,64,64),SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(normal),SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init(variable),SVT_AV2_ERROR_NONE);
+    TestPicture t;
+    test_picture_init_64x64(&t);
+    for (size_t i=0;i<sizeof(t.storage);++i) t.storage[i]=(uint8_t)(i*17u+i/64u);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture_at_qp(variable,&t.picture,256),SVT_AV2_ERROR_INVALID_PARAMETER);
+    for (int i=0;i<2;++i) {
+        uint8_t a[16384], b[16384];
+        SvtAv2Packet pa={0}, pb={0};
+        pa.data=a; pa.capacity=sizeof(a);
+        pb.data=b; pb.capacity=sizeof(b);
+        t.picture.pts=i;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture(normal,&t.picture),SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK_EQ_INT(i ? svt_av2_enc_send_picture(variable,&t.picture) :
+            svt_av2_enc_send_picture_at_qp(variable,&t.picture,200),SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture_at_qp(variable,&t.picture,1),SVT_AV2_ERROR_INVALID_STATE);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_packet_ex(normal,&pa),SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_get_packet_ex(variable,&pb),SVT_AV2_ERROR_NONE);
+        const int equal=pa.size==pb.size && memcmp(a,b,pa.size)==0;
+        SVT_TEST_CHECK_EQ_INT(equal,i);
+    }
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&normal),SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_enc_deinit(&variable),SVT_AV2_ERROR_NONE);
+}
+
 static void test_packet_matches_submitted_frame(void) {
     SvtAv2Handle handle = NULL;
     SVT_TEST_CHECK_EQ_INT(svt_av2_enc_init_handle(&handle, NULL), SVT_AV2_ERROR_NONE);
@@ -1146,7 +1177,18 @@ static void test_causal_anchor_retries(int inherit) {
         test.picture.pts = frame + 73u;
         memset(test.storage, 128, sizeof(test.storage));
         if (frame >= 13u) memset(test.storage, frame == 13u ? 144 : 164, 64u * 64u);
-        SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture(handle, &test.picture), SVT_AV2_ERROR_NONE);
+        if (!frame && inherit) {
+            uint16_t weight=0;
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture_weighted(handle,&test.picture,100,&weight,1),
+                SVT_AV2_ERROR_INVALID_PARAMETER);
+            weight=256;
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture_weighted(handle,&test.picture,100,&weight,0),
+                SVT_AV2_ERROR_INVALID_PARAMETER);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture_weighted(handle,&test.picture,100,&weight,1),
+                SVT_AV2_ERROR_NONE);
+            SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture_weighted(handle,&test.picture,100,&weight,1),
+                SVT_AV2_ERROR_INVALID_STATE);
+        } else SVT_TEST_CHECK_EQ_INT(svt_av2_enc_send_picture(handle, &test.picture), SVT_AV2_ERROR_NONE);
         SvtAv2Packet packet = {0};
         bytes[0] = 0xa5u;
         packet.data = bytes; packet.capacity = 1u;
@@ -1206,6 +1248,7 @@ int main(void) {
     test_output_path_replacement();
     test_consecutive_frames_use_their_own_input();
     test_packet_matches_submitted_frame();
+    test_picture_qp_override();
     test_m2_owned_source_and_reconstruction();
 
     SVT_TEST_REPORT("test_api");

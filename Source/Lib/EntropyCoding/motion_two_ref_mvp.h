@@ -28,7 +28,7 @@ static inline int svt_av2_mvp_two_past_distances(uint64_t current, uint64_t ref0
  * (ties away from zero), not an exact rational or quarter-grid operation.
  * Distances are bounded to eight. The caller applies the spatial clamp.
  * Return 0 without changing the output on unsupported input. */
-static inline int svt_av2_motion_q3_limit(int wide) { return wide ? 248 : 128; }
+static inline int svt_av2_motion_q3_limit(int wide) { return wide == 2 ? 504 : wide ? 248 : 128; }
 
 static inline int svt_av2_mvp_project_q3_range(int wide, int32_t mv_q3, uint32_t target_distance,
     uint32_t neighbor_distance, int32_t* result_q3) {

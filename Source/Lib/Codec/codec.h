@@ -54,6 +54,8 @@ typedef struct SvtAv2EncoderContext {
     uint32_t frame_width;
     uint32_t frame_height;
     int32_t  frame_pts;
+    int32_t  picture_qp;
+    uint16_t* picture_weights;
     int      frame_pending;   /* 1 = a picture awaits get_packet() */
     int      eos;             /* 1 = send_picture(NULL) / flush was called */
     int      eos_reported;    /* 1 = the EOS "no packet" was already returned */
@@ -101,7 +103,7 @@ typedef struct SvtAv2EncoderContext {
     uint8_t intra_ist_scope; /* 0=off, 1=signal, 2=KEY, 4=P, 6=KEY/P. */
     uint8_t still_edge_filter;
     uint8_t enable_ibp;
-    uint8_t qm_scope;
+    uint8_t qm_scope, inter_qm_curve;
     int8_t uv_delta_q;
     uint8_t qm_level, qm_uv_level; /* Zero UV override inherits luma. */
     uint8_t luma_compensation_scope;
@@ -115,9 +117,10 @@ typedef struct SvtAv2EncoderContext {
     uint32_t previous_motion_q8, last_clean_frame;
     uint8_t quiet_frames, held_pictures;
     uint8_t motion_q;
+    uint8_t adaptive_pyramid, pyramid_span, tree_full, motion_layers, display_all_slots, drawing_runs;
     uint8_t drawing_cadence;
     uint8_t latest_slot;
-    uint32_t anchor_display, previous_anchor_display;
+    uint32_t anchor_display, previous_anchor_display, slot_display[6];
     uint16_t anchor_source[SVT_AV2_ANCHOR_GRID_COUNT];
     uint64_t inter_skip_trials, inter_skip_accepts;
     uint64_t inter_fine_trials, inter_fine_accepts;

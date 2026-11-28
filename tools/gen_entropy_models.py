@@ -157,6 +157,14 @@ def generate(avm, dest, evidence):
         entries = [e for e in rows(initializer(tables['modes'], name)) if e[0] in paths]
         assert [e[0] for e in entries] == paths
         families.append((key, name, [entries] * 4))
+    for key, name in [('COMP_INTER', 'default_comp_inter_cdf'),
+                      ('COMP_JOINT', 'default_inter_compound_mode_is_joint_cdf'),
+                      ('COMP_MODE', 'default_inter_compound_mode_non_joint_type_cdf'),
+                      ('VIDEO_DELTA_Q', 'default_delta_q_cdf')]:
+        entries = list(rows(initializer(tables['modes'], name)))
+        families.append((key, name, [entries] * 4))
+    path = (6, 0, 8)
+    families.append(('MV_QUARTER_BIT8', 'default_nmv_context', [[(path, *nmv[path])]] * 4))
     dest.mkdir(parents=True, exist_ok=True)
     evidence.mkdir(parents=True, exist_ok=True)
     defines, ns, allq, manifest, checks = [], [], [[] for _ in range(4)], [], []

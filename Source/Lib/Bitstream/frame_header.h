@@ -75,7 +75,9 @@ enum {
     SVT_AV2_ONLY_MIDPOINT,
     SVT_AV2_FIRST_MIDPOINT,
     SVT_AV2_INNER_MIDPOINT,
-    SVT_AV2_LAST_MIDPOINT
+    SVT_AV2_LAST_MIDPOINT,
+    SVT_AV2_HIDDEN_MIDPOINT,
+    SVT_AV2_HIDDEN_BRANCH /* Bidirectional hidden frame opening a temporal unit. */
 };
 
 typedef struct SvtAv2FrameHeaderConfig {
@@ -137,6 +139,8 @@ typedef struct SvtAv2FrameHeaderConfig {
     uint32_t retain_reference; /* Single-slot P only: 1 leaves the slot intact. */
     uint32_t dual_ref; /* 1: two physical DPB slots, as signaled by the sequence. */
     uint32_t refresh_mask; /* Dual P only: bit n refreshes slot n. KEY infers both. */
+    uint32_t pyramid_slots, secondary_slot, compound_average;
+    uint32_t inter_intra_search; /* Widen the encoder mode shortlist for intra blocks within inter frames. */
     uint32_t reference_slot; /* Dual P only: slot backing logical reference 0. */
     uint32_t logical_ref_count; /* 0/1: legacy single; 2: explicit physical map [0,1]. */
     uint32_t ref_distance[2]; /* Only estimator/writer state, not coded: 0/0=zero-MV gate. */
@@ -144,6 +148,11 @@ typedef struct SvtAv2FrameHeaderConfig {
      * bank is the immutable, already-decayed end context of that reference. */
     const struct SvtAv2EntropyModels* primary_models;
 } SvtAv2FrameHeaderConfig;
+
+static inline unsigned svt_av2_frame_max_ref_distance(const SvtAv2FrameHeaderConfig* cfg) {
+    return cfg->pyramid_slots>=5u && cfg->paired_role>=SVT_AV2_ONLY_MIDPOINT ? 32u :
+        cfg->pyramid_slots==6u ? 16u : 8u;
+}
 
 /* The still selector keeps its legacy sequence syntax. The independent video
  * flag reflects the first packet's sequence bit on every KEY/P tile. */
