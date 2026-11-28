@@ -376,22 +376,21 @@ static void gdf_set_lap_and_cls_unit_c(const int i_min, const int i_max,
 /*!\brief Function to apply scaling factor to expected coding error
  *        and then generate the final filtered unit
  */
+static uint16_t gdf_correct(int pixel, int error, int shift, int scale, int max_pixel) {
+  const int half = shift ? 1 << (shift - 1) : 0;
+  const int scaled = scale * error;
+  const int delta = scaled < 0 ? -((-scaled + half) >> shift) : (scaled + half) >> shift;
+  return (uint16_t)CLIP(pixel + delta, 0, max_pixel);
+}
+
 static void gdf_compensation_unit_c(uint16_t *rec_pnt, const int rec_stride,
                              int16_t *err_pnt, const int err_stride,
                              const int err_shift, const int scale,
                              const int pxl_max, const int blk_height,
                              const int blk_width) {
-  const int errShift_half = err_shift > 0 ? 1 << (err_shift - 1) : 0;
   for (int i = 0; i < blk_height; i++) {
-    for (int j = 0; j < blk_width; j++) {
-      int res_pxl = scale * (*(err_pnt + j));
-      if (res_pxl > 0) {
-        res_pxl = (res_pxl + errShift_half) >> err_shift;
-      } else {
-        res_pxl = -(((-res_pxl) + errShift_half) >> err_shift);
-      }
-      rec_pnt[j] = (uint16_t)CLIP(res_pxl + rec_pnt[j], 0, pxl_max);
-    }
+    for (int j = 0; j < blk_width; j++)
+      rec_pnt[j] = gdf_correct(rec_pnt[j], err_pnt[j], err_shift, scale, pxl_max);
     rec_pnt += rec_stride;
     err_pnt += err_stride;
   }
@@ -521,8 +520,9 @@ uint16_t* svt_av2_gdf_copy_luma(const SvtAv2FrameBuffer* frame) {
     return samples;
 }
 
-SvtAv2Error svt_av2_gdf_luma(SvtAv2FrameBuffer* frame, const uint16_t* guide,
-    const uint16_t* deblocked, uint32_t base_q_idx, uint32_t code, uint32_t ref_distance) {
+static SvtAv2Error gdf_process(SvtAv2FrameBuffer* frame, const uint16_t* guide,
+    const uint16_t* deblocked, uint32_t base_q_idx, uint32_t code, uint32_t ref_distance, uint32_t threads,
+    const SvtAv2FrameBuffer* source, uint64_t scores[5]) {
     enum { unit = 64, border = 6, stride = unit + 2 * border, lap_stride = unit + 16 };
     if (!frame || !guide || code < 1u || code > 16u) return SVT_AV2_ERROR_INVALID_PARAMETER;
     const int width = (int)frame->visible_width, height = (int)frame->visible_height;
@@ -533,16 +533,27 @@ SvtAv2Error svt_av2_gdf_luma(SvtAv2FrameBuffer* frame, const uint16_t* guide,
     const int key_qp = ref_distance ? qp - 25 : qp;
     const int model = (key_qp >= 172 ? 2 : key_qp >= 147 ? 1 : 0) + (int)(code - 1u) / 4;
     const int scale = 1 + (int)(code - 1u) % 4;
-    uint16_t padded[stride * stride], lap_data[4][34 * lap_stride] = {{0}};
-    uint16_t* lap[4] = { lap_data[0], lap_data[1], lap_data[2], lap_data[3] };
-    uint32_t classes[34 * lap_stride] = {0};
-    int16_t error[unit * lap_stride] = {0};
-    uint16_t output[unit * unit];
     if (!deblocked) deblocked = guide;
-    for (int stripe = -8; stripe < height; stripe += unit) {
+    int stripe;
+#ifdef _OPENMP
+#pragma omp parallel for if(threads > 1u) num_threads(threads) schedule(static)
+#else
+    (void)threads;
+#endif
+    for (stripe = -8; stripe < height; stripe += unit) {
+        uint16_t padded[stride * stride], lap_data[4][34 * lap_stride] = {{0}};
+        uint16_t* lap[4] = { lap_data[0], lap_data[1], lap_data[2], lap_data[3] };
+        uint32_t classes[34 * lap_stride] = {0};
+        int16_t error[unit * lap_stride] = {0};
+        uint16_t output[unit * unit];
         const int top = AVMMAX(0, stripe), bottom = AVMMIN(height, stripe + unit);
         const int h = bottom - top;
         for (int x0 = 0; x0 < width; x0 += unit) {
+            if (scores) {
+                const int row = (stripe+8)/unit;
+                const int phase = (row/4) % AVMMIN(4, (width+unit-1)/unit);
+                if (row%4 || (x0/unit)%4 != phase) continue;
+            }
             const int w = AVMMIN(unit, width - x0);
             for (int y = -border; y < h + border; ++y) {
                 const int inside = y >= 0 && y < h;
@@ -561,6 +572,17 @@ SvtAv2Error svt_av2_gdf_luma(SvtAv2FrameBuffer* frame, const uint16_t* guide,
                 for (int x = 0; x < w; ++x)
                     output[y * unit + x] = svt_av2_sample_load(frame->planes[0] +
                         (size_t)(top + y) * frame->strides[0] + (x0 + x) * step, frame->bit_depth);
+            if (scores) {
+                for (int y=0; y<h; ++y) for (int x=0; x<w; ++x) {
+                    const int orig=svt_av2_sample_load(source->planes[0]+(size_t)(top+y)*source->strides[0]+(x0+x)*step,depth);
+                    for (int strength=0; strength<=4; ++strength) {
+                        const int diff=orig-gdf_correct(output[y*unit+x],error[y*lap_stride+x],
+                            12-depth,strength,(1<<depth)-1);
+                        scores[strength]+=(uint32_t)(diff*diff);
+                    }
+                }
+                continue;
+            }
             gdf_compensation_unit_c(output, unit, error, lap_stride, 12 - depth, scale,
                 (1 << depth) - 1, h, w);
             for (int y = 0; y < h; ++y)
@@ -569,5 +591,31 @@ SvtAv2Error svt_av2_gdf_luma(SvtAv2FrameBuffer* frame, const uint16_t* guide,
                         (x0 + x) * step, frame->bit_depth, output[y * unit + x]);
         }
     }
+    return SVT_AV2_ERROR_NONE;
+}
+
+SvtAv2Error svt_av2_gdf_luma(SvtAv2FrameBuffer* frame, const uint16_t* guide,
+    const uint16_t* deblocked, uint32_t base_q_idx, uint32_t code, uint32_t ref_distance, uint32_t threads) {
+    return gdf_process(frame,guide,deblocked,base_q_idx,code,ref_distance,threads,NULL,NULL);
+}
+
+SvtAv2Error svt_av2_gdf_select(SvtAv2FrameBuffer* recon, const SvtAv2FrameBuffer* source,
+    const uint16_t* guide, uint32_t qindex, uint32_t distance, uint32_t* code) {
+    if (!recon || !source || !code || !guide || !recon->visible_width || !recon->visible_height ||
+        source->bit_depth!=recon->bit_depth || source->visible_width!=recon->visible_width ||
+        source->visible_height!=recon->visible_height) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    uint32_t selected=0;
+    uint64_t best=UINT64_MAX;
+    for (uint32_t model=0; model<4; ++model) {
+        uint64_t costs[5]={0};
+        SvtAv2Error status=gdf_process(recon,guide,guide,qindex,1+4*model,distance,1,source,costs);
+        if (status) return status;
+        if (!model) best=costs[0];
+        for (uint32_t strength=1; strength<=4; ++strength) if (costs[strength]<best) {
+            best=costs[strength];
+            selected=4*model+strength;
+        }
+    }
+    *code=selected;
     return SVT_AV2_ERROR_NONE;
 }

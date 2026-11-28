@@ -661,7 +661,24 @@ static void test_intra_ist_eob(void) {
     }
 }
 
+static void test_inter_rect_residual(void) {
+    const SvtAv2TxSize sizes[] = {SVT_AV2_TX_32X16, SVT_AV2_TX_16X32,
+                                  SVT_AV2_TX_16X8, SVT_AV2_TX_8X16};
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint32_t w = svt_av2_coeff_tx_width(sizes[i]);
+        const uint32_t h = svt_av2_coeff_tx_height(sizes[i]);
+        const SvtAv2CoeffPlaneInfo pi = {i / 2u, sizes[i], 0, 0, w / 4u, h / 4u, w, h};
+        int32_t qcoeff[512] = {1, -1};
+        SvtAv2CoeffNeighbours nb;
+        SvtAv2EntropyEncoder enc;
+        svt_av2_coeff_neighbours_reset(&nb);
+        svt_av2_entropy_rate_init(&enc);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_coeff_write_block_prediction(&enc, &pi, 0, qcoeff, &nb, 1, 1), 0);
+    }
+}
+
 int main(void) {
+    test_inter_rect_residual();
     test_intra_ist_eob();
     test_m53_q_contexts_and_high_range();
     test_m4_far_left_is_not_mvp();

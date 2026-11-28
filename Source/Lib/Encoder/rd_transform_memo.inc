@@ -28,7 +28,7 @@ typedef struct RdTransformCacheEntry {
 } RdTransformCacheEntry;
 typedef struct RdTransformCache {
     int8_t uv_delta_q;
-    uint32_t qm_level;  /* Immutable for the lifetime of the frame cache. */
+    uint32_t qm_level, qm_uv_level;  /* Immutable for the lifetime of the frame cache. */
     RdTransformCacheEntry* entries;
     uint32_t* buckets;
     uint8_t* arena;
@@ -112,12 +112,12 @@ static void rd_tx_memo_evict(RdTransformCache* c, uint32_t id) {
     e->hprev = 0u; e->hnext = c->free_head;
     c->free_head = id;
 }
-static uint32_t rd_tx_memo_span(const uint32_t key[6]) {
+static uint32_t rd_tx_memo_span(const uint32_t key[6], int all_zero) {
     const uint32_t w = key[1], h = key[2];
     if (!w || !h || w > 64u || h > 64u) return 0u;
     const uint32_t kw = w < 32u ? w : 32u;
     const uint32_t kh = h < 32u ? h : 32u;
-    return (RD_TX_RECORD_HEADER + 2u * w * h + 8u * kw * kh + 7u) & ~7u;
+    return (RD_TX_RECORD_HEADER + 2u * w * h + (all_zero ? 4u : 8u) * kw * kh + 7u) & ~7u;
 }
 static const uint8_t* rd_tx_memo_data(const RdTransformCache* c, uint32_t id) {
     return c->arena + c->entries[id - 1u].offset + RD_TX_RECORD_HEADER;
@@ -144,16 +144,23 @@ static int rd_tx_memo_restore(RdTransformCache* c, uint32_t id,
     const size_t count = (size_t)(w < 32u ? w : 32u) * (h < 32u ? h : 32u);
     const uint8_t* raw = rd_tx_memo_data(c, id) + (size_t)w * h * sizeof(int16_t);
     memcpy(coeff, raw, count * sizeof(*coeff));
-    memcpy(qcoeff, raw + count * sizeof(*coeff), count * sizeof(*qcoeff));
-    SvtAv2QuantParams params;
-    if (svt_av2_quant_params_init_matrix(&params, e->key[4], w, h, e->key[5], c->qm_level, c->uv_delta_q) !=
-            SVT_AV2_QUANT_OK ||
-        svt_av2_dequantize_block(&params, qcoeff, dqcoeff, count, (int)e->key[0]) !=
-            SVT_AV2_QUANT_OK) return 0;
+    if (e->all_zero) {
+        memset(qcoeff, 0, count * sizeof(*qcoeff));
+        memset(dqcoeff, 0, count * sizeof(*dqcoeff));
+    } else {
+        memcpy(qcoeff, raw + count * sizeof(*coeff), count * sizeof(*qcoeff));
+        SvtAv2QuantParams params;
+        const uint32_t qm = e->key[0] && c->qm_uv_level ? c->qm_uv_level : c->qm_level;
+        if (svt_av2_quant_params_init_matrix(&params, e->key[4], w, h, e->key[5],
+                qm, c->uv_delta_q) != SVT_AV2_QUANT_OK ||
+            svt_av2_dequantize_block(&params, qcoeff, dqcoeff, count,
+                (int)e->key[0]) != SVT_AV2_QUANT_OK) return 0;
+        ++c->dequant_rebuilds;
+    }
     /* Only the original valid prefix is written; scratch tails stay untouched. */
     *all_zero = e->all_zero;
     rd_tx_memo_touch(c, id);
-    ++c->hits; ++c->dequant_rebuilds;
+    ++c->hits;
     return 1;
 }
 static int rd_tx_memo_compact(RdTransformCache* c) {
@@ -206,7 +213,7 @@ static int rd_tx_memo_make_room(RdTransformCache* c, uint32_t span) {
 static int rd_tx_memo_store(RdTransformCache* c, uint64_t hash,
     const uint32_t key[6], const int16_t* residual, uint32_t stride,
     const int32_t* coeff, const int32_t* qcoeff, int all_zero) {
-    const uint32_t span = rd_tx_memo_span(key);
+    const uint32_t span = rd_tx_memo_span(key, all_zero);
     if (!rd_tx_memo_make_room(c, span)) return 0;
     const uint32_t id = c->free_head;
     RdTransformCacheEntry* e = &c->entries[id - 1u];
@@ -226,7 +233,7 @@ static int rd_tx_memo_store(RdTransformCache* c, uint64_t hash,
     const size_t count = (size_t)(key[1] < 32u ? key[1] : 32u) *
                                 (key[2] < 32u ? key[2] : 32u);
     memcpy(dst, coeff, count * sizeof(*coeff));
-    memcpy(dst + count * sizeof(*coeff), qcoeff, count * sizeof(*qcoeff));
+    if (!all_zero) memcpy(dst + count * sizeof(*coeff), qcoeff, count * sizeof(*qcoeff));
     c->arena_used += span; c->live_bytes += span; ++c->live_count;
     const uint32_t bucket = rd_tx_memo_bucket(hash);
     e->hprev = 0u; e->hnext = c->buckets[bucket];

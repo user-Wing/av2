@@ -129,6 +129,8 @@ uint32_t svt_av2_coeff_coeff_count(SvtAv2TxSize tx_size);
  * grid, which is clamped to 32x32: TX_64X64 yields the 1024-entry 32x32 order
  * (AVM reuses default_scan_32x32 for it). Verified against AVM's
  * default_scan_4x4/8x8/16x16/32x32 tables. */
+/* Read-only order for the calling thread, valid for its lifetime. */
+const uint16_t* svt_av2_coeff_scan_view(SvtAv2TxSize tx_size);
 size_t svt_av2_coeff_scan_dct_dct(SvtAv2TxSize tx_size, uint16_t* scan);
 
 /* --- EOB / last position --------------------------------------------------- */

@@ -54,7 +54,7 @@ static SvtAv2Error path_forward_type(void* user,
      * cached, so a later change of block size cannot read a stale quantizer. */
     SvtAv2QuantParams params;
     if (svt_av2_quant_params_init_matrix(&params, state->base_q_idx, block_w, block_h,
-            state->bit_depth, state->qm_level, state->uv_delta_q) !=
+            state->bit_depth, plane && state->qm_uv_level ? state->qm_uv_level : state->qm_level, state->uv_delta_q) !=
         SVT_AV2_QUANT_OK) {
         return SVT_AV2_ERROR_UNSUPPORTED;
     }
@@ -92,6 +92,7 @@ static SvtAv2Error path_forward_type(void* user,
 
     /* Quantise the carried grid: the count must be the carried count so the
      * qcoeff/dqcoeff contract is the same one T011 reads (row stride min(w,32)). */
+    params.matrix_rounding = state->matrix_rounding;
     params.avm_fp_round = state->avm_fp_round;
     if (state->quantize_block(&params, packed_coeff, qcoeff, dqcoeff, count, (int)plane,
                                log_scale) != SVT_AV2_QUANT_OK) {

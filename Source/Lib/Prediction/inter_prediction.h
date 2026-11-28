@@ -42,10 +42,20 @@ typedef struct SvtAv2EighthPelMotionVector {
     int32_t mv_x, mv_y;
 } SvtAv2EighthPelMotionVector;
 
+SvtAv2Error svt_av2_inter_predict_eighth_regular(const SvtAv2FrameBuffer* reference, uint32_t plane,
+    const SvtAv2BlockView* block, SvtAv2EighthPelMotionVector mv, uint16_t* prediction,
+    uint32_t prediction_stride);
+SvtAv2Error svt_av2_inter_luma_sad_eighth_regular(const SvtAv2FrameBuffer* source,
+    const SvtAv2FrameBuffer* reference, const SvtAv2BlockView* block,
+    SvtAv2EighthPelMotionVector mv, uint64_t limit, uint64_t* sad);
+
 SvtAv2Error svt_av2_inter_predict_eighth_sharp(const SvtAv2FrameBuffer* reference, uint32_t plane,
     const SvtAv2BlockView* block, SvtAv2EighthPelMotionVector mv, uint16_t* prediction,
     uint32_t prediction_stride);
 
+/* Exact SAD between a stored 8/10-bit row and up to 64 predicted samples. */
+uint64_t svt_av2_prediction_row_sad(const uint8_t* source, const uint16_t* predicted,
+    uint32_t count, uint32_t depth);
 /* Luma-only shortlist metric for width <= 64. Exact SHARP SAD if <= limit,
  * otherwise returns limit+1. UINT64_MAX requests the complete cost. This
  * function never writes reconstructed samples; reference extension and the

@@ -30,10 +30,10 @@ static int sample(const uint16_t* const* lines, int x, int y, int width, int top
     return lines[clamp_int(y-top+2,0,bottom-top+3)][clamp_int(x,0,width-1)];
 }
 
-int svt_av2_pcwiener_filter_y_boundaries(const uint16_t* src, ptrdiff_t src_stride,
+int svt_av2_pcwiener_filter_y_parallel(const uint16_t* src, ptrdiff_t src_stride,
     uint16_t* dst, ptrdiff_t dst_stride, uint32_t width, uint32_t height,
     uint32_t bit_depth, uint32_t base_q_idx, const uint8_t* tskip,
-    ptrdiff_t tskip_stride, const uint16_t* deblocked) {
+    ptrdiff_t tskip_stride, const uint16_t* deblocked, uint32_t threads) {
     if (!src || !dst || src == dst || !tskip || !width || !height ||
         width % 8u || height % 8u || width > 16384u || height > 16384u ||
         src_stride < (ptrdiff_t)width || dst_stride < (ptrdiff_t)width ||
@@ -69,9 +69,18 @@ int svt_av2_pcwiener_filter_y_boundaries(const uint16_t* src, ptrdiff_t src_stri
     static const int dx[12] = {0,1,0,2,1,1,1,-1,2,-2,0,3};
     const int max_sample = (1 << bit_depth) - 1;
     const int w = (int)width,h = (int)height;
-    for (int top = 0;top < h;) {
-        const int stripe_h = top == 0 ? 56 : 64;
-        const int bottom = top + stripe_h < h ? top + stripe_h : h;
+    for (int y=0; y<h/4; ++y) for (int x=0; x<w/4; ++x)
+        if (tskip[(ptrdiff_t)y*tskip_stride+x] > 1u) return -1;
+    if (!threads) threads = 1u;
+    int stripe;
+#ifdef _OPENMP
+#pragma omp parallel for if(threads > 1u) num_threads(threads) schedule(static)
+#else
+    (void)threads;
+#endif
+    for (stripe = -8; stripe < h; stripe += 64) {
+        const int top = stripe < 0 ? 0 : stripe;
+        const int bottom = stripe+64 < h ? stripe+64 : h;
         const uint16_t* lines[68];
         for (int y = top-2; y < bottom+2; ++y) {
             const int inside_frame = y >= 0 && y < h;
@@ -80,26 +89,28 @@ int svt_av2_pcwiener_filter_y_boundaries(const uint16_t* src, ptrdiff_t src_stri
         }
         for (int left = 0;left < w;left += 64) {
             const int right = left + 64 < w ? left + 64 : w;
+            enum { pitch = 70 };
+            uint16_t padded[pitch * pitch];
+            for (int y=top-3; y<bottom+3; ++y) for (int x=left-3; x<right+3; ++x)
+                padded[(y-top+3)*pitch+x-left+3]=(uint16_t)sample(lines,x,y,w,top,bottom);
             for (int by = top;by < bottom;by += 4) {
                 for (int bx = left;bx < right;bx += 4) {
                     int32_t features[4] = {0,0,0,0};
                     int skipped = 0;
                     for (int fy = by - 1;fy <= by + 4;++fy) {
                         for (int fx = bx - 1;fx <= bx + 4;++fx) {
-                            const int center = 2 * sample(lines,fx,fy,w,top,bottom);
-                            const int up = sample(lines,fx,fy-1,w,top,bottom);
-                            const int down = sample(lines,fx,fy+1,w,top,bottom);
-                            features[1] += abs(up + down - center);
-                            features[2] += abs(sample(lines,fx+1,fy-1,w,top,bottom) +
-                                sample(lines,fx-1,fy+1,w,top,bottom) - center);
-                            features[3] += abs(sample(lines,fx-1,fy-1,w,top,bottom) +
-                                sample(lines,fx+1,fy+1,w,top,bottom) - center);
-                            const int tx = clamp_int(fx,left,right-1) / 4;
-                            const int ty = clamp_int(fy,top,bottom-1) / 4;
-                            const uint8_t skip = tskip[(ptrdiff_t)ty * tskip_stride + tx];
-                            if (skip > 1u) return -1;
-                            skipped += skip;
+                            const uint16_t* p = padded + (fy-top+3)*pitch + (fx-left+3);
+                            const int center = 2*p[0];
+                            features[1] += abs(p[-pitch] + p[pitch] - center);
+                            features[2] += abs(p[1-pitch] + p[pitch-1] - center);
+                            features[3] += abs(p[-1-pitch] + p[pitch+1] - center);
                         }
+                    }
+                    /* The 6x6 window covers 1,4,1 pixels in each of three skip cells. */
+                    const int col=bx/4, lo=clamp_int(col-1,left/4,right/4-1), hi=clamp_int(col+1,left/4,right/4-1);
+                    for (int j=-1; j<=1; ++j) {
+                        const uint8_t* row = tskip + (ptrdiff_t)clamp_int(by/4+j,top/4,bottom/4-1)*tskip_stride;
+                        skipped += (j==0 ? 4 : 1) * (row[lo]+4*row[col]+row[hi]);
                     }
                     skipped *= tskip_normalizer;
                     int lut = 0;
@@ -112,19 +123,28 @@ int svt_av2_pcwiener_filter_y_boundaries(const uint16_t* src, ptrdiff_t src_stri
                     const int16_t* filter = filters[selector[pc_wiener_lut_to_class_index[lut]]];
                     for (int y = by;y < by + 4;++y) {
                         for (int x = bx;x < bx + 4;++x) {
-                            int32_t v = (128 + filter[12]) * sample(lines,x,y,w,top,bottom);
-                            for (int k = 0;k < 12;++k)
-                                v += filter[k] * (sample(lines,x+dx[k],y+dy[k],w,top,bottom) +
-                                    sample(lines,x-dx[k],y-dy[k],w,top,bottom));
+                            const uint16_t* p = padded + (y-top+3)*pitch + (x-left+3);
+                            int32_t v = (128 + filter[12]) * p[0];
+                            for (int k = 0;k < 12;++k) {
+                                const int offset = dy[k]*pitch+dx[k];
+                                v += filter[k] * (p[offset] + p[-offset]);
+                            }
                             dst[(ptrdiff_t)y * dst_stride + x] = (uint16_t)clamp_int(round_signed(v,7u),0,max_sample);
                         }
                     }
                 }
             }
         }
-        top = bottom;
     }
     return 0;
+}
+
+int svt_av2_pcwiener_filter_y_boundaries(const uint16_t* src, ptrdiff_t src_stride,
+    uint16_t* dst, ptrdiff_t dst_stride, uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t base_q_idx, const uint8_t* tskip,
+    ptrdiff_t tskip_stride, const uint16_t* deblocked) {
+    return svt_av2_pcwiener_filter_y_parallel(src,src_stride,dst,dst_stride,width,height,
+        bit_depth,base_q_idx,tskip,tskip_stride,deblocked,1u);
 }
 
 int svt_av2_pcwiener_filter_y(const uint16_t* src, ptrdiff_t src_stride,

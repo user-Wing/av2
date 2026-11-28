@@ -98,6 +98,24 @@ SvtAv2Error svt_av2_reference_refresh_after_holds(SvtAv2ReferenceFrame* slot0,
     return refresh_pair_unchecked(slot0, slot1, reconstruction, frame_index, (refresh_mask & 2u) != 0u);
 }
 
+SvtAv2Error svt_av2_reference_refresh_anchor(SvtAv2ReferenceFrame* recent, SvtAv2ReferenceFrame* older,
+    const SvtAv2FrameBuffer* reconstruction, uint64_t frame_index, uint32_t held, int rotate) {
+    if (!recent || !older || !reconstruction || recent == older) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    if (held >= frame_index || !recent->valid || recent->frame_index != frame_index - held - 1u ||
+        recent->prepared_valid || older->prepared_valid ||
+        (older->valid && older->frame_index >= recent->frame_index)) return SVT_AV2_ERROR_INVALID_STATE;
+    SvtAv2ReferenceFrame* dest = rotate ? older : recent;
+    const SvtAv2Error error = stage_unchecked(dest, reconstruction, frame_index);
+    if (error != SVT_AV2_ERROR_NONE) return error;
+    publish_prepared(dest);
+    if (rotate) {
+        const SvtAv2ReferenceFrame saved = *recent;
+        *recent = *older;
+        *older = saved;
+    }
+    return SVT_AV2_ERROR_NONE;
+}
+
 SvtAv2Error svt_av2_reference_refresh_pair(SvtAv2ReferenceFrame* slot0,
     SvtAv2ReferenceFrame* slot1, const SvtAv2FrameBuffer* reconstruction,
     uint64_t frame_index, uint32_t period) {

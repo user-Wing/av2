@@ -64,6 +64,7 @@ typedef struct SvtAv2EntropyEncoder {
     uint32_t  rate_only;      /* M6: shared syntax, without arithmetic output */
     uint64_t  rate_q12;       /* sum of estimated -log2(CDF probability), 4096/bit */
     uint64_t  rate_symbols, rate_literal_bits;
+    struct SvtAv2EntropyTrial* trial; /* Lazy CDF copy for noncommitting rate trials. */
     struct SvtAv2EntropyModels* models; /* Adaptive formal/rate bank; NULL is frozen off. */
 } SvtAv2EntropyEncoder;
 

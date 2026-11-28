@@ -71,6 +71,10 @@ typedef struct SvtAv2EncoderContext {
     int                 recon_ready;  /* 1 = recon + scratch are live */
     SvtAv2TileCoeffBlock* coded_blocks;
     SvtAv2TileBlockMode* coded_modes;
+    uint32_t tile_columns;
+    int still_aq, block_gdf;
+    uint16_t* column_qindex; /* Borrowed during still-column reconstruction. */
+    uint32_t full_picture_width; /* Parent geometry for tiled mode selection. */
     uint32_t satd_angles;
     uint32_t m5_last_intra_mode;
     SvtAv2RdStats rd_stats;
@@ -99,10 +103,10 @@ typedef struct SvtAv2EncoderContext {
     uint8_t enable_ibp;
     uint8_t qm_scope;
     int8_t uv_delta_q;
-    uint8_t qm_level;
+    uint8_t qm_level, qm_uv_level; /* Zero UV override inherits luma. */
     uint8_t luma_compensation_scope;
     uint8_t source_cdef_scope;
-    uint8_t gdf_key, gdf_inter;
+    uint8_t gdf_key, gdf_inter, gdf_still_quality;
     SvtAv2FrameHeaderConfig still_tools_header;
     uint32_t dual_ref_period;
     uint32_t dual_ref_policy;
@@ -111,6 +115,9 @@ typedef struct SvtAv2EncoderContext {
     uint32_t previous_motion_q8, last_clean_frame;
     uint8_t quiet_frames, held_pictures;
     uint8_t motion_q;
+    uint8_t drawing_cadence;
+    uint8_t latest_slot;
+    uint32_t anchor_display, previous_anchor_display;
     uint16_t anchor_source[SVT_AV2_ANCHOR_GRID_COUNT];
     uint64_t inter_skip_trials, inter_skip_accepts;
     uint64_t inter_fine_trials, inter_fine_accepts;

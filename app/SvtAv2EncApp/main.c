@@ -43,6 +43,7 @@ typedef struct AppOptions {
     int32_t     video_anchor_qp;
     int32_t     preset;
     int32_t     threads;
+    int32_t     tile_columns;
     int32_t     frames; /* -1 = all frames in the source */
     int32_t     deterministic;
     SvtAv2PredictionStructure prediction_structure;
@@ -80,6 +81,7 @@ static void app_options_set_defaults(AppOptions* options) {
     options->qp = SVT_AV2_M1_DEFAULT_QP;
     options->preset = SVT_AV2_PRESET_SLOW;
     options->threads = 1;
+    options->tile_columns = 1;
     options->frames = -1;
     options->deterministic = 1;
     options->inter_ref_period = 1u;
@@ -143,7 +145,8 @@ static void print_usage(const char* program) {
            "  --key-qp <1..255>     Override the first KEY QP in low-delay P only (default: inherit --qp)\n"
            "  --anchor-qp <1..255>  Override QP on P frames refreshing the long slot (requires dual ref)\n"
            "  --preset <0|4|8|12>   Speed preset placeholder (default: 4)\n"
-           "  --threads <n>         Thread count; M4 only supports 1 (default: 1)\n"
+           "  --tile-columns <n>    Still-picture fast RD uniform tile columns: 1, 2, 4, 8 (default: 1)\n"
+           "  --threads <n>         Threads for still-picture fast RD angle search and GDF (default: 1)\n"
            "  --deterministic       Enable deterministic mode (default)\n"
            "  --no-deterministic    Disable deterministic mode\n"
            "  --verbose             Print per frame progress\n"
@@ -513,6 +516,16 @@ static int app_parse_args(int argc, char** argv, AppOptions* options) {
             ++i;
             continue;
         }
+        if (strcmp(arg, "--tile-columns") == 0) {
+            if (!has_next || parse_int32(value, &options->tile_columns) != 0 ||
+                (options->tile_columns != 1 && options->tile_columns != 2 &&
+                 options->tile_columns != 4 && options->tile_columns != 8)) {
+                fprintf(stderr, "error: --tile-columns requires 1, 2, 4, or 8\n");
+                return -1;
+            }
+            ++i;
+            continue;
+        }
         if (strcmp(arg, "--threads") == 0) {
             if (!has_next || parse_int32(value, &options->threads) != 0 || options->threads < 1) {
                 fprintf(stderr, "error: --threads requires a positive integer\n");
@@ -653,6 +666,20 @@ static int app_read_frame_payload(FILE* stream, uint8_t* buffer, size_t size) {
     return (fread(buffer, 1, size, stream) == size) ? 0 : -1;
 }
 
+/* Compare source luma in display order before deciding whether to read ahead.
+ * The grid and 8-bit scale match the encoder's anchor activity probe. */
+static int app_drawing_changed(const uint8_t* frame, uint32_t w, uint32_t h, unsigned bd, uint16_t grid[576]) {
+    uint32_t sad = 0u;
+    for (unsigned y = 0; y < 18u; ++y) for (unsigned x = 0; x < 32u; ++x) {
+        const size_t pos = (size_t)((2u*y+1u)*h/36u)*w + (2u*x+1u)*w/64u;
+        const uint16_t value = bd > 8u ? (uint16_t)(frame[2u*pos] | (frame[2u*pos+1u] << 8u)) : frame[pos];
+        const unsigned index = y*32u+x;
+        sad += (uint32_t)abs((int)value - grid[index]);
+        grid[index] = value;
+    }
+    return sad >= 2u*576u*(1u << (bd-8u));
+}
+
 /* Fills a SvtAv2Picture view over tightly packed supported YUV data held in a
  * single Y-then-U-then-V buffer (the Y4M layout). planes[] aliases into
  * `buffer`; strides are the plane widths in bytes. */
@@ -757,6 +784,10 @@ int main(int argc, char** argv) {
     }
     if (err == SVT_AV2_ERROR_NONE) {
         err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_THREADS, &threads);
+    }
+    if (err == SVT_AV2_ERROR_NONE) {
+        const uint32_t cols=(uint32_t)options.tile_columns;
+        err=svt_av2_enc_set_parameter(handle,SVT_AV2_PARAM_TILE_COLUMNS,&cols);
     }
     if (err == SVT_AV2_ERROR_NONE) {
         err = svt_av2_enc_set_parameter(handle, SVT_AV2_PARAM_DETERMINISTIC, &deterministic);
@@ -950,32 +981,64 @@ int main(int argc, char** argv) {
         }
     }
 
-    for (;;) {
+    const char* motion_profile = getenv("SVT_AV2_MOTION_Q");
+    unsigned lookahead = 0;
+    const int adaptive_group = motion_profile && !strcmp(motion_profile, "adaptive-gop");
+    uint16_t previous_grid[576] = {0};
+    if (adaptive_group || (motion_profile && !strcmp(motion_profile, "quartet-refs"))) lookahead = 3u;
+    else if (motion_profile && (!strcmp(motion_profile, "paired-anchor") || !strcmp(motion_profile, "paired-refs"))) lookahead = 1u;
+    const int paired = lookahead != 0u;
+    uint8_t* pending_input = paired && frame_bytes <= SIZE_MAX / lookahead ? (uint8_t*)malloc(frame_bytes * lookahead) : NULL;
+    uint8_t* pending_recon = paired && recon_output ? (uint8_t*)malloc(frame_bytes) : NULL;
+    unsigned next_midpoint = 0u, midpoints = 0u;
+    if (paired && (!pending_input || (recon_output && !pending_recon))) exit_code = 7;
+    while (!exit_code) {
         if (effective_limit >= 0 && (int32_t)frames_written >= effective_limit) {
             break;
         }
 
-        const int tag = app_read_frame_tag(input);
-        if (tag == 0) {
-            break; /* clean end of stream */
-        }
-        if (tag < 0) {
-            fprintf(stderr, "error: malformed frame tag in '%s'\n", options.input_path);
-            exit_code = 3;
-            break;
-        }
-        if (app_read_frame_payload(input, frame_buffer, frame_bytes) != 0) {
-            fprintf(stderr,
-                    "error: truncated frame %u in '%s'\n",
-                    frames_written,
-                    options.input_path);
-            exit_code = 3;
-            break;
+        uint32_t display = frames_written;
+        uint8_t* current = frame_buffer;
+        if (next_midpoint < midpoints) {
+            current = pending_input + frame_bytes * next_midpoint++;
+            display = frames_written - 1u;
+        } else {
+            const int tag = app_read_frame_tag(input);
+            if (!tag) break;
+            if (tag < 0) {
+                fprintf(stderr, "error: malformed frame tag in '%s'\n", options.input_path);
+                exit_code = 3;
+                break;
+            }
+            if (app_read_frame_payload(input, frame_buffer, frame_bytes) != 0) {
+                fprintf(stderr, "error: truncated frame %u in '%s'\n", frames_written, options.input_path);
+                exit_code = 3;
+                break;
+            }
+            next_midpoint = midpoints = 0u;
+            const uint32_t gop_index = frames_written % SVT_AV2_LOOKAHEAD_KEY_INTERVAL;
+            const int changed = !adaptive_group || app_drawing_changed(frame_buffer, y4m.width, y4m.height, y4m.bit_depth, previous_grid);
+            while (changed && gop_index && midpoints < lookahead && gop_index + midpoints + 1u < SVT_AV2_LOOKAHEAD_KEY_INTERVAL &&
+                   (effective_limit < 0 || frames_written + midpoints + 1u < (uint32_t)effective_limit)) {
+                const int next = app_read_frame_tag(input);
+                if (!next) break;
+                memcpy(pending_input + frame_bytes * midpoints, frame_buffer, frame_bytes);
+                if (next < 0 || app_read_frame_payload(input, frame_buffer, frame_bytes) != 0) {
+                    fprintf(stderr, "error: malformed or truncated future anchor in '%s'\n", options.input_path);
+                    exit_code = 3;
+                    break;
+                }
+                ++midpoints;
+            }
+            if (exit_code) break;
+            display += midpoints;
+            if (adaptive_group && midpoints)
+                app_drawing_changed(frame_buffer, y4m.width, y4m.height, y4m.bit_depth, previous_grid);
         }
 
         SvtAv2Picture picture;
-        app_fill_picture(&picture, frame_buffer, y4m.width, y4m.height, y4m.bit_depth, y4m.chroma_format);
-        picture.pts = (int32_t)frames_written;
+        app_fill_picture(&picture, current, y4m.width, y4m.height, y4m.bit_depth, y4m.chroma_format);
+        picture.pts = (int32_t)display;
 
         err = svt_av2_enc_send_picture(handle, &picture);
         if (err != SVT_AV2_ERROR_NONE) {
@@ -1076,8 +1139,10 @@ int main(int argc, char** argv) {
                 exit_code = 11;
                 break;
             }
-            if (recon.byte_count == 0 ||
-                fwrite(recon_buffer, 1, recon.byte_count, recon_output) != recon.byte_count) {
+            if (paired && recon.byte_count != frame_bytes) { exit_code = 11; break; }
+            if (display > frames_written) memcpy(pending_recon, recon_buffer, recon.byte_count);
+            else if (!recon.byte_count || fwrite(recon_buffer, 1, recon.byte_count, recon_output) != recon.byte_count ||
+                (display < frames_written && next_midpoint == midpoints && fwrite(pending_recon, 1, recon.byte_count, recon_output) != recon.byte_count)) {
                 fprintf(stderr,
                         "error: writing reconstruction for frame %u to '%s' failed\n",
                         frames_written,
@@ -1172,6 +1237,8 @@ int main(int argc, char** argv) {
     }
 
     free(packet);
+    free(pending_input);
+    free(pending_recon);
     free(recon_buffer);
     free(frame_buffer);
     fclose(input);
@@ -1210,7 +1277,7 @@ int main(int argc, char** argv) {
     printf("frames      : %u encoded\n", frames_written);
     printf("note        : %s, coded transform residuals\n",
            options.prediction_structure == SVT_AV2_PRED_LOW_DELAY_P
-               ? (options.dual_ref_policy == 3u ? "LOW_DELAY_P, block-selected LAST/LONG" :
+               ? (lookahead == 3u ? "four-picture group, three-picture lookahead" : paired ? "paired future anchors, one-picture lookahead" : options.dual_ref_policy == 3u ? "LOW_DELAY_P, block-selected LAST/LONG" :
                     "LOW_DELAY_P, single logical reconstructed reference") :
                  options.intra_mode_selection == 4u ? "SINGLE_PICTURE/directional Y + implicit CfL UV RD" :
                  options.intra_mode_selection == 3u ? "SINGLE_PICTURE/directional Y + basic UV RD" :

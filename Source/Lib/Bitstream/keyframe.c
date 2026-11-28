@@ -302,6 +302,42 @@ static int encode_sequence_header_ex(uint32_t width, uint32_t height,
     return 0;
 }
 
+int svt_av2_pack_still_columns(const SvtAv2FrameHeaderConfig* cfg, const SvtAv2ColumnPayload* cols,
+    uint8_t* out, size_t capacity, size_t* bytes) {
+    if (!cfg || !cols || !out || !bytes || cfg->tile_cols_log2>3u)
+        return SVT_AV2_BW_ERROR_RANGE;
+    size_t prefix=0;
+    int st=encode_sequence_header_ex(cfg->frame_width,cfg->frame_height,cfg->bit_depth,cfg->chroma_format,
+        0u,1u,1u,svt_av2_frame_header_use_cfl(cfg),cfg->enable_mrls,cfg->enable_mhccp,0u,cfg->enable_pc_wiener,0u,
+        cfg->enable_intra_ist,cfg->enable_intra_edge_filter,cfg->enable_ibp,0u,cfg->enable_gdf,cfg->uv_delta_q,
+        out,capacity,&prefix);
+    if (st) return st;
+    uint8_t* payload=(uint8_t*)malloc(capacity-prefix);
+    if (!payload) return SVT_AV2_BW_ERROR_NO_SPACE;
+    SvtAv2BitWriter group,bw;
+    svt_av2_bit_writer_init(&group,payload,capacity-prefix);
+    st=svt_av2_bit_writer_write_bit(&group,1u);
+    if (!st) st=svt_av2_frame_header_write(&group,cfg);
+    if (!st && cfg->tile_cols_log2) st=svt_av2_bit_writer_write_bit(&group,0u); /* all tiles in this group */
+    if (!st) st=svt_av2_bit_writer_byte_alignment(&group);
+    const uint32_t count=1u<<cfg->tile_cols_log2;
+    for (uint32_t i=0; !st && i<count; ++i) {
+        if (!cols[i].data || !cols[i].size || cols[i].size>UINT32_MAX) { st=SVT_AV2_BW_ERROR_RANGE; break; }
+        const uint32_t length=(uint32_t)(cols[i].size-1u);
+        if (i+1u<count)
+            for (unsigned j=0; !st && j<4; ++j)
+                st=svt_av2_bit_writer_write_byte(&group,(uint8_t)(length>>(8u*j)));
+        if (!st) st=svt_av2_bit_writer_write_bytes(&group,cols[i].data,cols[i].size);
+    }
+    if (!st) {
+        svt_av2_bit_writer_init(&bw,out+prefix,capacity-prefix);
+        st=svt_av2_obu_write(&bw,SVT_AV2_OBU_CLOSED_LOOP_KEY,0,payload,svt_av2_bit_writer_bytes_written(&group));
+        if (!st) *bytes=prefix+svt_av2_bit_writer_bytes_written(&bw);
+    }
+    free(payload);
+    return st;
+}
+
 int svt_av2_encode_sequence_header_multi(uint32_t width, uint32_t height,
     uint8_t* out, size_t out_cap, size_t* out_size) {
     return encode_sequence_header_ex(width, height, 8u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0, out, out_cap, out_size);
@@ -368,14 +404,14 @@ static int emit_frame_packet(const SvtAv2FrameHeaderConfig* cfg, uint32_t frame_
         (cfg->enable_cfl_intra && (!low_delay_p || end_models == NULL)))
         return SVT_AV2_BW_ERROR_RANGE;
     size_t prefix = 0u;
-    int st;
+    int st = 0;
     if (frame_index == 0u) {
         st = encode_sequence_header_ex(cfg->frame_width, cfg->frame_height, cfg->bit_depth,
             cfg->chroma_format, low_delay_p, !cfg->multi_frame, cfg->m5_intra_modes >= 2u,
             svt_av2_frame_header_use_cfl(cfg), cfg->enable_mrls, cfg->enable_mhccp,
             cfg->ccso64 != NULL, cfg->enable_pc_wiener, cfg->dual_ref, cfg->enable_intra_ist,
             cfg->enable_intra_edge_filter, cfg->enable_ibp, cfg->cdef_primary != 0u, cfg->enable_gdf, cfg->uv_delta_q, out, out_cap, &prefix);
-    } else {
+    } else if (cfg->paired_role != SVT_AV2_ONLY_MIDPOINT && cfg->paired_role != SVT_AV2_FIRST_MIDPOINT) {
         SvtAv2BitWriter delimiter;
         svt_av2_bit_writer_init(&delimiter, out, out_cap);
         st = svt_av2_obu_write(&delimiter, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0, NULL, 0);
@@ -401,6 +437,13 @@ static int emit_frame_packet(const SvtAv2FrameHeaderConfig* cfg, uint32_t frame_
         SvtAv2BitWriter bw;
         svt_av2_bit_writer_init(&bw, out + prefix, out_cap - prefix);
         st = svt_av2_obu_write(&bw, cfg->inter_frame ? SVT_AV2_OBU_REGULAR_TILE_GROUP : SVT_AV2_OBU_CLOSED_LOOP_KEY, 0, tile, tile_size);
+        if (st == 0 && (cfg->paired_role == SVT_AV2_ONLY_MIDPOINT || cfg->paired_role == SVT_AV2_LAST_MIDPOINT)) {
+            /* Sequence and MFH ID zero, physical slot of rank zero, derive order hint
+             * from the hidden anchor, then trailing_one_bit and zero padding. */
+            const uint8_t show_anchor = (uint8_t)(0xd8u | (cfg->reference_slot << 5u));
+            st = svt_av2_obu_write(&bw, SVT_AV2_OBU_TEMPORAL_DELIMITER, 0, NULL, 0);
+            if (!st) st = svt_av2_obu_write(&bw, SVT_AV2_OBU_REGULAR_SEF, 0, &show_anchor, 1);
+        }
         if (st == 0) {
             *out_size = prefix + svt_av2_bit_writer_bytes_written(&bw);
             if (end_models != NULL) *end_models = staged;

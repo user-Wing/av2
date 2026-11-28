@@ -41,6 +41,11 @@ target_link_libraries(svt_av2_encoder_core
         svt_av2_transform
         svt_av2_quantization)
 
+find_package(OpenMP QUIET COMPONENTS C)
+if(OpenMP_C_FOUND)
+    target_link_libraries(svt_av2_encoder_core PUBLIC OpenMP::OpenMP_C)
+endif()
+
 if(UNIX)
     target_link_libraries(svt_av2_encoder_core PRIVATE m)
 endif()

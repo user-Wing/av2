@@ -188,6 +188,26 @@ static void test_dual_ref_headers(void) {
             SVT_TEST_CHECK_EQ_INT(read_bits(dual, i + 2u, 1u), read_bits(legacy, i, 1u));
     }
     svt_av2_bit_writer_init(&bw, dual, sizeof(dual));
+    cfg.logical_ref_count = 2u;
+    for (uint32_t slot = 0; slot < 2u; ++slot) {
+        cfg.reference_slot = slot;
+        svt_av2_bit_writer_init(&bw, dual, sizeof(dual));
+        SVT_TEST_CHECK_EQ_INT(svt_av2_frame_header_write(&bw, &cfg), SVT_AV2_BW_OK);
+        SVT_TEST_CHECK_EQ_INT(read_bits(dual, 24u, 2u), slot ? 2u : 1u);
+    }
+    for (uint32_t role = SVT_AV2_HIDDEN_ANCHOR; role <= SVT_AV2_LAST_MIDPOINT; ++role) {
+        cfg.paired_role = role;
+        cfg.refresh_mask = role == SVT_AV2_HIDDEN_ANCHOR ? 2u : 0u;
+        svt_av2_bit_writer_init(&bw, dual, sizeof(dual));
+        SVT_TEST_CHECK_EQ_INT(svt_av2_frame_header_write(&bw, &cfg), SVT_AV2_BW_OK);
+        SVT_TEST_CHECK_EQ_INT(read_bits(dual, 3u, 1u), role != SVT_AV2_HIDDEN_ANCHOR);
+        cfg.refresh_mask ^= 2u;
+        svt_av2_bit_writer_init(&bw, dual, sizeof(dual));
+        SVT_TEST_CHECK_EQ_INT(svt_av2_frame_header_write(&bw, &cfg), SVT_AV2_BW_ERROR_RANGE);
+    }
+    cfg.paired_role = 0u;
+    cfg.logical_ref_count = 0u;
+    svt_av2_bit_writer_init(&bw, dual, sizeof(dual));
     cfg.refresh_mask = 4u;
     SVT_TEST_CHECK_EQ_INT(svt_av2_frame_header_write(&bw, &cfg), SVT_AV2_BW_ERROR_RANGE);
     cfg.refresh_mask = 1u;

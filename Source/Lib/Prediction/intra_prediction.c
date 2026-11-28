@@ -509,6 +509,24 @@ void svt_av2_intra_ibp_dc(const SvtAv2FrameBuffer* recon, const SvtAv2IntraBlock
     }
 }
 
+/* The AV2 blend weights depend only on the folded angle and two 0..15
+ * coordinates. Reuse them across blocks on each encoding worker. */
+static const uint8_t* ibp_direction_weights(unsigned folded) {
+    static _Thread_local uint8_t weights[85][16 * 16];
+    const unsigned angle = SVT_AV2_MAX(39u, folded);
+    uint8_t* table = weights[angle];
+    if (!table[0]) {
+        const unsigned step = intra_direction_derivative[90u - angle];
+        for (unsigned r = 0; r < 16; ++r) for (unsigned c = 0; c < 16; ++c) {
+            const unsigned distance = (c + 1u) * step;
+            uint32_t shift;
+            const uint32_t div = resolve_divisor_u32(((r + 1u) << 6) + distance, &shift);
+            table[r * 16 + c] = (uint8_t)round2_u32(distance * div, shift - SVT_AV2_DIV_LUT_BITS);
+        }
+    }
+    return table;
+}
+
 SvtAv2Error svt_av2_intra_directional_predict_tools(const SvtAv2FrameBuffer* recon,
     const SvtAv2IntraBlock* block, uint32_t mode, uint32_t top_right,
     uint32_t bottom_left, uint32_t top_filter, uint32_t left_filter, int ibp, uint8_t* dst, uint32_t stride) {
@@ -615,7 +633,7 @@ SvtAv2Error svt_av2_intra_directional_predict_tools(const SvtAv2FrameBuffer* rec
         (angle < 90 || angle > 180) && delta % 2 == 0 && (folded <= 36 || folded == 39 ||
         folded == 45 || folded == 51 || folded == 61 || folded == 67 || folded == 73 || folded == 84);
     const int second_step = blend ? intra_direction_derivative[90 - folded] : 0;
-    const int weight_step = blend ? intra_direction_derivative[90 - SVT_AV2_MAX(39, folded)] : 0;
+    const uint8_t* weights = blend ? ibp_direction_weights((unsigned)folded) : NULL;
     for (uint32_t y = 0u; y < block->h; ++y) {
         for (uint32_t x = 0u; x < block->w; ++x) {
             int32_t position;
@@ -662,10 +680,7 @@ SvtAv2Error svt_av2_intra_directional_predict_tools(const SvtAv2FrameBuffer* rec
                 }
                 const uint32_t r = row >> ((zone1 ? block->h : block->w) >> 5);
                 const uint32_t c = col >> ((zone1 ? block->w : block->h) >> 5);
-                const uint32_t distance = (c + 1u) * weight_step;
-                uint32_t shift;
-                const uint32_t div = resolve_divisor_u32(((r + 1u) << 6) + distance, &shift);
-                const int w = (int)round2_u32(distance * div, shift - SVT_AV2_DIV_LUT_BITS);
+                const int w = weights[r * 16u + c];
                 value = (value * w + second * (128 - w) + 64) >> 7;
             }
             svt_av2_sample_store(dst + (size_t)y * stride + x * step, recon->bit_depth, (uint16_t)value);
@@ -715,10 +730,9 @@ static uint32_t cfl_sample(const SvtAv2FrameBuffer* recon, uint32_t plane,
         recon->bit_depth);
 }
 
-static SvtAv2Error intra_cfl_predict(const SvtAv2FrameBuffer* recon,
-    const SvtAv2IntraBlock* block, uint32_t sb_size, uint8_t* dst,
-    uint32_t stride, int32_t* alpha_q8, int32_t explicit_alpha_q3, uint32_t explicit_alpha) {
-    if (recon == NULL || block == NULL || dst == NULL || block->plane < 1u || block->plane > 2u ||
+static SvtAv2Error cfl_parameters(const SvtAv2FrameBuffer* recon, const SvtAv2IntraBlock* block,
+    uint32_t sb_size, uint32_t* average_luma, uint32_t* chroma_dc, int32_t* implicit_alpha) {
+    if (recon == NULL || block == NULL || block->plane < 1u || block->plane > 2u ||
         (recon->bit_depth != 8u && recon->bit_depth != 10u) ||
         (recon->chroma_format != SVT_AV2_CHROMA_420 && recon->chroma_format != SVT_AV2_CHROMA_444) ||
         (block->w != block->h && !((block->w == 4u && block->h == 8u) ||
@@ -732,8 +746,6 @@ static SvtAv2Error intra_cfl_predict(const SvtAv2FrameBuffer* recon,
         validate_block(block, svt_av2_picture_plane_width(recon, block->plane),
             svt_av2_picture_plane_height(recon, block->plane)) != SVT_AV2_ERROR_NONE)
         return SVT_AV2_ERROR_INVALID_PARAMETER;
-    const uint32_t step = recon->bit_depth > 8u ? 2u : 1u;
-    if (stride < block->w * step) return SVT_AV2_ERROR_INVALID_PARAMETER;
     const uint32_t sub = recon->chroma_format == SVT_AV2_CHROMA_420 ? 1u : 0u;
     const uint32_t lx = block->x << sub, ly = block->y << sub;
     if ((block->w << sub) > sb_size || (block->h << sub) > sb_size)
@@ -772,6 +784,9 @@ static SvtAv2Error intra_cfl_predict(const SvtAv2FrameBuffer* recon,
         1u << (recon->bit_depth+2u);
     const uint32_t dc = count ? SVT_AV2_MIN(approx_divide_u32(sum_c,count), (1u << recon->bit_depth)-1u) :
         1u << (recon->bit_depth-1u);
+    *average_luma = avg_l;
+    *chroma_dc = dc;
+    if (!implicit_alpha) return SVT_AV2_ERROR_NONE;
     int32_t sx = 0, sy = 0, sxx = 0, sxy = 0, samples = 0;
     const uint32_t both_edges = block->x && block->y;
     const uint32_t refs = both_edges && block->w <= 2u * block->h && block->h <= 2u * block->w ? 4u : 8u;
@@ -788,24 +803,70 @@ static SvtAv2Error intra_cfl_predict(const SvtAv2FrameBuffer* recon,
             sx += a; sy += c; sxx += a*a; sxy += a*c; ++samples;
         }
     }
-    int32_t alpha = 0;
-    if (samples && !explicit_alpha) alpha = cfl_derive_alpha(sxy-(int32_t)((int64_t)sx*sy/samples),
-        (uint32_t)(sxx-(int32_t)((int64_t)sx*sx/samples)));
-    if (explicit_alpha) alpha = explicit_alpha_q3 * 32;
-    for (uint32_t y = 0u; y < block->h; ++y) {
-        for (uint32_t x = 0u; x < block->w; ++x) {
-            const uint32_t px = lx + (x << sub), py = ly + (y << sub);
-            const uint32_t luma = sub ?
-                (cfl_sample(recon,0u,px,py) + cfl_sample(recon,0u,px+1u,py) +
-                 cfl_sample(recon,0u,px,py+1u) + cfl_sample(recon,0u,px+1u,py+1u)) * 2u :
-                cfl_sample(recon,0u,px,py) * 8u;
-            const int32_t scaled = alpha * ((int32_t)luma - (int32_t)avg_l);
-            const int32_t delta = scaled < 0 ? -(int32_t)round2_u32((uint32_t)-scaled,11u) :
-                (int32_t)round2_u32((uint32_t)scaled,11u);
-            svt_av2_sample_store(dst+(size_t)y*stride+x*step,recon->bit_depth,clip1((int32_t)dc+delta,recon->bit_depth));
-        }
+    *implicit_alpha = samples ? cfl_derive_alpha(sxy-(int32_t)((int64_t)sx*sy/samples),
+        (uint32_t)(sxx-(int32_t)((int64_t)sx*sx/samples))) : 0;
+    return SVT_AV2_ERROR_NONE;
+}
+
+static inline int cfl_luma_q3(const SvtAv2FrameBuffer* recon, uint32_t x, uint32_t y, uint32_t sub) {
+    const uint32_t px = x << sub, py = y << sub;
+    return sub ? (cfl_sample(recon,0u,px,py) + cfl_sample(recon,0u,px+1u,py) +
+                  cfl_sample(recon,0u,px,py+1u) + cfl_sample(recon,0u,px+1u,py+1u)) * 2 :
+                 cfl_sample(recon,0u,px,py) * 8;
+}
+
+static inline uint16_t cfl_pixel(int dc, int scaled, uint32_t depth) {
+    const int delta = scaled < 0 ? -(int)round2_u32((unsigned)-scaled,11u) :
+        (int)round2_u32((unsigned)scaled,11u);
+    return clip1(dc + delta, depth);
+}
+
+static SvtAv2Error intra_cfl_predict(const SvtAv2FrameBuffer* recon,
+    const SvtAv2IntraBlock* block, uint32_t sb_size, uint8_t* dst,
+    uint32_t stride, int32_t* alpha_q8, int32_t explicit_alpha_q3, uint32_t explicit_alpha) {
+    if (!dst || !recon || !block) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    const uint32_t step = recon->bit_depth > 8u ? 2u : 1u;
+    if (stride < (uint64_t)block->w * step) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    uint32_t avg_l, dc;
+    int32_t alpha = explicit_alpha_q3 * 32;
+    SvtAv2Error error = cfl_parameters(recon, block, sb_size, &avg_l, &dc, explicit_alpha ? NULL : &alpha);
+    if (error) return error;
+    const uint32_t sub = recon->chroma_format == SVT_AV2_CHROMA_420;
+    for (uint32_t y=0; y<block->h; ++y) for (uint32_t x=0; x<block->w; ++x) {
+        const int ac = cfl_luma_q3(recon, block->x+x, block->y+y, sub) - (int)avg_l;
+        svt_av2_sample_store(dst+(size_t)y*stride+x*step,recon->bit_depth,cfl_pixel((int)dc, alpha*ac, recon->bit_depth));
     }
     if (alpha_q8) *alpha_q8 = alpha;
+    return SVT_AV2_ERROR_NONE;
+}
+
+SvtAv2Error svt_av2_intra_cfl_rank(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* recon,
+    const SvtAv2IntraBlock* block, int8_t ranked[2]) {
+    if (!source || !recon || !ranked || source->bit_depth != recon->bit_depth ||
+        source->chroma_format != recon->chroma_format || source->visible_width != recon->visible_width ||
+        source->visible_height != recon->visible_height) return SVT_AV2_ERROR_INVALID_PARAMETER;
+    uint32_t avg_l, dc;
+    SvtAv2Error error = cfl_parameters(recon, block, 64u, &avg_l, &dc, NULL);
+    if (error) return error;
+    const uint32_t sub = recon->chroma_format == SVT_AV2_CHROMA_420;
+    /* Even 64x64 at 10 bits fits in an unsigned 32-bit SSE accumulator. */
+    uint32_t scores[17] = {0};
+    for (uint32_t y=0; y<block->h; ++y) for (uint32_t x=0; x<block->w; ++x) {
+        const int ac = cfl_luma_q3(recon, block->x+x, block->y+y, sub) - (int)avg_l;
+        const int orig = cfl_sample(source, block->plane, block->x+x, block->y+y);
+        for (int a=-8; a<=8; ++a) {
+            const int diff = orig - cfl_pixel((int)dc, a*32*ac, recon->bit_depth);
+            scores[a+8] += (uint32_t)(diff*diff);
+        }
+    }
+    unsigned first = 0, second = 1;
+    if (scores[1] < scores[0]) { first = 1; second = 0; }
+    for (unsigned i=2; i<17; ++i) {
+        if (scores[i] < scores[first]) { second = first; first = i; }
+        else if (scores[i] < scores[second]) second = i;
+    }
+    ranked[0] = (int8_t)((int)first-8);
+    ranked[1] = (int8_t)((int)second-8);
     return SVT_AV2_ERROR_NONE;
 }
 

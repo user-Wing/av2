@@ -651,6 +651,25 @@ static void list_tests(void) {
             for (unsigned position = 0u; position < 3u; ++position) {
                 SvtAv2BlockView block = {0}; block.x = position * 8u; block.y = position * 8u;
                 block.w = block.h = 16u;
+                if (pattern == 2u && position == 1u) {
+                    SvtAv2MotionField field = {0};
+                    field.velocity[SVT_AV2_ME_FIELD_ROWS / 2u][SVT_AV2_ME_FIELD_COLS / 2u] =
+                        (SvtAv2MotionVector){20, -12};
+                    SvtAv2MotionSearchResult result = {{0, 0}, UINT64_MAX, 0u};
+                    svt_av2_motion_temporal(&source, &reference, &block, &field, 9u, 16, &result);
+                    SVT_TEST_CHECK_EQ_INT(result.candidates, 0u);
+                    svt_av2_motion_temporal(&source, &reference, &block, &field, 2u, 16, &result);
+                    SVT_TEST_CHECK_EQ_INT(result.sad, 0u);
+                    SVT_TEST_CHECK_EQ_INT(result.mv.mv_x, 5);
+                    SVT_TEST_CHECK_EQ_INT(result.mv.mv_y, -3);
+                    field.velocity[SVT_AV2_ME_FIELD_ROWS / 2u][SVT_AV2_ME_FIELD_COLS / 2u] =
+                        (SvtAv2MotionVector){-20, 12};
+                    result = (SvtAv2MotionSearchResult){{0, 0}, UINT64_MAX, 0u};
+                    svt_av2_motion_temporal(&source, &reference, &block, &field, -2, 16, &result);
+                    SVT_TEST_CHECK_EQ_INT(result.sad, 0u);
+                    SVT_TEST_CHECK_EQ_INT(result.mv.mv_x, 5);
+                    SVT_TEST_CHECK_EQ_INT(result.mv.mv_y, -3);
+                }
                 FullCandidate oracle[289]; size_t n = 0u;
                 for (int32_t y = -8; y <= 8; ++y)
                     for (int32_t x = -8; x <= 8; ++x) {
@@ -722,7 +741,7 @@ static void check_projected_motion_parity(void) {
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &second, &bad, 1u),
         SVT_AV2_ENTROPY_ERROR_RANGE);
     SVT_TEST_CHECK(enc.rate_q12 == before && enc.rate_symbols == symbols && !motion.cells[right].valid);
-    const SvtAv2BlockView unsupported[] = {{64,0,4,4,NULL}, {68,0,16,16,NULL}, {64,0,16,32,NULL}};
+    const SvtAv2BlockView unsupported[] = {{64,0,4,4,NULL}, {68,0,16,16,NULL}, {64,16,16,32,NULL}, {64,0,32,8,NULL}};
     for (uint32_t i = 0u; i < sizeof(unsupported) / sizeof(unsupported[0]); ++i) {
         SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &unsupported[i], &exact, 1u),
             SVT_AV2_ENTROPY_ERROR_RANGE);
@@ -739,6 +758,24 @@ static void check_projected_motion_parity(void) {
     const SvtAv2TileBlockMode edge_mode = {1u,px,py,0u};
     SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &edge, &edge_mode, 1u), 0);
     SVT_TEST_CHECK(motion.cells[edge.x / 4u].valid && !motion.cells[edge.x / 4u].is_new);
+    const SvtAv2BlockView rectangles[] = {{64,32,16,32,NULL}, {96,48,32,16,NULL}};
+    for (unsigned i = 0; i < 2u; ++i) {
+        const SvtAv2BlockView* b = &rectangles[i];
+        SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, b, i, NULL, &px, &py), 0);
+        const SvtAv2TileBlockMode mode = {1u,px,py,i};
+        SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, b, &mode, 1u), 0);
+        for (unsigned y = b->y; y < b->y + b->h; y += 4u)
+            for (unsigned x = b->x; x < b->x + b->w; x += 4u) {
+                const SvtAv2MotionCell* cell = &motion.cells[(y / 4u) * motion.cols + x / 4u];
+                SVT_TEST_CHECK(cell->valid && cell->is_inter == i + 1u && cell->mv_x == px && cell->mv_y == py);
+            }
+    }
+    motion.wide_motion = 1u;
+    const SvtAv2BlockView wide_block = {96,0,16,16,NULL};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_predict(&motion, &wide_block, 0u, NULL, &px, &py), 0);
+    const SvtAv2TileBlockMode wide_mode = {1u, 240 + abs(px % 2), -240 + abs(py % 2), 0u};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_motion_write_block(&motion, &enc, &wide_block, &wide_mode, 0), 0);
+    SVT_TEST_CHECK_EQ_INT(motion.cells[wide_block.x / 4u].mv_x, wide_mode.mv_x);
     svt_av2_motion_syntax_free(&motion);
 }
 

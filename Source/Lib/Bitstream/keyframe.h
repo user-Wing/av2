@@ -33,6 +33,14 @@
 extern "C" {
 #endif
 
+typedef struct SvtAv2ColumnPayload {
+    const uint8_t* data;
+    size_t size;
+} SvtAv2ColumnPayload;
+
+int svt_av2_pack_still_columns(const SvtAv2FrameHeaderConfig* cfg, const SvtAv2ColumnPayload* cols,
+    uint8_t* out, size_t capacity, size_t* bytes);
+
 /* Normal adaptive low-delay KEY/P. Returns the raw end bank only on full
  * packet success; caller may then verify, decay, and publish it. */
 int svt_av2_encode_packet_video_models(const SvtAv2FrameHeaderConfig* cfg, uint32_t frame_index,

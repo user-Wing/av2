@@ -27,8 +27,8 @@ static int quniform(SvtAv2EntropyEncoder* e, uint32_t n, uint32_t value) {
     return st != 0 ? st : literal(e, (value - m) & 1u, 1u);
 }
 static int motion_write_difference(SvtAv2EntropyEncoder* e, int32_t dx, int32_t dy,
-    uint32_t mv_half) {
-    const int32_t limit = mv_half == 2u ? 128 : mv_half ? 64 : 32;
+    uint32_t mv_half, int wide) {
+    const int32_t limit = mv_half == 2u ? svt_av2_motion_q3_limit(wide) : mv_half ? 64 : 32;
     if (dx < -limit || dx > limit || dy < -limit || dy > limit)
         return SVT_AV2_ENTROPY_ERROR_RANGE;
     const uint32_t x = (uint32_t)abs(dx), y = (uint32_t)abs(dy), shell = x + y;
@@ -87,7 +87,7 @@ static int motion_write_difference(SvtAv2EntropyEncoder* e, int32_t dx, int32_t 
     return st;
 }
 int svt_av2_motion_write_difference(SvtAv2EntropyEncoder* e, int32_t dx, int32_t dy) {
-    return motion_write_difference(e, dx, dy, 0u);
+    return motion_write_difference(e, dx, dy, 0u, 0);
 }
 int svt_av2_motion_syntax_init(SvtAv2MotionSyntax* s, uint32_t w, uint32_t h) {
     return svt_av2_motion_syntax_init_precision(s, w, h, 0u);
@@ -164,13 +164,14 @@ int svt_av2_motion_predict(const SvtAv2MotionSyntax* s, const SvtAv2BlockView* b
         const SvtAv2MotionCell* candidate = candidates[i];
         if (candidate == NULL || !candidate->is_inter) continue;
         if (!projected || candidate->is_inter == reference_plus_one) { first = candidate; break; }
-        if (first == NULL) first = candidate;
+        /* AVM derives spatial predictors only from references on the same temporal side. */
+        if (!s->opposite_directions && first == NULL) first = candidate;
     }
     if (first != NULL) {
         px = first->mv_x; py = first->mv_y;
         if (projected && first->is_inter != reference_plus_one) {
             const uint32_t from = s->ref_distance[first->is_inter - 1u], to = s->ref_distance[rank];
-            if (!svt_av2_mvp_project_q3(px, to, from, &px) || !svt_av2_mvp_project_q3(py, to, from, &py))
+            if (!svt_av2_mvp_project_q3_range(s->wide_motion, px, to, from, &px) || !svt_av2_mvp_project_q3_range(s->wide_motion, py, to, from, &py))
                 return SVT_AV2_ENTROPY_ERROR_RANGE;
         }
     }
@@ -189,17 +190,20 @@ int svt_av2_motion_predict(const SvtAv2MotionSyntax* s, const SvtAv2BlockView* b
 int svt_av2_motion_write_block(SvtAv2MotionSyntax* s, SvtAv2EntropyEncoder* e,
     const SvtAv2BlockView* b, const SvtAv2TileBlockMode* m, uint32_t skip_txfm) {
     const int projected = s->two_refs && s->ref_distance[0] != 0u;
-    const int32_t limit = projected ? 128 : s->mv_half == 2u ? 64 : s->mv_half ? 32 : 16;
+    const int32_t q3_limit = svt_av2_motion_q3_limit(s->wide_motion);
+    const int32_t limit = projected ? q3_limit : s->mv_half == 2u ? q3_limit / 2 : s->mv_half ? 32 : 16;
     if (m->is_inter > 1u || m->mv_x < -limit || m->mv_x > limit || m->mv_y < -limit || m->mv_y > limit)
         return SVT_AV2_ENTROPY_ERROR_RANGE;
     const uint32_t rank = s->two_refs ? m->reference_rank : 0u;
     if (s->two_refs && (rank > m->is_inter || ((!projected || !m->is_inter) && (m->mv_x || m->mv_y))))
         return SVT_AV2_ENTROPY_ERROR_RANGE;
-    /* Oracle-covered, aligned nominal 64/32/16 squares only. Visible-edge
-     * groups may use intra, whose reconstruction and context do not project. */
-    if (projected && m->is_inter && (s->mv_half != 2u || b->w != b->h ||
-        (b->w != 8u && b->w != 16u && b->w != 32u && b->w != 64u) || b->x % b->w != 0u || b->y % b->h != 0u))
-        return SVT_AV2_ENTROPY_ERROR_RANGE;
+    if (projected && m->is_inter) {
+        const int square = b->w == b->h &&
+            (b->w == 8u || b->w == 16u || b->w == 32u || b->w == 64u);
+        const int rect = (b->w == 32u && b->h == 16u) || (b->w == 16u && b->h == 32u);
+        if (s->mv_half != 2u || !(square || rect) || b->x % b->w || b->y % b->h)
+            return SVT_AV2_ENTROPY_ERROR_RANGE;
+    }
     const uint8_t reference_plus_one = m->is_inter ? (uint8_t)(1u + rank) : 0u;
     const int32_t x = (int32_t)(b->x / 4u), y = (int32_t)(b->y / 4u);
     const int32_t w = (int32_t)(b->w / 4u), h = (int32_t)(b->h / 4u);
@@ -223,7 +227,7 @@ int svt_av2_motion_write_block(SvtAv2MotionSyntax* s, SvtAv2EntropyEncoder* e,
         const int pred = svt_av2_motion_predict(s, b, rank, NULL, &px, &py);
         if (pred != 0) return pred;
         if (projected) {
-            if (!svt_av2_mvp_quarter_delta(m->mv_x, px, &dx) || !svt_av2_mvp_quarter_delta(m->mv_y, py, &dy))
+            if (!svt_av2_mvp_quarter_delta_range(s->wide_motion, m->mv_x, px, &dx) || !svt_av2_mvp_quarter_delta_range(s->wide_motion, m->mv_y, py, &dy))
                 return SVT_AV2_ENTROPY_ERROR_RANGE;
         } else {
             dx = m->mv_x - px; dy = m->mv_y - py;
@@ -256,7 +260,7 @@ int svt_av2_motion_write_block(SvtAv2MotionSyntax* s, SvtAv2EntropyEncoder* e,
     if (st == 0 && m->is_inter) st = svt_av2_entropy_encode_model(e, SVT_AV2_MODEL_INTER_MODE + ctx, mode_cdf[ctx], 3u, is_new ? 2u : 0u);
     if (st == 0 && m->is_inter) st = symbol(e, drl_cdf[ctx], SVT_AV2_MODEL_DRL + ctx, 0u);
     if (st == 0 && is_new)
-        st = motion_write_difference(e, dx, dy, s->mv_half);
+        st = motion_write_difference(e, dx, dy, s->mv_half, s->wide_motion);
     if (st == 0) {
         SvtAv2MotionCell value = {m->mv_x,m->mv_y,1u,reference_plus_one,(uint8_t)is_new,(uint8_t)skip_txfm};
         for (int32_t yy = y; yy < y+h; ++yy)

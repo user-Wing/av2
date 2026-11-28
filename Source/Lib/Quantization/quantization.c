@@ -8,6 +8,7 @@
 #include "quantization_internal.h"
 #include "qm12_data.h"
 #include "qm_search_data.h"
+#include "qm_curve_data.h"
 
 #include <string.h>
 
@@ -279,9 +280,15 @@ SvtAv2QuantStatus svt_av2_quant_params_init_matrix(SvtAv2QuantParams* params,
     const uint32_t w = width < 32u ? width : 32u, h = height < 32u ? height : 32u;
     const unsigned col = (w >= 8u) + (w >= 16u) + (w >= 32u);
     const unsigned row = (h >= 8u) + (h >= 16u) + (h >= 32u);
-    if (qm_level != 4 && qm_level != 8 && qm_level != 12) return SVT_AV2_QUANT_ERR_UNSUPPORTED;
-    params->inverse_matrix = qm_level == 4 ? qm4_inverse : qm_level == 8 ? qm8_inverse : qm12_inverse;
+    static const uint8_t (*const matrices[])[3600] = {
+        NULL, NULL, qm2_inverse, qm3_inverse, qm4_inverse, qm5_inverse, qm6_inverse,
+        qm7_inverse, qm8_inverse, qm9_inverse, qm10_inverse, NULL, qm12_inverse
+    };
+    if ((unsigned)qm_level >= sizeof(matrices) / sizeof(matrices[0]) || !matrices[qm_level])
+        return SVT_AV2_QUANT_ERR_UNSUPPORTED;
+    params->inverse_matrix = matrices[qm_level];
     params->qm_offset = qm12_offsets[col][row];
+    params->qm_width = (uint8_t)w;
     params->qm_size = (uint16_t)(w * h);
     return SVT_AV2_QUANT_OK;
 }
@@ -523,8 +530,60 @@ static SvtAv2QuantStatus quantize_block_impl(const SvtAv2QuantParams* params,
     if (params->qm_size) {
         int32_t levels[1024];
         const uint8_t* inverse = params->inverse_matrix[plane != 0] + params->qm_offset;
+#if defined(SVT_AV2_HAVE_QUANT_AVX2)
+        if (kernel && params->matrix_rounding == 1u &&
+            svt_av2_quantize_matrix_levels_avx2(&coeffs, inverse, coeff, levels, count)) {
+            memcpy(qcoeff, levels, count * sizeof(*levels));
+            return svt_av2_dequantize_block(params, qcoeff, dqcoeff, count, plane);
+        }
+#endif
+        if (params->matrix_rounding == 2u) {
+            /* AV2 DCT scan walks anti-diagonals bottom-left to top-right.
+             * The EOB bias is stricter than the in-run significance bias. */
+            const unsigned w=params->qm_width, h=(unsigned)count/w;
+            uint16_t trailing[1024];
+            size_t tail=0;
+            unsigned in_run=1;
+            for (unsigned d=0;d<w+h-1u;++d) {
+                const unsigned start=d<h?d:h-1u, stop=d<w?0u:d-w+1u;
+                for (unsigned row=start+1u;row-- > stop;) {
+                    const unsigned pos=row*w+d-row;
+                    const int step=(coeffs.dequant_QTX[pos!=0]*inverse[pos]+16)>>SVT_AV2_AVM_QM_BITS;
+                    const int64_t mag=coeff[pos]<0?-(int64_t)coeff[pos]:coeff[pos];
+                    const int64_t scaled=mag<<(SVT_AV2_QUANT_TABLE_BITS+log_scale);
+                    const int64_t floor_level=scaled/step;
+                    const int bias=pos==0 || floor_level>1u-in_run?109:98;
+                    const int64_t level=floor_level+(scaled+((int64_t)step*bias>>8)>=(floor_level+1)*step);
+                    if (level>coeffs.max_level) return SVT_AV2_QUANT_ERR_LEVEL_OVERFLOW;
+                    levels[pos]=coeff[pos]<0?-(int32_t)level:(int32_t)level;
+                    if (!pos) continue;
+                    if (!level) in_run=0;
+                    else {
+                        if (level>1) in_run=1;
+                        if (scaled+((int64_t)step*88>>8)>=step) tail=0;
+                        else trailing[tail++]=(uint16_t)pos;
+                    }
+                }
+            }
+            while (tail) levels[trailing[--tail]]=0;
+            memcpy(qcoeff,levels,count*sizeof(*levels));
+            return svt_av2_dequantize_block(params,qcoeff,dqcoeff,count,plane);
+        }
         for (size_t i = 0u; i < count; ++i) {
             const int idx = i != 0u;
+            if (params->matrix_rounding) {
+                /* Use the decoder's frequency-specific step. The smaller first AC
+                 * offset reflects the extra cost of opening a nonzero coefficient. */
+                const int step = (coeffs.dequant_QTX[idx] * inverse[i] + 16) >> SVT_AV2_AVM_QM_BITS;
+                const int64_t mag = coeff[i] < 0 ? -(int64_t)coeff[i] : coeff[i];
+                const int64_t scaled = mag << (SVT_AV2_QUANT_TABLE_BITS + log_scale);
+                const int bias = idx && scaled < step ? 98 : 109;
+                const int64_t rounded = scaled + ((int64_t)step * bias >> 8);
+                const int64_t level = rounded < step ? 0 : rounded / step;
+                if (level > coeffs.max_level) return SVT_AV2_QUANT_ERR_LEVEL_OVERFLOW;
+                levels[i] = coeff[i] < 0 ? -(int32_t)level : (int32_t)level;
+                continue;
+            }
             const int weight = qm_reciprocal[inverse[i]];
             const int64_t mag = coeff[i] < 0 ? -(int64_t)coeff[i] : coeff[i];
             int64_t level = 0;

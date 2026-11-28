@@ -74,15 +74,61 @@ def encoder_command(encoder, source, output, qp, content, profile, width, height
     return selected, model, command
 
 
+def quality_settings(width, content, *, rounding):
+    matrix = content == 'animation' or width == 1920
+    settings = dict(SVT_AV2_GDF='still-quality', SVT_AV2_RECT_RDOQ='1', SVT_AV2_IBP='1',
+                    SVT_AV2_STILL_EDGE_FILTER='1', SVT_AV2_STILL_UV_RD='0', SVT_AV2_INTRA_IST='off',
+                    SVT_AV2_SSIM_RD='off', SVT_AV2_LUMA_COMPENSATION='off', SVT_AV2_DCT64_MATCH='key',
+                    SVT_AV2_QM12='all' if matrix else 'off', SVT_AV2_UV_DELTA_Q='-23')
+    if matrix:
+        settings['SVT_AV2_QM_LEVEL'] = '4' if width == 1920 else '8'
+    if rounding:
+        settings['SVT_AV2_FP_ROUND'] = 'matrix'
+    return settings
+
+
+def deep_matrix_settings(width, content):
+    settings = quality_settings(width, content, rounding=True)
+    screened = width == 3840 and content == 'real'
+    settings.update(SVT_AV2_QM12='all', SVT_AV2_QM_LEVEL='12' if screened else '8')
+    if not screened:
+        settings.update(SVT_AV2_STILL_RECT_RD='deep', SVT_AV2_UV_DELTA_Q='-8')
+    return settings, screened
+
+
+def calibration_choices(width, content, *, rectangles=False):
+    base = quality_settings(width, content, rounding=True)
+    choices = {'quality': quality_settings(width, content, rounding=False), 'round': base}
+    for name, level, delta in [('matrix4', 4, -23), ('matrix8', 8, -23), ('matrix12', 12, -23),
+                               ('uv8', None, -8), ('uv0', None, 0), ('uv8m8', 8, -8)]:
+        settings = dict(base, SVT_AV2_UV_DELTA_Q=str(delta))
+        if level is not None:
+            settings.update(SVT_AV2_QM12='all', SVT_AV2_QM_LEVEL=str(level))
+        choices[name] = settings
+    if rectangles:
+        for name in ('uv0', 'uv8m8'):
+            choices['rect-' + name] = dict(choices[name], SVT_AV2_STILL_SEARCH='rect', SVT_AV2_STILL_RECT_RD='deep')
+    return choices
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('input', 'output', 'encoder'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--qp', type=int, required=True)
+    parser.add_argument('--tile-columns', type=int, choices=(1, 2, 4, 8), help='uniform columns for parallel still encoding')
+    parser.add_argument('--threads', type=int, choices=range(1, 65), metavar='1..64')
     parser.add_argument('--recon', type=Path)
     parser.add_argument('--content-type', choices=('auto', 'animation', 'real'), default='auto')
     parser.add_argument('--profile', choices=('auto', 'animation', 'photo'), default='auto')
     search = parser.add_mutually_exclusive_group()
+    search.add_argument('--content-matrix', action='store_true', help='deep rectangles on animation, screened QM4/QM12 on HD/UHD live action')
+    search.add_argument('--deep-matrix', action='store_true', help='deep rectangle search with QM8, or screened QM12 for 2160p live action')
+    search.add_argument('--directional-matrix', action='store_true', help='directional tree candidate and unit-level PC-Wiener, four columns and four threads by default')
+    search.add_argument('--balanced-matrix', action='store_true', help='limit partition, angle and reference-line search in the matrix profile')
+    search.add_argument('--quality-calibration', type=Path, help='apply the calibration for this source frame')
+    search.add_argument('--quality-matrix', action='store_true', help='use still-quality GDF and frequency-specific quantizer rounding')
+    search.add_argument('--quality-gdf', action='store_true', help='use still-picture GDF model offset 3, resolution-based strength and UV delta -23')
     search.add_argument('--fusion-gdf', action='store_true', help='use screened trees, resolution-based matrices and UV delta -8')
     search.add_argument('--fast-gdf', action='store_true', help='use screened mixed8 trees and single-pass restoration')
     search.add_argument('--deep-gdf', nargs='?', const='base', choices=('base', 'qm12'),
@@ -91,6 +137,8 @@ def main():
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--classifier-dir', type=Path, default=Path(__file__).parent / 'public-classifier')
     args = parser.parse_args()
+    args.tile_columns = args.tile_columns or (4 if args.directional_matrix else 1)
+    args.threads = args.threads or (args.tile_columns if args.directional_matrix else 1)
     if not 1 <= args.qp <= 255:
         parser.error('QP must be in [1,255]')
     if args.content_type == 'auto' and (args.ffmpeg is None or args.checkpoint is None):
@@ -110,8 +158,13 @@ def main():
     if recon is not None:
         report['recon'] = str(recon)
     env = {k: v for k, v in os.environ.items() if not k.startswith('SVT_AV2_TEST_') and k != 'SVT_AV2_M6_DIP'}
-    screened = args.fast_gdf or args.fusion_gdf
-    if args.deep_gdf or screened:
+    balanced = args.balanced_matrix or args.directional_matrix
+    quality = args.content_matrix or args.deep_matrix or args.quality_gdf or args.quality_matrix or balanced or args.quality_calibration is not None
+    matrix_profile = args.fusion_gdf or quality
+    screened = args.fast_gdf or matrix_profile
+    if quality:
+        env = {k: v for k, v in env.items() if not k.startswith('SVT_AV2_')}
+    elif args.deep_gdf or screened:
         env = {k: v for k, v in env.items() if not k.startswith('SVT_AV2_')}
         settings = dict(SVT_AV2_STILL_RECT_RD='deep', SVT_AV2_RECT_RDOQ='1', SVT_AV2_IBP='1',
                         SVT_AV2_STILL_EDGE_FILTER='1', SVT_AV2_GDF='key', SVT_AV2_STILL_UV_RD='0',
@@ -142,15 +195,43 @@ def main():
             report['classifier'] = {name: sha(package / name) for name in ('predict.py', 'runtime.json')}
             report['checkpoint_sha256'] = runtime.config['model']['sha256']
             content = report['classification']['encoder_content_type']
-        if screened:
-            matrix = content == 'animation' or (args.fusion_gdf and width == 1920)
+        if quality:
+            settings = quality_settings(width, content, rounding=args.deep_matrix or args.quality_matrix or balanced)
+            if args.content_matrix and content == 'real' and width == 1920:
+                settings = quality_settings(width, content, rounding=True)
+            elif args.deep_matrix or args.content_matrix:
+                settings, screened = deep_matrix_settings(width, content)
+            if balanced:
+                settings['SVT_AV2_STILL_SEARCH'] = 'balanced'
+                if width == 3840 and content == 'real':
+                    settings.update(SVT_AV2_QM12='all', SVT_AV2_QM_LEVEL='4')
+            if args.directional_matrix:
+                settings.update(SVT_AV2_STILL_SEARCH='directional', SVT_AV2_TILE_RESTORATION='pcw')
+            if args.quality_calibration:
+                calibration = json.loads(args.quality_calibration.read_text(encoding='utf-8-sig'))
+                if calibration['source_sha256'] != report['input_sha256'] or args.profile != 'auto':
+                    raise ValueError('Calibration requires the same input frame and the automatic RD profile')
+                if calibration.get('content_type', content) != content:
+                    raise ValueError('Calibration requires the content type used for the pilot encodes')
+                winner = calibration['winner']
+                settings = calibration_choices(width, content, rectangles=True)[winner]
+                if settings != calibration['candidates'][winner]['environment']:
+                    raise ValueError('Calibration settings disagree with this content type or profile')
+                report['calibration'] = dict(path=str(args.quality_calibration.resolve()), winner=winner)
+            env.update(settings)
+            report['tool_environment'] = settings
+        elif screened:
+            matrix = content == 'animation' or (matrix_profile and width == 1920)
             settings['SVT_AV2_QM12'] = 'all' if matrix else 'off'
-            if args.fusion_gdf:
+            if matrix_profile:
                 settings['SVT_AV2_UV_DELTA_Q'] = '-8'
                 if matrix:
                     settings['SVT_AV2_QM_LEVEL'] = '4' if width == 1920 else '8'
             env.update(settings)
         selected, model, command = encoder_command(encoder, source, output, args.qp, content, args.profile, width, height, recon, fast_gdf=screened)
+        command[command.index('--threads') + 1] = str(args.threads)
+        if args.tile_columns > 1:
+            command.extend(['--tile-columns', str(args.tile_columns)])
         report.update(content_type=content, selected_profile=selected, rd_lambda=model, command=command)
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         with log_path.open('xb') as log:

@@ -21,4 +21,9 @@ int svt_av2_pcwiener_filter_y_boundaries(const uint16_t* src, ptrdiff_t src_stri
     uint32_t bit_depth, uint32_t base_q_idx, const uint8_t* tskip,
     ptrdiff_t tskip_stride, const uint16_t* deblocked);
 
+int svt_av2_pcwiener_filter_y_parallel(const uint16_t* src, ptrdiff_t src_stride,
+    uint16_t* dst, ptrdiff_t dst_stride, uint32_t width, uint32_t height,
+    uint32_t bit_depth, uint32_t base_q_idx, const uint8_t* tskip,
+    ptrdiff_t tskip_stride, const uint16_t* deblocked, uint32_t threads);
+
 #endif

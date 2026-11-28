@@ -150,6 +150,13 @@ def generate(avm, dest, evidence):
         entries = list(rows(initializer(tables['modes'], name)))[:count]
         assert len(entries) == count
         families.append((key, name, [entries] * 4))
+    for key, name, paths in [
+        ('INTER_LONG_TX32', 'default_tx_ext_32_cdf', [(1,)]),
+        ('INTER_LONG_TX16', 'default_inter_ext_tx_short_side_cdf', [(i, 2) for i in range(3)]),
+    ]:
+        entries = [e for e in rows(initializer(tables['modes'], name)) if e[0] in paths]
+        assert [e[0] for e in entries] == paths
+        families.append((key, name, [entries] * 4))
     dest.mkdir(parents=True, exist_ok=True)
     evidence.mkdir(parents=True, exist_ok=True)
     defines, ns, allq, manifest, checks = [], [], [[] for _ in range(4)], [], []

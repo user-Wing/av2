@@ -38,8 +38,8 @@ int main(void) {
             src[y*ss+x]=(uint16_t)((17u*x+23u*y+13u*((x*y)%19u)+v.seed*37u)&((1u<<v.bd)-1u));
         for (unsigned y=0u;y<v.h/4u;++y) for (unsigned x=0u;x<v.w/4u;++x)
             skip[y*ts+x]=(uint8_t)((x+y/3u+v.seed)%3u==0u);
-        const int status=svt_av2_pcwiener_filter_y(src,(ptrdiff_t)ss,dst,(ptrdiff_t)ds,
-            v.w,v.h,v.bd,v.q,skip,(ptrdiff_t)ts);
+        const int status=svt_av2_pcwiener_filter_y_parallel(src,(ptrdiff_t)ss,dst,(ptrdiff_t)ds,
+            v.w,v.h,v.bd,v.q,skip,(ptrdiff_t)ts,NULL,c%2u ? 4u : 1u);
         ++checks;if(status) ++failures;
         uint64_t hash=UINT64_C(14695981039346656037);
         for (unsigned y=0u;y<v.h;++y) {

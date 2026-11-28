@@ -157,6 +157,81 @@ SvtAv2Error svt_av2_motion_estimate(const SvtAv2FrameBuffer* source,
     return SVT_AV2_ERROR_NONE;
 }
 
+void svt_av2_motion_downsample4(const SvtAv2FrameBuffer* frame,uint16_t* quarter) {
+    const unsigned bytes=frame->bit_depth>8u?2u:1u, width=frame->visible_width/4u;
+    for (unsigned y=0;y<frame->visible_height/4u;++y) for (unsigned x=0;x<width;++x) {
+        unsigned sum=0;
+        for (unsigned dy=0;dy<4;++dy) {
+            const uint8_t* row=frame->planes[0]+(size_t)(4u*y+dy)*frame->strides[0]+4u*x*bytes;
+            for (unsigned dx=0;dx<4;++dx) sum+=svt_av2_sample_load(row+dx*bytes,frame->bit_depth);
+        }
+        quarter[(size_t)y*width+x]=(uint16_t)((sum+8u)>>4);
+    }
+}
+
+void svt_av2_motion_hme(const SvtAv2FrameBuffer* source,const SvtAv2FrameBuffer* reference,
+    const uint16_t* quarter_source,const uint16_t* quarter_ref,const SvtAv2BlockView* block,
+    int radius, SvtAv2MotionSearchResult* result) {
+    if (result->sad < (uint64_t)block->w*block->h*(2u<<(source->bit_depth-8u))) return;
+    const uint32_t w=source->visible_width/4u,h=source->visible_height/4u;
+    const int bx=(int)block->x/4,by=(int)block->y/4;
+    uint64_t best=UINT64_MAX;
+    SvtAv2MotionVector center={0,0};
+    const int coarse = radius / 4;
+    for (int dy=-coarse;dy<=coarse;++dy) for (int dx=-coarse;dx<=coarse;++dx) {
+        uint64_t v=0;
+        for (int y=0;y<(int)block->h/4 && v<=best;++y) {
+            const uint16_t* a=quarter_source+(size_t)(by+y)*w+bx;
+            const uint16_t* b=quarter_ref+(size_t)edge_coordinate(by+y+dy,h)*w;
+            for (int x=0;x<(int)block->w/4;++x) v+=sample_difference(a[x],b[edge_coordinate(bx+x+dx,w)]);
+        }
+        const SvtAv2MotionVector quarter_mv={dx,dy};
+        ++result->candidates;
+        if (v<best || (v==best && preferred(quarter_mv,center))) { best=v;center=quarter_mv; }
+    }
+    if (magnitude(center.mv_x)<2 && magnitude(center.mv_y)<2) return;
+    center.mv_x*=4;center.mv_y*=4;
+    uint64_t full=UINT64_MAX;
+    /* Leave one pixel of range for the existing fractional-pel refinement. */
+    for (int step=2;step;step/=2) {
+        const SvtAv2MotionVector origin=center;
+        for (int dy=-step;dy<=step;dy+=step) for (int dx=-step;dx<=step;dx+=step) {
+            const SvtAv2MotionVector v={origin.mv_x+dx,origin.mv_y+dy};
+            if (magnitude(v.mv_x) >= radius || magnitude(v.mv_y) >= radius) continue;
+            const uint64_t sad=candidate_sad(source,reference,block,v,full);
+            ++result->candidates;
+            if (sad<full || (sad==full && preferred(v,center))) { full=sad;center=v; }
+        }
+    }
+    if (full<result->sad || (full==result->sad && preferred(center,result->mv))) {
+        result->sad=full;result->mv=center;
+    }
+}
+
+void svt_av2_motion_temporal(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* reference,
+    const SvtAv2BlockView* block, const SvtAv2MotionField* field, int distance,
+    int radius, SvtAv2MotionSearchResult* result) {
+    if (!distance || distance < -8 || distance > 8 || !result->sad) return;
+    const uint32_t x = (block->x + block->w / 2u) * SVT_AV2_ME_FIELD_COLS / source->visible_width;
+    const uint32_t y = (block->y + block->h / 2u) * SVT_AV2_ME_FIELD_ROWS / source->visible_height;
+    const SvtAv2MotionVector v = field->velocity[SVT_AV2_MIN(y, SVT_AV2_ME_FIELD_ROWS - 1u)]
+                                            [SVT_AV2_MIN(x, SVT_AV2_ME_FIELD_COLS - 1u)];
+    if (!v.mv_x && !v.mv_y) return;
+    const int sx = v.mv_x * distance, sy = v.mv_y * distance;
+    const int dx = (sx + (sx < 0 ? -4 : 4)) / 8;
+    const int dy = (sy + (sy < 0 ? -4 : 4)) / 8;
+    const int edge = radius - 1;
+    const SvtAv2MotionVector seed = {SVT_AV2_MAX(-edge, SVT_AV2_MIN(edge, dx)),
+                                     SVT_AV2_MAX(-edge, SVT_AV2_MIN(edge, dy))};
+    for (int j = -1; j <= 1; ++j) for (int i = -1; i <= 1; ++i) {
+        const SvtAv2MotionVector mv = {seed.mv_x + i, seed.mv_y + j};
+        if (magnitude(mv.mv_x) > edge || magnitude(mv.mv_y) > edge) continue;
+        const uint64_t sad = candidate_sad(source, reference, block, mv, result->sad);
+        ++result->candidates;
+        if (sad < result->sad) { result->sad = sad; result->mv = mv; }
+    }
+}
+
 void svt_av2_motion_extend(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* reference,
     const SvtAv2BlockView* block, SvtAv2MotionSearchResult* result) {
     if (result->sad < (uint64_t)block->w * block->h * (3u << (source->bit_depth - 8u))) return;

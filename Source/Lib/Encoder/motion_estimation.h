@@ -9,6 +9,20 @@ typedef struct SvtAv2MotionSearchResult {
     uint64_t sad;
     uint32_t candidates;
 } SvtAv2MotionSearchResult;
+/* Search-only colocated velocity, measured in eighths of a pixel per frame. */
+#define SVT_AV2_ME_FIELD_COLS 32u
+#define SVT_AV2_ME_FIELD_ROWS 18u
+typedef struct SvtAv2MotionField {
+    SvtAv2MotionVector velocity[SVT_AV2_ME_FIELD_ROWS][SVT_AV2_ME_FIELD_COLS];
+} SvtAv2MotionField;
+void svt_av2_motion_temporal(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* reference,
+    const SvtAv2BlockView* block, const SvtAv2MotionField* field, int distance,
+    int radius, SvtAv2MotionSearchResult* result);
+/* Quarter-resolution luma is an average of each 4x4 source neighborhood. */
+void svt_av2_motion_downsample4(const SvtAv2FrameBuffer* frame,uint16_t* quarter);
+void svt_av2_motion_hme(const SvtAv2FrameBuffer* source,const SvtAv2FrameBuffer* reference,
+    const uint16_t* quarter_source,const uint16_t* quarter_ref,const SvtAv2BlockView* block,
+    int radius, SvtAv2MotionSearchResult* result);
 /* Extend a successful integer search on high-residual blocks, within the
  * projected Q3 predictor's +/-16 pixel range. */
 void svt_av2_motion_extend(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* reference,

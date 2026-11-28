@@ -118,6 +118,34 @@ static void transaction_test(Forced* f, const uint16_t* decisions, size_t count,
     svt_av2_tile_rate_free(session);
 }
 
+static void check_alpha_ranking(const SvtAv2FrameBuffer* source,const SvtAv2FrameBuffer* recon) {
+    const uint32_t step = source->bit_depth > 8u ? 2u : 1u;
+    const SvtAv2IntraBlock blocks[]={{0u,0u,8u,8u,1u},{8u,0u,16u,4u,2u},{4u,4u,4u,16u,1u}};
+    for (unsigned b=0; b<sizeof(blocks)/sizeof(blocks[0]); ++b) {
+        const SvtAv2IntraBlock* block = blocks+b;
+        int8_t actual[2], expected[2]={0,0};
+        uint64_t best[2]={UINT64_MAX,UINT64_MAX};
+        SVT_TEST_CHECK_EQ_INT(svt_av2_intra_cfl_rank(source,recon,block,actual),0);
+        for (int a=-8; a<=8; ++a) {
+            uint8_t pixels[128];
+            SVT_TEST_CHECK_EQ_INT(svt_av2_intra_cfl_explicit_predict(recon,block,64u,pixels,block->w*step,a),0);
+            uint64_t score=0;
+            for (unsigned y=0; y<block->h; ++y) for (unsigned x=0; x<block->w; ++x) {
+                const uint8_t* orig=source->planes[block->plane]+(size_t)(block->y+y)*source->strides[block->plane]+(block->x+x)*step;
+                const int diff=(int)svt_av2_sample_load(orig,source->bit_depth)-
+                    (int)svt_av2_sample_load(pixels+(y*block->w+x)*step,source->bit_depth);
+                score+=(uint32_t)(diff*diff);
+            }
+            for (unsigned j=0; j<2; ++j) if (score<best[j]) {
+                if (!j) { best[1]=best[0]; expected[1]=expected[0]; }
+                best[j]=score; expected[j]=(int8_t)a; break;
+            }
+        }
+        SVT_TEST_CHECK_EQ_INT(actual[0],expected[0]);
+        SVT_TEST_CHECK_EQ_INT(actual[1],expected[1]);
+    }
+}
+
 int main(int argc, char** argv) {
     const int pilot=getenv("SVT_AV2_CLASSIC_CFL_PILOT")!=NULL;
     const uint16_t plans[12]={0u,1u,2u,3u,85u,86u,87u,88u,89u,90u,91u,92u};
@@ -136,6 +164,9 @@ int main(int argc, char** argv) {
             for(uint32_t x=0u;x<svt_av2_picture_plane_width(&f->source,p);++x)
                 svt_av2_sample_store(f->source.planes[p]+(size_t)y*f->source.strides[p]+x*(bd>8u?2u:1u),bd,
                     (uint16_t)(((x*y*17u+x*43u+y*29u+p*53u)&255u)<<(bd-8u)));
+        check_alpha_ranking(&f->source,&f->source);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_recon_reset_frame(&f->recon,(uint16_t)(1u<<(bd-1u))),0);
+        check_alpha_ranking(&f->source,&f->recon);
         SvtAv2TransformPathState state;
         const uint32_t q=100u+(bd==10u?48u:0u);
         SVT_TEST_CHECK_EQ_INT(svt_av2_transform_path_init_bd(&state,&f->path,q,bd),0);

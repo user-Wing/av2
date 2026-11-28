@@ -271,11 +271,39 @@ static void avm_highbd_lpf_vertical_generic_c(uint16_t *s, int pitch,
   }
 }
 
+typedef struct DbThresholds {
+    uint16_t q, side;
+} DbThresholds;
+
+static DbThresholds db_thresholds(int qindex, int delta, uint32_t bd) {
+    const int rawq = qindex + delta * 8;
+    const int q = rawq == 0 ? 0 : clamp(rawq, 1, bd == 10u ? 303 : 255);
+    const int side_index = clamp(rawq - 24 * ((int)bd - 8), 0, MAX_SIDE_TABLE - 1);
+    const DbThresholds result = {
+        (uint16_t)(((svt_av2_quant_qlookup(q) + 4) >> 3) >> 6),
+        (uint16_t)(AVMMAX(side_thresholds[side_index] + (1 << (12 - bd)), 0) >> (13 - bd))
+    };
+    return result;
+}
+
+static uint16_t db_merge_threshold(uint16_t a, uint16_t b) {
+    return a && b ? (uint16_t)((a + b + 1u) >> 1) : (uint16_t)(a + b);
+}
+
 static void db_filter_sb(uint16_t* pixels,uint32_t w,uint32_t h,
     const uint32_t* map,const SvtAv2TileCoeffBlock* blocks,
-    uint32_t bx,uint32_t by,uint32_t mode,uint16_t q_threshold,
-    uint16_t side_threshold,uint32_t bd,uint64_t* edge_calls) {
+    uint32_t bx,uint32_t by,uint32_t mode,uint32_t frame_qindex,
+    const uint16_t* sb_qindex,int delta,uint32_t bd,uint64_t tile_edges,uint64_t* edge_calls) {
     const uint32_t cols=w/4u;
+    const uint32_t stride=(w+63u)/64u, sb=(by/64u)*stride+bx/64u;
+    const DbThresholds current_sb=db_thresholds(sb_qindex ? sb_qindex[sb] : (int)frame_qindex,delta,bd);
+    DbThresholds boundary=current_sb;
+    if (sb_qindex && (mode==1u ? bx : by)) {
+        const DbThresholds neighbor=db_thresholds(sb_qindex[sb-(mode==1u ? 1u : stride)],delta,bd);
+        boundary.q=db_merge_threshold(current_sb.q,neighbor.q);
+        boundary.side=db_merge_threshold(current_sb.side,neighbor.side);
+    }
+
 
         const uint32_t outer_end=mode==1u?AVMMIN(by+64u,h):AVMMIN(bx+64u,w);
         const uint32_t inner_end=mode==1u?AVMMIN(bx+64u,w):AVMMIN(by+64u,h);
@@ -297,20 +325,24 @@ static void db_filter_sb(uint16_t* pixels,uint32_t w,uint32_t h,
                 if (minimum<=4u) neg=pos=4;
                 else if (minimum==8u) neg=pos=8;
                 else if (minimum==16u) neg=pos=14;
-                else {pos=18;neg=(mode==2u && !(y&63u))?14:18;}
-                if (!q_threshold || !side_threshold) continue;
+                else {
+                    const int column_edge=mode==1u && !(x&63u) && ((tile_edges>>(x/64u))&1u);
+                    pos=18;neg=((mode==2u && !(y&63u)) || column_edge)?14:18;
+                }
+                const DbThresholds thresholds=inner%64u==0u ? boundary : current_sb;
+                if (!thresholds.q || !thresholds.side) continue;
                 uint16_t* at=pixels+(size_t)y*w+x;
-                if (mode==1u) avm_highbd_lpf_vertical_generic_c(at,(int)w,neg,pos,&q_threshold,&side_threshold,(int)bd,0,0);
-                else avm_highbd_lpf_horizontal_generic_c(at,(int)w,neg,pos,&q_threshold,&side_threshold,(int)bd,0,0);
+                if (mode==1u) avm_highbd_lpf_vertical_generic_c(at,(int)w,neg,pos,&thresholds.q,&thresholds.side,(int)bd,0,0);
+                else avm_highbd_lpf_horizontal_generic_c(at,(int)w,neg,pos,&thresholds.q,&thresholds.side,(int)bd,0,0);
                 ++*edge_calls;
             }
         }
-    
+
 }
 
-SvtAv2Error svt_av2_deblock_luma_apply(SvtAv2FrameBuffer* recon,
+SvtAv2Error svt_av2_deblock_luma_columns(SvtAv2FrameBuffer* recon,
     const SvtAv2TileCoeffBlock* blocks,size_t count,uint32_t mode,int delta,int delta_h,
-    uint32_t actual_qindex,uint64_t* edge_calls,uint64_t* changed_pixels) {
+    uint32_t actual_qindex,const uint16_t* sb_qindex,uint64_t tile_edges,uint64_t* edge_calls,uint64_t* changed_pixels) {
     if (!recon || !blocks || !edge_calls || !changed_pixels || mode<1u || mode>3u ||
         delta< -2 || delta>1 || delta_h< -2 || delta_h>1 || (recon->bit_depth!=8u && recon->bit_depth!=10u) ||
         recon->chroma_format!=SVT_AV2_CHROMA_420 || (recon->visible_width&7u) ||
@@ -338,28 +370,19 @@ SvtAv2Error svt_av2_deblock_luma_apply(SvtAv2FrameBuffer* recon,
     const uint32_t bd=recon->bit_depth,step=bd>8u?2u:1u;
     for (uint32_t y=0u;y<h;++y) for (uint32_t x=0u;x<w;++x)
         pixels[(size_t)y*w+x]=svt_av2_sample_load(recon->planes[0]+(size_t)y*recon->strides[0]+x*step,bd);
-    uint16_t q_threshold[2],side_threshold[2];
-    const int deltas[2]={delta,delta_h};
-    for (uint32_t direction=0u;direction<2u;++direction) {
-        const int rawq=(int)actual_qindex+deltas[direction]*8;
-        const int q=rawq==0?0:clamp(rawq,1,bd==10u?303:255);
-        q_threshold[direction]=(uint16_t)(((svt_av2_quant_qlookup(q)+4)>>3)>>6);
-        const int side_index=clamp(rawq-24*((int)bd-8),0,MAX_SIDE_TABLE-1);
-        side_threshold[direction]=(uint16_t)(AVMMAX(side_thresholds[side_index]+(1<<(12-bd)),0)>>(13-bd));
-    }
     /* AVM loop_filter_rows combined schedule: V(current), H(previous),
      * then flush H(last) at every SB row end. */
     for (uint32_t by=0u;by<h;by+=64u) {
         for (uint32_t bx=0u;bx<w;bx+=64u) {
             if (mode&1u) db_filter_sb(pixels,w,h,map,blocks,bx,by,1u,
-                q_threshold[0],side_threshold[0],bd,edge_calls);
+                actual_qindex,sb_qindex,delta,bd,tile_edges,edge_calls);
             if (mode==2u) db_filter_sb(pixels,w,h,map,blocks,bx,by,2u,
-                q_threshold[1],side_threshold[1],bd,edge_calls);
+                actual_qindex,sb_qindex,delta_h,bd,tile_edges,edge_calls);
             else if (mode==3u && bx>=64u) db_filter_sb(pixels,w,h,map,blocks,bx-64u,by,2u,
-                q_threshold[1],side_threshold[1],bd,edge_calls);
+                actual_qindex,sb_qindex,delta_h,bd,tile_edges,edge_calls);
         }
         if (mode==3u) db_filter_sb(pixels,w,h,map,blocks,((w-1u)/64u)*64u,by,2u,
-            q_threshold[1],side_threshold[1],bd,edge_calls);
+            actual_qindex,sb_qindex,delta_h,bd,tile_edges,edge_calls);
     }
     for (uint32_t y=0u;y<h;++y) for (uint32_t x=0u;x<w;++x) {
         uint8_t* target=recon->planes[0]+(size_t)y*recon->strides[0]+x*step;
@@ -369,4 +392,10 @@ SvtAv2Error svt_av2_deblock_luma_apply(SvtAv2FrameBuffer* recon,
     error=SVT_AV2_ERROR_NONE;
 done:
     free(pixels);free(map);return error;
+}
+
+SvtAv2Error svt_av2_deblock_luma_apply(SvtAv2FrameBuffer* recon,
+    const SvtAv2TileCoeffBlock* blocks,size_t count,uint32_t mode,int delta,int delta_h,
+    uint32_t actual_qindex,uint64_t* edge_calls,uint64_t* changed_pixels) {
+    return svt_av2_deblock_luma_columns(recon,blocks,count,mode,delta,delta_h,actual_qindex,NULL,0,edge_calls,changed_pixels);
 }

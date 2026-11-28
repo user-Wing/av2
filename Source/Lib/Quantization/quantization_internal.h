@@ -7,6 +7,8 @@ typedef void (*SvtAv2QuantKernel)(const SvtAv2QuantCoeffs*, int32_t, int32_t,
     const int32_t*, int32_t*, int32_t*, size_t);
 SvtAv2QuantizeBlockFn svt_av2_quantize_block_select(void);
 #if defined(SVT_AV2_HAVE_QUANT_AVX2)
+int svt_av2_quantize_matrix_levels_avx2(const SvtAv2QuantCoeffs* coeffs, const uint8_t* inverse,
+    const int32_t* coeff, int32_t* levels, size_t count);
 void svt_av2_quantize_avx2(const SvtAv2QuantCoeffs*, int32_t, int32_t,
     const int32_t*, int32_t*, int32_t*, size_t);
 #endif

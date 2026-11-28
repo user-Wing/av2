@@ -70,9 +70,18 @@ extern "C" {
 
 #define SVT_AV2_PC_WIENER_MASK_WORDS 34u /* 64 x 34 units at the largest supported size. */
 
+enum {
+    SVT_AV2_HIDDEN_ANCHOR = 1,
+    SVT_AV2_ONLY_MIDPOINT,
+    SVT_AV2_FIRST_MIDPOINT,
+    SVT_AV2_INNER_MIDPOINT,
+    SVT_AV2_LAST_MIDPOINT
+};
+
 typedef struct SvtAv2FrameHeaderConfig {
     /* Frame dimensions (informational for M1; the decoder derives them from
      * the sequence header because frame_size_override_flag is 0). */
+    uint32_t tile_cols_log2; /* Still-picture uniform columns, one tile row. */
     uint32_t frame_width;
     uint32_t frame_height;
     /* frame-level quantizer index, f(8) for 8-bit, range [0,255]. M1 requires
@@ -92,6 +101,7 @@ typedef struct SvtAv2FrameHeaderConfig {
      * picture header derives (spec 5.18.2 p.98). order_hint occupies eight bits
      * because the multi-frame sequence header writes order_hint_bits_minus_1=7. */
     uint32_t multi_frame;
+    uint32_t paired_role; /* Zero for normal display order, otherwise one of the anchor/midpoint roles above. */
     uint32_t order_hint; /* eight-bit multi-frame order, ignored for still pictures */
     uint32_t reduced_tx_set; /* M2=2 forces DCT_DCT; M1 regression=0 */
     uint32_t inter_frame;               /* OBU_REGULAR_TILE_GROUP with one logical reference. */
@@ -106,11 +116,13 @@ typedef struct SvtAv2FrameHeaderConfig {
     uint32_t enable_intra_ist; /* Sequence bit shared by KEY and P-intra. */
     uint32_t enable_ibp;
     int8_t uv_delta_q;
-    uint32_t qm_level;
+    const uint16_t* sb_qindex; /* Raster order within the tile, four-qindex resolution. */
+    uint32_t qm_level, qm_uv_level; /* Zero UV override inherits luma. */
     uint32_t enable_intra_edge_filter; /* Sequence bit, still prediction tool. */
     uint32_t enable_mhccp; /* Optional filter0 multi-parameter chroma-from-luma syntax. */
     const SvtAv2Ccso64Plan* ccso64; /* Borrowed immutable 64-unit plan; NULL is oldoff. */
     uint32_t cdef_primary;
+    const uint8_t* gdf_flags; /* Optional one flag per 64x64 superblock within this tile. */
     uint32_t enable_gdf, gdf_code; /* 1..16 = frame-wide KEY model/scale, zero = bypass. */
     uint32_t enable_pc_wiener;
     uint32_t pc_wiener_unit; /* Zero uses the original 256-pixel units. */
@@ -119,6 +131,8 @@ typedef struct SvtAv2FrameHeaderConfig {
     int32_t deblock_delta; /* vertical, df_par_bits=2: -2..1, scale 8. */
     int32_t deblock_delta_h; /* horizontal, inherits V when not signaled. */
     uint32_t mv_half; /* MV precision: 0=integer, 1=half, 2=quarter; P only. */
+    uint32_t wide_motion; /* Encoder search domain. The MV syntax is unchanged. */
+    uint32_t regular_filter; /* Override fixed SHARP with EIGHTTAP_REGULAR in quarter-pel P. */
     uint32_t sharp_filter; /* 1: fixed MULTITAP_SHARP in fractional P. */
     uint32_t retain_reference; /* Single-slot P only: 1 leaves the slot intact. */
     uint32_t dual_ref; /* 1: two physical DPB slots, as signaled by the sequence. */

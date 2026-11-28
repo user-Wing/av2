@@ -7,4 +7,7 @@
 SvtAv2Error svt_av2_deblock_luma_apply(SvtAv2FrameBuffer* recon,
     const SvtAv2TileCoeffBlock* blocks,size_t count,uint32_t mode,int delta,int delta_h,
     uint32_t actual_qindex,uint64_t* edge_calls,uint64_t* changed_pixels);
+SvtAv2Error svt_av2_deblock_luma_columns(SvtAv2FrameBuffer* recon,
+    const SvtAv2TileCoeffBlock* blocks,size_t count,uint32_t mode,int delta,int delta_h,
+    uint32_t actual_qindex,const uint16_t* sb_qindex,uint64_t tile_edges,uint64_t* edge_calls,uint64_t* changed_pixels);
 #endif

@@ -85,6 +85,31 @@ static void test_pair(uint32_t depth, SvtAv2ChromaFormat format, uint32_t period
     SVT_TEST_CHECK_EQ_INT(svt_av2_reference_release(&anchor), SVT_AV2_ERROR_NONE);
 }
 
+static void test_rotating_anchor(void) {
+    SvtAv2ReferenceFrame recent = {0}, older = {0};
+    SvtAv2FrameBuffer recon = {0};
+    SVT_TEST_CHECK_EQ_INT(svt_av2_reference_init(&recent, 16, 16, 10, SVT_AV2_CHROMA_420), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_reference_init(&older, 16, 16, 10, SVT_AV2_CHROMA_420), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_picture_alloc_ex(&recon, 16, 16, 10, SVT_AV2_CHROMA_420), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_recon_reset_frame(&recon, 41), SVT_AV2_ERROR_NONE);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_reference_refresh_pair_masked(&recent, &older, &recon, 0, 0), SVT_AV2_ERROR_NONE);
+    uint32_t anchor = 0;
+    for (uint32_t i = 1; i < 12; ++i) {
+        if (i == 8) continue;
+        const int rotate = i == 1 || i == 9;
+        const uint32_t held = i == 9;
+        if (rotate) anchor = i - held - 1;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_recon_reset_frame(&recon, (uint16_t)(41+i)), SVT_AV2_ERROR_NONE);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_reference_refresh_anchor(&recent, &older, &recon, i, held, rotate), SVT_AV2_ERROR_NONE);
+        check_slot(&recent, i, (uint16_t)(41+i), 10);
+        check_slot(&older, anchor, (uint16_t)(41+anchor), 10);
+        SVT_TEST_CHECK_EQ_INT(svt_av2_reference_refresh_anchor(&recent, &older, &recon, i, held, rotate), SVT_AV2_ERROR_INVALID_STATE);
+    }
+    svt_av2_reference_release(&recent);
+    svt_av2_reference_release(&older);
+    svt_av2_picture_free(&recon);
+}
+
 static void test_pair_masked(uint32_t depth, SvtAv2ChromaFormat format) {
     SvtAv2ReferenceFrame last = {0}, anchor = {0};
     SvtAv2FrameBuffer recon = {0};
@@ -273,6 +298,7 @@ static void test_choice(uint32_t depth, SvtAv2ChromaFormat format) {
 }
 
 int main(void) {
+    test_rotating_anchor();
     const uint32_t depths[] = { 8, 10, 10 };
     const SvtAv2ChromaFormat formats[] = { SVT_AV2_CHROMA_420, SVT_AV2_CHROMA_420, SVT_AV2_CHROMA_444 };
     for (uint32_t f = 0; f < 3; ++f) {

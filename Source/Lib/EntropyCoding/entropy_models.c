@@ -41,6 +41,14 @@ int svt_av2_entropy_encode_model(SvtAv2EntropyEncoder* enc, uint32_t model,
         nsyms != svt_av2_model_nsyms[model] || symbol >= nsyms)
         return SVT_AV2_ENTROPY_ERROR_RANGE;
     uint16_t* state = enc->models->cdf[model];
+    if (enc->trial) {
+        uint32_t* word = &enc->trial->loaded[model / 32u];
+        const uint32_t bit = UINT32_C(1) << (model % 32u);
+        if (!(*word & bit)) {
+            memcpy(state, enc->trial->base->cdf[model], sizeof(enc->models->cdf[model]));
+            *word |= bit;
+        }
+    }
     uint16_t forward[7];
     for (uint32_t i = 0u; i + 1u < nsyms; ++i)
         forward[i] = (uint16_t)(32768u - state[i]);

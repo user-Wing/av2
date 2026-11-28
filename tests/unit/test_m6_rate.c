@@ -181,9 +181,10 @@ static void inter_tail_selector(void) {
     const uint16_t untouched[SVT_AV2_INTER_TAIL_MAX] = {0xffffu, 0xffffu, 0xffffu, 0xffffu};
     uint16_t scan[1024], out[SVT_AV2_INTER_TAIL_MAX];
     int32_t q[1024] = {0}, before[1024];
-    const SvtAv2TxSize sizes[] = {SVT_AV2_TX_8X8, SVT_AV2_TX_16X16, SVT_AV2_TX_32X32, SVT_AV2_TX_64X64};
-    const uint32_t counts[] = {64u, 256u, 1024u, 1024u};
-    const uint32_t floors[] = {3u, 4u, 16u, 16u};
+    const SvtAv2TxSize sizes[] = {SVT_AV2_TX_8X8, SVT_AV2_TX_16X16, SVT_AV2_TX_32X32, SVT_AV2_TX_64X64,
+        SVT_AV2_TX_8X16, SVT_AV2_TX_16X8, SVT_AV2_TX_32X16, SVT_AV2_TX_16X32};
+    const uint32_t counts[] = {64u, 256u, 1024u, 1024u, 128u, 128u, 512u, 512u};
+    const uint32_t floors[] = {3u, 4u, 16u, 16u, 3u, 3u, 8u, 8u};
     for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); ++s) {
         const uint32_t n = counts[s], f = floors[s];
         const size_t scan_count = svt_av2_coeff_scan_dct_dct(sizes[s], scan);
@@ -253,7 +254,7 @@ static void inter_tail_selector(void) {
     SVT_TEST_CHECK_EQ_INT(svt_av2_inter_tail_positions(q, scan, 1024u, NULL), 0u);
     SVT_TEST_CHECK_EQ_INT(svt_av2_inter_tail_positions(q, scan, 0u, out), 0u);
     SVT_TEST_CHECK_EQ_INT(svt_av2_inter_tail_positions(q, scan, 16u, out), 0u);
-    SVT_TEST_CHECK_EQ_INT(svt_av2_inter_tail_positions(q, scan, 8u * 16u, out), 0u);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_inter_tail_positions(q, scan, 127u, out), 0u);
     SVT_TEST_CHECK_EQ_INT(svt_av2_inter_tail_positions(q, scan, 64u * 64u, out), 0u);
     SVT_TEST_CHECK(memcmp(out, untouched, sizeof(out)) == 0);
 }

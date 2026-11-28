@@ -133,6 +133,11 @@ typedef struct TileTree {
     uint32_t enable_intra_ist;
     uint32_t enable_mhccp;
     const SvtAv2Ccso64Plan* ccso64;
+    const uint16_t* sb_qindex;
+    uint32_t current_qindex;
+    const uint8_t* gdf_flags;
+    uint16_t gdf_cdf[6];
+    uint16_t delta_q_cdf[12];
     uint32_t enable_pc_wiener;
     uint32_t pc_wiener_unit;
     const uint64_t* pc_wiener_none_mask;
@@ -454,6 +459,37 @@ static int tile_ccso64_write(TileTree* tree, const SvtAv2BlockView* b) {
     return 0;
 }
 
+static void tile_sb_tools_init(TileTree* tree,const SvtAv2FrameHeaderConfig* cfg) {
+    tree->gdf_flags=cfg->gdf_flags;
+    const uint16_t gdf_cdf[6]={18175,0,0,1,2,2};
+    memcpy(tree->gdf_cdf,gdf_cdf,sizeof(gdf_cdf));
+    tree->sb_qindex=cfg->sb_qindex;
+    tree->current_qindex=cfg->base_q_idx;
+    const uint16_t delta[12]={16174,9443,6344,4543,3410,2669,2155,0,0,1,3,4};
+    memcpy(tree->delta_q_cdf,delta,sizeof(delta));
+}
+
+static int tile_sb_tools_write(TileTree* tree,const SvtAv2BlockView* b) {
+    int st=0;
+    if (!st && tree->gdf_flags && !(b->x%64u) && !(b->y%64u))
+        st=svt_av2_ccso64_symbol(tree->enc,tree->gdf_cdf,
+            tree->gdf_flags[(b->y/64u)*tree->geometry.sb_cols+b->x/64u],tree->enc->models!=NULL);
+    if (st == 0) st = tile_ccso64_write(tree, b);
+    if (!st && tree->sb_qindex && b->x%64u==0u && b->y%64u==0u) {
+        const uint32_t q=tree->sb_qindex[(b->y/64u)*tree->geometry.sb_cols+b->x/64u];
+        const int delta=(int)q-(int)tree->current_qindex;
+        const unsigned symbol=(unsigned)abs(delta)/4u;
+        if (delta%4 || symbol>=7u) return SVT_AV2_ENTROPY_ERROR_RANGE;
+        uint16_t forward[7];
+        for (unsigned i=0;i<7u;++i) forward[i]=(uint16_t)(32768u-tree->delta_q_cdf[i]);
+        st=svt_av2_entropy_encode_symbol(tree->enc,forward,8u,symbol);
+        if (!st && tree->enc->models) st=svt_av2_entropy_model_update(tree->delta_q_cdf,8u,symbol);
+        if (!st && symbol) st=svt_av2_entropy_encode_bit(tree->enc,delta<0);
+        tree->current_qindex=q;
+    }
+    return st;
+}
+
 static int tile_leaf_write(TileTree* tree, const SvtAv2BlockView* b) {
     int st=0;
     if (tree->next + 3u > tree->count) return SVT_AV2_ENTROPY_ERROR_RANGE;
@@ -512,7 +548,7 @@ static int tile_leaf_write(TileTree* tree, const SvtAv2BlockView* b) {
             memset(tree->cfl_left + b->y / 4u, 0, b->h / 4u);
         }
     }
-    if (st == 0) st = tile_ccso64_write(tree, b);
+    if (!st) st=tile_sb_tools_write(tree,b);
     uint32_t m5_mode = 0u;
     if (!is_inter && tree->m5_intra_modes) {
         /* M5 syntax is enabled explicitly by tile tree configuration. */
@@ -611,10 +647,10 @@ static int tile_tree_write(TileTree* tree, const SvtAv2BlockView* b) {
 static int tile_mv_precision_valid(const SvtAv2FrameHeaderConfig* cfg) {
     if (cfg->logical_ref_count > 2u || (cfg->logical_ref_count == 2u &&
         (cfg->dual_ref != 1u || cfg->inter_frame != 1u || !cfg->multi_frame ||
-         cfg->reference_slot || cfg->retain_reference))) return 0;
+         cfg->reference_slot > 1u || cfg->retain_reference))) return 0;
     const uint32_t d0 = cfg->ref_distance[0], d1 = cfg->ref_distance[1];
     if ((d0 || d1) && (cfg->logical_ref_count != 2u || d0 < 1u || d0 > 8u || d1 < 1u || d1 > 8u ||
-        d0 == d1 || cfg->mv_half != 2u || !cfg->sharp_filter)) return 0;
+        (cfg->paired_role < SVT_AV2_ONLY_MIDPOINT && d0 == d1) || cfg->mv_half != 2u || !cfg->sharp_filter)) return 0;
     return cfg->mv_half == 0u || (cfg->mv_half <= 2u && cfg->inter_frame == 1u &&
         cfg->multi_frame && cfg->sb_shift == SVT_AV2_FRAME_SB_SHIFT_64);
 }
@@ -623,7 +659,9 @@ static int tile_motion_init(SvtAv2MotionSyntax* motion, const SvtAv2FrameHeaderC
     const int st = svt_av2_motion_syntax_init_precision(motion, cfg->frame_width,
          cfg->frame_height, cfg->mv_half);
     if (st == 0) {
+        motion->wide_motion = cfg->wide_motion;
         motion->two_refs = cfg->logical_ref_count == 2u;
+        motion->opposite_directions = cfg->paired_role >= SVT_AV2_ONLY_MIDPOINT;
         motion->ref_distance[0] = cfg->ref_distance[0];
         motion->ref_distance[1] = cfg->ref_distance[1];
     }
@@ -656,6 +694,7 @@ static int tile_write_coeffs(SvtAv2EntropyEncoder* enc, const SvtAv2FrameHeaderC
     tree.enable_intra_ist = cfg->enable_intra_ist;
     tree.enable_mhccp = cfg->enable_mhccp;
     tile_ccso64_init(&tree, cfg->ccso64);
+    tile_sb_tools_init(&tree,cfg);
     tree.enable_pc_wiener = cfg->enable_pc_wiener;
     tree.pc_wiener_unit = cfg->pc_wiener_unit;
     tree.pc_wiener_none_mask = cfg->pc_wiener_none_mask;
@@ -745,6 +784,7 @@ int svt_av2_tile_rate_create(const SvtAv2FrameHeaderConfig* cfg,
     s->tree.enable_intra_ist = cfg->enable_intra_ist;
     s->tree.enable_mhccp = cfg->enable_mhccp;
     tile_ccso64_init(&s->tree, cfg->ccso64);
+    tile_sb_tools_init(&s->tree,cfg);
     s->tree.enable_pc_wiener = cfg->enable_pc_wiener;
     s->tree.pc_wiener_unit = cfg->pc_wiener_unit;
     if (cfg->enable_pc_wiener) {
@@ -825,10 +865,10 @@ int svt_av2_tile_rate_trial(SvtAv2TileRateSession* s, size_t sb_index,
     TileTree trial = s->tree;
     SvtAv2EntropyEncoder enc;
     svt_av2_entropy_rate_init(&enc);
+    SvtAv2EntropyTrial model_trial = {&s->committed_models, {0}};
     if (s->adaptive) {
-        /* Every candidate starts from the committed prefix. Failed and losing
-         * trials cannot mutate it, including equal raw CDF boundaries. */
-        s->scratch_models = s->committed_models;
+        if (commit) s->scratch_models = s->committed_models;
+        else enc.trial = &model_trial;
         enc.models = &s->scratch_models;
     }
     trial.enc = &enc;
@@ -1177,7 +1217,7 @@ int svt_av2_tile_rate_prefix_begin(SvtAv2TileRatePrefix* p,
     p->trial.enc=&enc;
     st=tile_pc_wiener_write(&p->trial,&sb);
     if (st==0) st=tile_prefix_advance(&p->trial,p->pending,count,&pos);
-    if (st!=0) return st;
+    if (st!=0) {p->trial=p->tree;return st;}
     p->tree=p->trial;p->tree.enc=NULL;
     p->enc=enc;p->adaptive=s->adaptive;
     if (p->adaptive) {p->models=p->scratch_models;p->enc.models=&p->models;}
@@ -1187,15 +1227,45 @@ int svt_av2_tile_rate_prefix_begin(SvtAv2TileRatePrefix* p,
     return 0;
 }
 
+/* Both trees start from the same prefix. A leaf trial can only write
+ * neighbour entries in this SB and the inline tool CDFs in the header. */
+static void tile_prefix_copy_sb(TileTree* dst, const TileTree* src, const SvtAv2BlockView* block) {
+    const size_t x = block->x / 64u * 16u, y = block->y / 64u * 16u;
+    memcpy(dst, src, offsetof(TileTree, mrl_above));
+    memcpy(dst->above_partition + x, src->above_partition + x, 16u);
+    memcpy(dst->left_partition + y, src->left_partition + y, 16u);
+    memcpy(dst->m5_above_mode + x, src->m5_above_mode + x, 16u);
+    memcpy(dst->m5_left_mode + y, src->m5_left_mode + y, 16u);
+    memcpy(dst->mrl_above + x, src->mrl_above + x, 16u);
+    memcpy(dst->mrl_left + y, src->mrl_left + y, 16u);
+    memcpy(dst->cfl_above + x, src->cfl_above + x, 16u);
+    memcpy(dst->cfl_left + y, src->cfl_left + y, 16u);
+    for (unsigned plane = 0; plane < 3u; ++plane) {
+        const unsigned shift = plane ? src->chroma_shift : 0u;
+        const size_t col = x >> shift, row = y >> shift;
+        SvtAv2CoeffNeighbours* to = &dst->neighbours[plane];
+        const SvtAv2CoeffNeighbours* from = &src->neighbours[plane];
+        memcpy(to->above_level + col, from->above_level + col, 16u);
+        memcpy(to->above_dc + col, from->above_dc + col, 16u);
+        memcpy(to->left_level + row, from->left_level + row, 16u);
+        memcpy(to->left_dc + row, from->left_dc + row, 16u);
+    }
+}
+
 int svt_av2_tile_rate_prefix_trial(SvtAv2TileRatePrefix* p, size_t leaf,
     const SvtAv2TileCoeffBlock blocks[3], int commit, uint64_t* rate_q12) {
     if (p==NULL || blocks==NULL || rate_q12==NULL) return SVT_AV2_ENTROPY_ERROR_NULL;
     *rate_q12=0u;
     if (!p->active || leaf!=p->leaf || leaf>=p->leaves || p->pos==0u ||
         (commit!=0 && commit!=1)) return SVT_AV2_ENTROPY_ERROR_RANGE;
-    p->trial=p->tree;
+    tile_prefix_copy_sb(&p->trial, &p->tree, &p->events[p->pos-1u].block);
     SvtAv2EntropyEncoder enc=p->enc;
-    if (p->adaptive) {p->scratch_models=p->models;enc.models=&p->scratch_models;}
+    SvtAv2EntropyTrial trial = {&p->models, {0}};
+    if (p->adaptive) {
+        if (commit) p->scratch_models = p->models;
+        else enc.trial = &trial;
+        enc.models = &p->scratch_models;
+    }
     p->trial.enc=&enc;p->trial.blocks=blocks;p->trial.count=3u;p->trial.next=0u;
     int st=tile_leaf_write(&p->trial,&p->events[p->pos-1u].block);
     if (st==0 && p->trial.next!=3u) st=SVT_AV2_ENTROPY_ERROR_RANGE;
@@ -1204,7 +1274,8 @@ int svt_av2_tile_rate_prefix_trial(SvtAv2TileRatePrefix* p, size_t leaf,
     if (st==0 && commit) st=tile_prefix_advance(&p->trial,p->events,p->count,&pos);
     if (st!=0) return st;
     if (commit) {
-        p->tree=p->trial;p->tree.enc=NULL;p->tree.blocks=NULL;
+        tile_prefix_copy_sb(&p->tree, &p->trial, &p->events[p->pos-1u].block);
+        p->tree.enc=NULL;p->tree.blocks=NULL;
         p->tree.count=p->tree.next=0u;
         p->enc=enc;
         if (p->adaptive) {p->models=p->scratch_models;p->enc.models=&p->models;}
@@ -1222,12 +1293,13 @@ int svt_av2_tile_rate_prefix_trial_y(SvtAv2TileRatePrefix* p,size_t leaf,
     *rate_q12=0u;
     if (!p->active || leaf!=p->leaf || leaf>=p->leaves || p->pos==0u ||
         p->tree.m5_intra_modes<3u) return SVT_AV2_ENTROPY_ERROR_RANGE;
-    p->trial=p->tree;
+    tile_prefix_copy_sb(&p->trial, &p->tree, &p->events[p->pos-1u].block);
     SvtAv2EntropyEncoder enc=p->enc;
-    if (p->adaptive) {p->scratch_models=p->models;enc.models=&p->scratch_models;}
+    SvtAv2EntropyTrial trial = {&p->models, {0}};
+    if (p->adaptive) {enc.trial=&trial;enc.models=&p->scratch_models;}
     p->trial.enc=&enc;p->trial.blocks=y;p->trial.count=1u;p->trial.next=0u;
     const SvtAv2BlockView* b=&p->events[p->pos-1u].block;
-    int st=tile_ccso64_write(&p->trial,b);
+    int st=tile_sb_tools_write(&p->trial,b);
     if (st==0) st=m5_write_intra_y_mode(&p->trial,b,y->intra_mode,0u);
     uint8_t unused=0u;
     if (st==0) st=tile_coeff_plane_write(&p->trial,b,0u,0u,0u,y->intra_mode,&unused);

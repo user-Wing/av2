@@ -29,6 +29,7 @@ void svt_av2_frame_header_config_default(SvtAv2FrameHeaderConfig* cfg,
     if (cfg == NULL) {
         return;
     }
+    cfg->tile_cols_log2 = 0u;
     cfg->frame_width = width;
     cfg->frame_height = height;
     cfg->base_q_idx = SVT_AV2_FRAME_DEFAULT_BASE_Q_IDX;
@@ -36,10 +37,13 @@ void svt_av2_frame_header_config_default(SvtAv2FrameHeaderConfig* cfg,
     cfg->frame_height_bits_minus_1 = 0u;
     cfg->sb_shift = SVT_AV2_FRAME_SB_SHIFT_64;
     cfg->multi_frame = 0u;
+    cfg->paired_role = 0u;
     cfg->order_hint = 0u;
     cfg->reduced_tx_set = 0u;
     cfg->inter_frame = 0u;
     cfg->mv_half = 0u;
+    cfg->wide_motion = 0u;
+    cfg->regular_filter = 0u;
     cfg->sharp_filter = 0u;
     cfg->retain_reference = 0u;
     cfg->dual_ref = 0u;
@@ -59,10 +63,12 @@ void svt_av2_frame_header_config_default(SvtAv2FrameHeaderConfig* cfg,
     cfg->enable_intra_ist = 0u;
     cfg->enable_ibp = 0u;
     cfg->uv_delta_q = 0;
-    cfg->qm_level = 0u;
+    cfg->sb_qindex=NULL;
+    cfg->qm_level = cfg->qm_uv_level = 0u;
     cfg->enable_intra_edge_filter = 0u;
     cfg->enable_mhccp = 0u;
     cfg->ccso64 = NULL;
+    cfg->gdf_flags = NULL;
     cfg->enable_gdf = cfg->gdf_code = 0u;
     cfg->cdef_primary = 0u;
     cfg->enable_pc_wiener = 0u;
@@ -185,7 +191,7 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
     }
     if (cfg->deblock_y>3u || cfg->deblock_delta< -2 || cfg->deblock_delta>1 ||
         cfg->deblock_delta_h< -2 || cfg->deblock_delta_h>1 ||
-        (cfg->deblock_y && (cfg->multi_frame || cfg->inter_frame || cfg->sb_shift!=4u)))
+        (cfg->deblock_y && cfg->sb_shift!=4u))
         return SVT_AV2_BW_ERROR_RANGE;
     if (svt_av2_ccso64_validate(cfg->ccso64, cfg->frame_width, cfg->frame_height,
         cfg->bit_depth, cfg->chroma_format) != 0 ||
@@ -194,7 +200,11 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
     if (cfg->inter_frame > 1u || (cfg->inter_frame && !cfg->multi_frame) ||
         (cfg->primary_models != NULL && (!cfg->inter_frame || cfg->entropy_adaptation != 1u)))
         return SVT_AV2_BW_ERROR_UNSUPPORTED;
+    if (cfg->paired_role > SVT_AV2_LAST_MIDPOINT || (cfg->paired_role && (!cfg->multi_frame || !cfg->inter_frame ||
+        !cfg->dual_ref || (cfg->paired_role == SVT_AV2_HIDDEN_ANCHOR ? (cfg->refresh_mask != 1u && cfg->refresh_mask != 2u) : cfg->refresh_mask != 0u)))) return SVT_AV2_BW_ERROR_RANGE;
     if (cfg->mv_half > 2u || cfg->retain_reference > 1u || cfg->sharp_filter > 1u ||
+        cfg->wide_motion > 1u || (cfg->wide_motion && cfg->mv_half != 2u) ||
+        cfg->regular_filter > 1u || (cfg->regular_filter && (!cfg->sharp_filter || cfg->mv_half != 2u)) ||
         cfg->dual_ref > 1u || cfg->refresh_mask > 3u || cfg->reference_slot > 1u ||
         cfg->logical_ref_count > 2u)
         return SVT_AV2_BW_ERROR_RANGE;
@@ -202,8 +212,7 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
         (cfg->sharp_filter && !cfg->mv_half) ||
         (cfg->dual_ref && (!cfg->multi_frame || cfg->retain_reference)) ||
         ((cfg->refresh_mask || cfg->reference_slot) && (!cfg->dual_ref || !cfg->inter_frame)) ||
-        (cfg->logical_ref_count == 2u && (!cfg->dual_ref || !cfg->inter_frame ||
-                                        cfg->reference_slot)))
+        (cfg->logical_ref_count == 2u && (!cfg->dual_ref || !cfg->inter_frame)))
         return SVT_AV2_BW_ERROR_UNSUPPORTED;
     if ((cfg->bit_depth != 8u && cfg->bit_depth != 10u) ||
         (cfg->chroma_format != 1u && !(cfg->bit_depth == 10u && cfg->chroma_format == 3u)))
@@ -213,7 +222,9 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
          * eight bits at depth 8, nine bits at depth 10. */
         return SVT_AV2_BW_ERROR_RANGE;
     }
-    if ((cfg->qm_level && cfg->qm_level != 4u && cfg->qm_level != 8u && cfg->qm_level != 12u) || cfg->entropy_adaptation > 1u || cfg->enable_mrls > 1u || cfg->enable_mhccp > 1u ||
+    if (cfg->qm_uv_level && (!cfg->qm_level || cfg->qm_uv_level == 1u ||
+        cfg->qm_uv_level == 11u || cfg->qm_uv_level > 12u)) return SVT_AV2_BW_ERROR_RANGE;
+    if (cfg->qm_level == 1u || cfg->qm_level == 11u || cfg->qm_level > 12u || cfg->entropy_adaptation > 1u || cfg->enable_mrls > 1u || cfg->enable_mhccp > 1u ||
         !svt_av2_frame_header_video_cfl_valid(cfg)) return SVT_AV2_BW_ERROR_RANGE;
     if (cfg->enable_gdf > 1u || cfg->gdf_code > 16u || (cfg->gdf_code && (!cfg->enable_gdf ||
         (cfg->inter_frame && !cfg->multi_frame) || cfg->sb_shift != 4u)) || (cfg->enable_gdf && !cfg->multi_frame && !cfg->gdf_code))
@@ -249,7 +260,7 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
          * frame size comes from the sequence header (spec 5.18.2 p.98; AVM
          * decodeframe.c:8100-8102, :8167). order_hint is written below using the sequence
          * header's eight-bit width. */
-        if ((st = svt_av2_bit_writer_write_bit(bw, 1u)) != SVT_AV2_BW_OK) {
+        if ((st = svt_av2_bit_writer_write_bit(bw, cfg->paired_role != SVT_AV2_HIDDEN_ANCHOR)) != SVT_AV2_BW_OK) {
             return st;
         }
         if ((st = svt_av2_bit_writer_write_bit(bw, 0u)) != SVT_AV2_BW_OK) {
@@ -275,7 +286,7 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
         if ((st = svt_av2_bit_writer_write_bits(bw, 1u + two_refs, 3u)) != 0) return st;
         /* ceil(log2(NumRefFrames)) is zero with one slot, one with two. */
         if (cfg->dual_ref && (st = svt_av2_bit_writer_write_bit(bw, cfg->reference_slot)) != 0) return st;
-        if (two_refs && (st = svt_av2_bit_writer_write_bit(bw, 1u)) != 0) return st;
+        if (two_refs && (st = svt_av2_bit_writer_write_bit(bw, 1u ^ cfg->reference_slot)) != 0) return st;
         if ((st = svt_av2_bit_writer_write_bit(bw, 1u)) != 0) return st; /* screen content */
         if ((st = svt_av2_bit_writer_write_bit(bw, !cfg->mv_half)) != 0) return st; /* force integer MV */
         if ((st = svt_av2_bit_writer_write_bit(bw, 0u)) != 0) return st; /* intrabc */
@@ -283,7 +294,7 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
         if (cfg->mv_half == 1u && (st = svt_av2_bit_writer_write_bits(bw, 0u, 2u)) != 0) return st;
         if (cfg->mv_half == 2u && (st = svt_av2_bit_writer_write_bit(bw, 1u)) != 0) return st;
         if ((st = svt_av2_bit_writer_write_bit(bw, 0u)) != 0) return st; /* fixed filter */
-        if ((st = svt_av2_bit_writer_write_bits(bw, cfg->sharp_filter ? 2u : 3u, 2u)) != 0) return st; /* SHARP or BILINEAR */
+        if ((st = svt_av2_bit_writer_write_bits(bw, cfg->regular_filter ? 0u : cfg->sharp_filter ? 2u : 3u, 2u)) != 0) return st; /* Fixed interpolation filter. */
     } else {
     /* screen_content_params(): seq_force_screen_content_tools == SELECT, so one
      * bit; value 0 also forces force_integer_mv = 0 (no further bits). */
@@ -305,13 +316,20 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
     if ((st = svt_av2_bit_writer_write_bit(bw, 1u)) != SVT_AV2_BW_OK) {
         return st;
     }
+    if (cfg->tile_cols_log2) {
+        if (cfg->tile_cols_log2 > 3u || cfg->multi_frame || cfg->inter_frame ||
+            cfg->frame_width < (128u << cfg->tile_cols_log2) || cfg->frame_height <= 64u)
+            return SVT_AV2_BW_ERROR_RANGE;
+        for (uint32_t i=0; i<cfg->tile_cols_log2; ++i)
+            if ((st=svt_av2_bit_writer_write_bit(bw, 1u)) != 0) return st;
+    }
     for (uint32_t i = 1u; i < tile_bits; ++i) {
         if ((st = svt_av2_bit_writer_write_bit(bw, 0u)) != SVT_AV2_BW_OK) {
             return st;
         }
     }
-    /* Single tile => TileCols*TileRows == 1 => no context_update_tile_id and no
-     * tile_size_bytes_minus_1. */
+    /* Single-picture syntax infers average CDF. Four bytes delimit each tile except the last. */
+    if (cfg->tile_cols_log2 && (st=svt_av2_bit_writer_write_bits(bw, 3u, 2u)) != 0) return st;
 
     /* quantization_params(): base_q_idx is f(BitDepth == 8 ? 8 : 9). No delta_q
      * because y_dc_delta_q_enabled/uv_*_delta_q_enabled are all 0 (T004). */
@@ -327,12 +345,12 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
     if ((st = svt_av2_bit_writer_write_bit(bw, cfg->qm_level != 0u)) != 0) return st;
     if (cfg->qm_level) {
         if ((st = svt_av2_bit_writer_write_bits(bw, cfg->qm_level, 4u)) != 0) return st;
-        if ((st = svt_av2_bit_writer_write_bit(bw, 1u)) != 0) return st; /* UV same level as Y */
+        const unsigned same=!cfg->qm_uv_level || cfg->qm_uv_level==cfg->qm_level;
+        if ((st=svt_av2_bit_writer_write_bit(bw,same)) != 0) return st;
+        if (!same && (st=svt_av2_bit_writer_write_bits(bw,cfg->qm_uv_level,4u)) != 0) return st;
     }
-    /* delta_q_params(): base_q_idx > 0, delta_q_present = 0. */
-    if ((st = svt_av2_bit_writer_write_bit(bw, 0u)) != SVT_AV2_BW_OK) {
-        return st;
-    }
+    if ((st=svt_av2_bit_writer_write_bit(bw,cfg->sb_qindex!=NULL)) != 0) return st;
+    if (cfg->sb_qindex && (st=svt_av2_bit_writer_write_bits(bw,2u,2u)) != 0) return st;
     /* AVM Y direction flags, UV flags, V delta, then H delta/inheritance. */
     if ((st=svt_av2_bit_writer_write_bit(bw,(cfg->deblock_y&1u)!=0u))!=0) return st;
     if ((st=svt_av2_bit_writer_write_bit(bw,(cfg->deblock_y&2u)!=0u))!=0) return st;
@@ -355,7 +373,7 @@ int svt_av2_frame_header_write(SvtAv2BitWriter* bw,
         if (cfg->multi_frame && (st = svt_av2_bit_writer_write_bit(bw, cfg->gdf_code != 0u)) != 0) return st;
         if (cfg->gdf_code) {
             if ((cfg->frame_width > 64u || cfg->frame_height > 64u) &&
-                (st = svt_av2_bit_writer_write_bit(bw, 0u)) != 0) return st; /* Frame-wide mode. */
+                (st = svt_av2_bit_writer_write_bit(bw, cfg->gdf_flags != NULL)) != 0) return st;
             if ((st = svt_av2_bit_writer_write_bits(bw, cfg->gdf_code - 1u, 4u)) != 0) return st;
         }
     }

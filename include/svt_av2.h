@@ -67,6 +67,10 @@ typedef enum SvtAv2BitDepth {
 
 /* Prediction structure; M4 adds synchronous single-reference low-delay P.
  * ALL_INTRA remains the default so existing encoded streams are unchanged. */
+/* The lookahead profiles begin an independently decodable sequence at this
+ * display interval. Their coded-order submissions cannot cross the boundary. */
+#define SVT_AV2_LOOKAHEAD_KEY_INTERVAL 240u
+
 typedef enum SvtAv2PredictionStructure {
     SVT_AV2_PRED_ALL_INTRA = 0,
     SVT_AV2_PRED_LOW_DELAY_P = 1
@@ -260,6 +264,7 @@ typedef enum SvtAv2Parameter {
     SVT_AV2_PARAM_INTER_NEAR,
     /* Percent of the selected AVM RD lambda, 0=default or 50..250. */
     SVT_AV2_PARAM_RD_LAMBDA_SCALE,
+    SVT_AV2_PARAM_TILE_COLUMNS, /* Still-picture fast RD: 1, 2, 4 or 8 uniform columns. */
     SVT_AV2_PARAM_COUNT
 } SvtAv2Parameter;
 

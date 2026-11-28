@@ -13,6 +13,8 @@ typedef struct SvtAv2RdFrameConfig {
     SvtAv2FrameHeaderConfig frame_header;
     uint32_t rd_mode; /* 1=exhaustive, 2=pruned, 3=fast still intra */
     uint32_t partition_selection; /* 4=small rectangles, 5=also uniform long rectangles, 6=also bounded 32-quadrant rectangles, 7=also bounded small-rectangle mixtures, 8=also uniform thin rectangles, 9=also bounded thin mixtures, 10=also uniform 8x64/64x8 */
+    const struct SvtAv2MotionField* temporal_motion;
+    uint32_t motion_distance[2];
     uint32_t motion_optimization; /* 1=legacy-range RD, 2=wide RD, 3=fixed half-pel RD (mv_half P frames only) */
     uint32_t satd_angles; /* Additional SATD shortlist; original candidates retained. */
     uint32_t angle_search; /* 48-angle Y-SAD shortlist plus exact refinement on the winning tree */
@@ -29,6 +31,13 @@ typedef struct SvtAv2RdFrameConfig {
     void* candidate_hook_user;
     uint32_t reverse_candidates;
     int screen_trees; /* Compare greedy partition seeds before refining the winner. */
+    int balanced_still_search;
+    uint32_t shortlist_trees;
+    int thin_still_search;
+    int subrect_search;
+    uint16_t* sb_qindex; /* Optional output map for still-picture delta Q. */
+    int sparse_angle_search;
+    uint32_t threads;
     uint32_t tree_finalists; /* 0=original winner, 2=best two basic trees, 4=also preserve two seeds before long rectangles, 8=global four plus two before long and thin rectangles, 10=also retain both 8x64/64x8 seeds */
     uint32_t rd_lambda_scale;
     uint32_t rd_lambda_model; /* 0=original, 1=AVM AI with compile-time scale, 2=AVM AI base x6/4 */
@@ -39,6 +48,7 @@ typedef struct SvtAv2RdFrameConfig {
     uint32_t inter_tail; /* 1=optionally prune weak end-of-block DCT coefficients on the P winner. */
     uint32_t inter_near; /* 1=bounded exact-RD DRL0 predictor targets on quarter P. */
     uint32_t intra_ist_search;
+    uint8_t matrix_rounding; /* Round with the effective step at each coefficient. */
     uint8_t avm_fp_round;
     const SvtAv2ReferenceFrame* secondary_reference; /* Distinct past LONG in projected two-reference P. */
     struct SvtAv2EntropyModels* end_models; /* Optional committed tile bank before frame decay. */

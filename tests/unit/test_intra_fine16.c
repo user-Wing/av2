@@ -175,7 +175,7 @@ static void geometry_tests(void) {
     }
     SVT_TEST_CHECK_EQ_INT(checked,7000u);
     SVT_TEST_CHECK_EQ_INT(max_leaves,61u);SVT_TEST_CHECK_EQ_INT(max_events,121u);
-    const uint16_t invalid[3]={4095u,M6_FINE16_PAIR?40496u:11096u,65535u};Walk untouched={0};
+    const uint16_t invalid[3]={4095u,M6_FINE16_PAIR?(SVT_AV2_MIXED_RECT32_BASE + SVT_AV2_MIXED_RECT32_COUNT):11096u,65535u};Walk untouched={0};
     for (uint32_t i=0u;i<3u;++i)
         SVT_TEST_CHECK_EQ_INT(svt_av2_partition_traverse_sb_plan(&g,0u,invalid+i,1u,collect,&untouched),SVT_AV2_ERROR_INVALID_PARAMETER);
     SVT_TEST_CHECK_EQ_INT(untouched.count,0u);
@@ -201,7 +201,7 @@ static void transaction_test(Forced* f,uint16_t decision,uint32_t adaptive) {
     SVT_TEST_CHECK(svt_av2_tile_rate_trial(session,0u,decision,f->blocks,f->count,NULL,0u,1,&repeat)!=0);
     --f->blocks[1].x;
     SVT_TEST_CHECK(svt_av2_tile_rate_trial(session,0u,4095u,f->blocks,f->count,NULL,0u,1,&repeat)!=0);
-    SVT_TEST_CHECK(svt_av2_tile_rate_trial(session,0u,M6_FINE16_PAIR?40496u:11096u,f->blocks,f->count,NULL,0u,1,&repeat)!=0);
+    SVT_TEST_CHECK(svt_av2_tile_rate_trial(session,0u,M6_FINE16_PAIR?(SVT_AV2_MIXED_RECT32_BASE + SVT_AV2_MIXED_RECT32_COUNT):11096u,f->blocks,f->count,NULL,0u,1,&repeat)!=0);
     SVT_TEST_CHECK_EQ_INT(svt_av2_tile_rate_trial(session,0u,decision,f->blocks,f->count,NULL,0u,0,&repeat),0);
     SVT_TEST_CHECK_EQ_INT(repeat,original);
     SVT_TEST_CHECK_EQ_INT(svt_av2_tile_rate_trial(session,0u,decision,f->blocks,f->count,NULL,0u,1,&repeat),0);

@@ -143,6 +143,7 @@ void svt_av2_entropy_encoder_init(SvtAv2EntropyEncoder* enc, uint8_t* buf,
     enc->error = 0;
     enc->rate_only = 0u;
     enc->models = NULL;
+    enc->trial = NULL;
     enc->rate_q12 = 0u;
     enc->rate_symbols = enc->rate_literal_bits = 0u;
 }

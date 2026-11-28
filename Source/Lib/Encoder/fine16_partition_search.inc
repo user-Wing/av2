@@ -92,6 +92,43 @@ static uint32_t fine16_initial_code(const RdWork* work) {
     }
     return code;
 }
+/* Between-cell variance measures the reduction in DC residual energy when
+ * one 16x16 cell is split into four 8x8s. Try splitting the most heterogeneous
+ * cells first; exact entropy and reconstructed distortion decide the winner. */
+static void fine16_rank_masks(RdWork* work) {
+    const SvtAv2FrameBuffer* src = work->source;
+    const unsigned bytes = src->bit_depth > 8u ? 2u : 1u;
+    for (unsigned q = 0; q < 4; ++q) {
+        uint32_t score[4];
+        for (unsigned cell = 0; cell < 4; ++cell) {
+            const unsigned x = work->region[0].x + 32u * (q & 1u) + 16u * (cell & 1u);
+            const unsigned y = work->region[0].y + 32u * (q >> 1u) + 16u * (cell >> 1u);
+            uint32_t sum[4] = {0};
+            for (unsigned j = 0; j < 16; ++j) {
+                const uint8_t* row = src->planes[0] + (size_t)(y + j) * src->strides[0] + x * bytes;
+                for (unsigned i = 0; i < 16; ++i)
+                    sum[2u * (j >> 3u) + (i >> 3u)] += svt_av2_sample_load(row + i * bytes, src->bit_depth);
+            }
+            uint32_t total = 0, squares = 0;
+            for (unsigned i = 0; i < 4; ++i) {
+                const uint32_t mean = (sum[i] + 32u) >> 6u;
+                total += mean; squares += mean * mean;
+            }
+            score[cell] = 4u * squares - total * total;
+        }
+        uint16_t admitted = 0;
+        for (unsigned mask = 1; mask < 15; ++mask) {
+            uint32_t lowest = UINT32_MAX, highest = 0;
+            for (unsigned i = 0; i < 4; ++i) {
+                if (mask & (1u << i)) lowest = SVT_AV2_MIN(lowest, score[i]);
+                else highest = SVT_AV2_MAX(highest, score[i]);
+            }
+            if (lowest && lowest >= highest) admitted |= (uint16_t)(1u << mask);
+        }
+        work->fine16_masks[q] = admitted;
+    }
+}
+
 static SvtAv2Error fine16_prepare(RdWork* work,size_t sb,uint16_t old_plan,
     RdTreeSeed seeds[4],uint32_t* count) {
     *count=0u;
@@ -109,6 +146,7 @@ static SvtAv2Error fine16_prepare(RdWork* work,size_t sb,uint16_t old_plan,
         }
         for (uint32_t i=0u;i<14u;++i) {
             const uint32_t mask=M6_FINE16_REVERSE_CHOICES?14u-i:1u+i;
+            if (work->ranked_fine16 && !(work->fine16_masks[q] & (1u << mask))) continue;
             const uint16_t plan=(uint16_t)(4096u+(q*14u+mask-1u)*125u+others);
             RdBasicChoice trial;
             error=fine16_evaluate(work,entry,sb,plan,search,&trial);
@@ -116,7 +154,8 @@ static SvtAv2Error fine16_prepare(RdWork* work,size_t sb,uint16_t old_plan,
         }
     }
     if (error==SVT_AV2_ERROR_NONE) {
-        *count=search->best_count;memcpy(seeds,search->best,*count*sizeof(*seeds));
+        *count=work->ranked_fine16 ? SVT_AV2_MIN(2u,search->best_count) : search->best_count;
+        memcpy(seeds,search->best,*count*sizeof(*seeds));
         fprintf(stderr,"FINE16_BASIC sb=%zu trials=%u finalists=%u\n",sb,search->seen_count,*count);
     }
     const SvtAv2RdFrameStats aggregate=work->stats;

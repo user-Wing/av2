@@ -205,12 +205,33 @@ typedef struct SharpAxis {
     int first;
 } SharpAxis;
 
-static SharpAxis sharp_axis(uint32_t phase, uint32_t span) {
+/* AV2 EIGHTTAP_REGULAR in Q6, indexed by sixteenth-sample phase. */
+static const int16_t regular_q6[16][8] = {
+    {0, 0, 0, 64, 0, 0, 0, 0},
+    {0, 1, -3, 63, 4, -1, 0, 0},
+    {0, 1, -5, 61, 9, -2, 0, 0},
+    {0, 1, -6, 58, 14, -4, 1, 0},
+    {0, 1, -7, 55, 19, -5, 1, 0},
+    {0, 1, -7, 51, 24, -6, 1, 0},
+    {0, 1, -8, 47, 29, -6, 1, 0},
+    {0, 1, -7, 42, 33, -6, 1, 0},
+    {0, 1, -7, 38, 38, -7, 1, 0},
+    {0, 1, -6, 33, 42, -7, 1, 0},
+    {0, 1, -6, 29, 47, -8, 1, 0},
+    {0, 1, -6, 24, 51, -7, 1, 0},
+    {0, 1, -5, 19, 55, -7, 1, 0},
+    {0, 1, -4, 14, 58, -6, 1, 0},
+    {0, 0, -2, 9, 61, -5, 1, 0},
+    {0, 0, -1, 4, 63, -3, 1, 0},
+};
+
+static SharpAxis sharp_axis(uint32_t phase, uint32_t span, int regular) {
     static const int16_t identity = 64;
     if (phase == 0u) return (SharpAxis){&identity, 1u, 0};
     const uint32_t index = (phase - 1u) >> 1;
     if (span <= 4u)
         return (SharpAxis){phase & 1u ? small_regular_odd_q6[index] : small_regular_q6[index], 4u, -1};
+    if (regular) return (SharpAxis){regular_q6[phase], 8u, -3};
     return (SharpAxis){phase & 1u ? sharp_odd_q6[index] : sharp_q6[index], 8u, -3};
 }
 
@@ -438,7 +459,7 @@ typedef struct SharpLumaSad {
     uint64_t limit, sad;
 } SharpLumaSad;
 
-static uint64_t sharp_row_sad(const uint8_t* source, const uint16_t* predicted, uint32_t count,
+uint64_t svt_av2_prediction_row_sad(const uint8_t* source, const uint16_t* predicted, uint32_t count,
     uint32_t depth) {
     const size_t step = depth > 8u ? 2u : 1u;
     uint64_t total = 0;
@@ -511,13 +532,13 @@ static int sharp_sad_sum(SharpLumaSad* screen, uint64_t row_sad) {
 
 static int sharp_sad_accumulate(SharpLumaSad* screen, const uint16_t* predicted, uint32_t row,
     uint32_t width, uint32_t depth) {
-    return sharp_sad_sum(screen, sharp_row_sad(screen->source + (size_t)row * screen->stride,
+    return sharp_sad_sum(screen, svt_av2_prediction_row_sad(screen->source + (size_t)row * screen->stride,
         predicted, width, depth));
 }
 
-static SvtAv2Error predict_eighth_sharp(const SvtAv2FrameBuffer* reference, uint32_t plane,
+static SvtAv2Error predict_eighth_filtered(const SvtAv2FrameBuffer* reference, uint32_t plane,
     const SvtAv2BlockView* block, int64_t mv_x, int64_t mv_y, uint16_t* prediction,
-    uint32_t prediction_stride, SharpLumaSad* screen) {
+    uint32_t prediction_stride, SharpLumaSad* screen, int regular) {
     if (reference == NULL || block == NULL || reference->buffer == NULL ||
         plane >= 3u || reference->planes[plane] == NULL ||
         (screen == NULL && (prediction == NULL || prediction_stride < block->w)) ||
@@ -565,8 +586,8 @@ static SvtAv2Error predict_eighth_sharp(const SvtAv2FrameBuffer* reference, uint
         return svt_av2_inter_predict_half(reference, plane, block, half, prediction, prediction_stride);
     }
 
-    const SharpAxis horiz = sharp_axis(fx, block->w);
-    const SharpAxis vert = sharp_axis(fy, block->h);
+    const SharpAxis horiz = sharp_axis(fx, block->w, regular);
+    const SharpAxis vert = sharp_axis(fy, block->h, regular);
     const int64_t top = y + vert.first;
     int32_t intermediate[8][SHARP_ROW_WIDTH];
 #if SVT_SHARP_HAVE_SSE2
@@ -624,26 +645,26 @@ static SvtAv2Error predict_eighth_sharp(const SvtAv2FrameBuffer* reference, uint
 SvtAv2Error svt_av2_inter_predict_half_sharp(const SvtAv2FrameBuffer* reference, uint32_t plane,
     const SvtAv2BlockView* block, SvtAv2HalfPelMotionVector mv, uint16_t* prediction,
     uint32_t prediction_stride) {
-    return predict_eighth_sharp(reference, plane, block, 4 * (int64_t)mv.mv_x, 4 * (int64_t)mv.mv_y,
-        prediction, prediction_stride, NULL);
+    return predict_eighth_filtered(reference, plane, block, 4 * (int64_t)mv.mv_x, 4 * (int64_t)mv.mv_y,
+        prediction, prediction_stride, NULL, 0);
 }
 
 SvtAv2Error svt_av2_inter_predict_quarter_sharp(const SvtAv2FrameBuffer* reference, uint32_t plane,
     const SvtAv2BlockView* block, SvtAv2QuarterPelMotionVector mv, uint16_t* prediction,
     uint32_t prediction_stride) {
-    return predict_eighth_sharp(reference, plane, block, 2 * (int64_t)mv.mv_x, 2 * (int64_t)mv.mv_y,
-        prediction, prediction_stride, NULL);
+    return predict_eighth_filtered(reference, plane, block, 2 * (int64_t)mv.mv_x, 2 * (int64_t)mv.mv_y,
+        prediction, prediction_stride, NULL, 0);
 }
 
 SvtAv2Error svt_av2_inter_predict_eighth_sharp(const SvtAv2FrameBuffer* reference, uint32_t plane,
     const SvtAv2BlockView* block, SvtAv2EighthPelMotionVector mv, uint16_t* prediction,
     uint32_t prediction_stride) {
-    return predict_eighth_sharp(reference, plane, block, mv.mv_x, mv.mv_y, prediction, prediction_stride, NULL);
+    return predict_eighth_filtered(reference, plane, block, mv.mv_x, mv.mv_y, prediction, prediction_stride, NULL, 0);
 }
 
 static SvtAv2Error sharp_luma_sad(const SvtAv2FrameBuffer* source,
     const SvtAv2FrameBuffer* reference, const SvtAv2BlockView* block,
-    int64_t mv_x, int64_t mv_y, uint64_t limit, uint64_t* sad) {
+    int64_t mv_x, int64_t mv_y, uint64_t limit, uint64_t* sad, int regular) {
     if (source == NULL || reference == NULL || block == NULL || sad == NULL || source->buffer == NULL ||
         source->planes[0] == NULL || source->visible_width != reference->visible_width ||
         source->visible_height != reference->visible_height || source->bit_depth != reference->bit_depth ||
@@ -654,7 +675,7 @@ static SvtAv2Error sharp_luma_sad(const SvtAv2FrameBuffer* source,
     const size_t step = source->bit_depth > 8u ? 2u : 1u;
     SharpLumaSad screen = {source->planes[0] + (size_t)block->y * source->strides[0] + (size_t)block->x * step,
         source->strides[0], limit, 0u};
-    const SvtAv2Error error = predict_eighth_sharp(reference, 0u, block, mv_x, mv_y, NULL, 0u, &screen);
+    const SvtAv2Error error = predict_eighth_filtered(reference, 0u, block, mv_x, mv_y, NULL, 0u, &screen, regular);
     if (error == SVT_AV2_ERROR_NONE) *sad = screen.sad;
     return error;
 }
@@ -662,11 +683,23 @@ static SvtAv2Error sharp_luma_sad(const SvtAv2FrameBuffer* source,
 SvtAv2Error svt_av2_inter_luma_sad_quarter_sharp(const SvtAv2FrameBuffer* source,
     const SvtAv2FrameBuffer* reference, const SvtAv2BlockView* block,
     SvtAv2QuarterPelMotionVector mv, uint64_t limit, uint64_t* sad) {
-    return sharp_luma_sad(source, reference, block, 2 * (int64_t)mv.mv_x, 2 * (int64_t)mv.mv_y, limit, sad);
+    return sharp_luma_sad(source, reference, block, 2 * (int64_t)mv.mv_x, 2 * (int64_t)mv.mv_y, limit, sad, 0);
 }
 
 SvtAv2Error svt_av2_inter_luma_sad_eighth_sharp(const SvtAv2FrameBuffer* source,
     const SvtAv2FrameBuffer* reference, const SvtAv2BlockView* block,
     SvtAv2EighthPelMotionVector mv, uint64_t limit, uint64_t* sad) {
-    return sharp_luma_sad(source, reference, block, mv.mv_x, mv.mv_y, limit, sad);
+    return sharp_luma_sad(source, reference, block, mv.mv_x, mv.mv_y, limit, sad, 0);
+}
+
+SvtAv2Error svt_av2_inter_predict_eighth_regular(const SvtAv2FrameBuffer* reference, uint32_t plane,
+    const SvtAv2BlockView* block, SvtAv2EighthPelMotionVector mv, uint16_t* prediction,
+    uint32_t prediction_stride) {
+    return predict_eighth_filtered(reference, plane, block, mv.mv_x, mv.mv_y, prediction, prediction_stride, NULL, 1);
+}
+
+SvtAv2Error svt_av2_inter_luma_sad_eighth_regular(const SvtAv2FrameBuffer* source,
+    const SvtAv2FrameBuffer* reference, const SvtAv2BlockView* block,
+    SvtAv2EighthPelMotionVector mv, uint64_t limit, uint64_t* sad) {
+    return sharp_luma_sad(source, reference, block, mv.mv_x, mv.mv_y, limit, sad, 1);
 }

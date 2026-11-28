@@ -37,6 +37,11 @@ int main(void) {
     CHECK(svt_av2_mvp_quarter_delta(-128, 128, &v) && v == -128);
     CHECK(!svt_av2_mvp_quarter_delta(-128, 130, &v) && v == -128);
     CHECK(!svt_av2_mvp_quarter_delta(-128, 2, NULL));
+    CHECK(svt_av2_mvp_project_q3_range(1, 248, 8, 1, &v) && v == 1984);
+    CHECK(!svt_av2_mvp_project_q3_range(1, 249, 1, 1, &v) && v == 1984);
+    CHECK(svt_av2_mvp_quarter_delta_range(1, -248, 248, &v) && v == -248);
+    CHECK(!svt_av2_mvp_quarter_delta_range(1, -248, 250, &v) && v == -248);
+    CHECK(!svt_av2_mvp_quarter_delta_range(1, 247, 248, &v) && v == -248);
     uint32_t distances[2] = {42u, 43u};
     CHECK(svt_av2_mvp_two_past_distances(257u, 256u, 254u, distances) && distances[0] == 1u && distances[1] == 3u);
     CHECK(svt_av2_mvp_two_past_distances(UINT64_MAX, UINT64_MAX-8u, UINT64_MAX-1u, distances) &&

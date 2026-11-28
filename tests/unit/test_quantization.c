@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "quantization.h"
+#include "quantization_internal.h"
 
 /* --- 1. reference tables --------------------------------------------------- */
 
@@ -1175,11 +1176,66 @@ static void test_qm12(void) {
             }
         }
     }
-    SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, 8, 5, 0), SVT_AV2_QUANT_ERR_UNSUPPORTED);
+    SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, 8, 11, 0), SVT_AV2_QUANT_ERR_UNSUPPORTED);
     SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, 8, 4, -24), SVT_AV2_QUANT_ERR_UNSUPPORTED);
 }
 
+static void test_matrix_dispatch(void) {
+    int32_t c[256], q[256], dq[256], selected_q[256], selected_dq[256];
+    SvtAv2QuantizeBlockFn selected = svt_av2_quantize_block_select();
+    for (unsigned level = 2; level <= 12; ++level) {
+        if (level == 11u) continue;
+        SvtAv2QuantParams p;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 148, 16, 16, 10, level, -8), SVT_AV2_QUANT_OK);
+        p.matrix_rounding = 1;
+        for (int scale = 0; scale <= 2; ++scale) {
+            for (unsigned i = 0; i < 256; ++i) {
+                const int weight = p.inverse_matrix[1][p.qm_offset + i];
+                const int step = (weight * p.plane[1].ac + 16) >> 5;
+                const int magnitude = (step * (1 + (int)(i % 63)) - ((step * 109) >> 8)) >> (3 + scale);
+                c[i] = (i & 1 ? -1 : 1) * (magnitude + (int)(i % 3) - 1);
+            }
+            SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, c, q, dq, 256, 1, scale), SVT_AV2_QUANT_OK);
+            SVT_TEST_CHECK_EQ_INT(selected(&p, c, selected_q, selected_dq, 256, 1, scale), SVT_AV2_QUANT_OK);
+            SVT_TEST_CHECK(memcmp(q, selected_q, sizeof(q)) == 0 && memcmp(dq, selected_dq, sizeof(dq)) == 0);
+            c[255] = INT32_MIN;
+            SVT_TEST_CHECK_EQ_INT(selected(&p, c, selected_q, selected_dq, 256, 1, scale), SVT_AV2_QUANT_ERR_LEVEL_OVERFLOW);
+            SVT_TEST_CHECK(memcmp(q, selected_q, sizeof(q)) == 0 && memcmp(dq, selected_dq, sizeof(dq)) == 0);
+        }
+    }
+}
+
+static void test_matrix_rounding_limits(void) {
+    for (unsigned depth = 8; depth <= 10; depth += 2) {
+        for (unsigned qp = 1; qp <= 255; qp += 254) {
+            for (unsigned level = 2; level <= 12; ++level) {
+        if (level == 11u) continue;
+                SvtAv2QuantParams p;
+                int32_t c[1024] = {0}, q[1024], dq[1024], decoded[1024];
+                unsigned index = qp + (depth - 8) * 24;
+                int delta = qp == 1 ? -23 : 8;
+                SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, index, 64, 64,
+                    depth, level, delta), SVT_AV2_QUANT_OK);
+                p.matrix_rounding = 1;
+                for (unsigned i = 0; i < 1024; ++i) c[i] = (int)(i % 127) - 63;
+                for (int plane = 0; plane < 3; ++plane) {
+                    SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, c, q, dq, 1024, plane, 2), SVT_AV2_QUANT_OK);
+                    int32_t selected_q[1024], selected_dq[1024];
+                    SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block_select()(&p, c, selected_q, selected_dq,
+                        1024, plane, 2), SVT_AV2_QUANT_OK);
+                    SVT_TEST_CHECK(memcmp(selected_q, q, sizeof(q)) == 0);
+                    SVT_TEST_CHECK(memcmp(selected_dq, dq, sizeof(dq)) == 0);
+                    SVT_TEST_CHECK_EQ_INT(svt_av2_dequantize_block(&p, q, decoded, 1024, plane), SVT_AV2_QUANT_OK);
+                    for (unsigned i = 0; i < 1024; ++i) SVT_TEST_CHECK_EQ_INT(decoded[i], dq[i]);
+                }
+            }
+        }
+    }
+}
+
 int main(void) {
+    test_matrix_rounding_limits();
+    test_matrix_dispatch();
     {
         SvtAv2QuantParams p;
         int32_t c[16] = {48, -48}, q[16], dq[16];
@@ -1191,6 +1247,27 @@ int main(void) {
         SVT_TEST_CHECK_EQ_INT(q[0], 1);
         SVT_TEST_CHECK_EQ_INT(q[1], -1);
         SVT_TEST_CHECK_EQ_INT(dq[1], -88);
+    }
+    {
+        SvtAv2QuantParams p;
+        int32_t c[16] = {0}, q[16], dq[16];
+        SVT_TEST_CHECK_EQ_INT(svt_av2_quant_params_init_matrix(&p, 100, 4, 4, 8, 12, 0), SVT_AV2_QUANT_OK);
+        p.matrix_rounding = 1;
+        /* Q100 with inverse weight 35 has a 770-QTX step. At 98/256
+         * first-level bias, 59 rounds to zero and 60 crosses the threshold. */
+        for (int sign = -1; sign <= 1; sign += 2) {
+            c[15] = sign * 59;
+            SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, c, q, dq, 16, 0, 0), SVT_AV2_QUANT_OK);
+            SVT_TEST_CHECK_EQ_INT(q[15], 0);
+            c[15] = sign * 60;
+            SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, c, q, dq, 16, 0, 0), SVT_AV2_QUANT_OK);
+            SVT_TEST_CHECK_EQ_INT(q[15], sign);
+            SVT_TEST_CHECK_EQ_INT(dq[15], sign * 96);
+        }
+        c[15] = INT32_MAX;
+        SVT_TEST_CHECK_EQ_INT(svt_av2_quantize_block(&p, c, q, dq, 16, 0, 0), SVT_AV2_QUANT_ERR_LEVEL_OVERFLOW);
+        SVT_TEST_CHECK_EQ_INT(q[15], 1);
+        SVT_TEST_CHECK_EQ_INT(dq[15], 96);
     }
     test_qm12();
     test_peak_preflight_matches_original_block();

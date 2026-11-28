@@ -71,8 +71,9 @@ typedef struct SvtAv2TransformPathState {
     uint32_t base_q_idx;
     uint32_t bit_depth;
     int8_t uv_delta_q;
-    uint8_t qm_level;
+    uint8_t qm_level, qm_uv_level; /* Zero UV override inherits luma. */
     uint8_t ac_prune;
+    uint8_t matrix_rounding; /* Round with the effective step at each coefficient. */
     uint8_t avm_fp_round;
 #if SVT_AV2_EXPERIMENTAL_DCT64_MATCH
     int match_dct64; /* Set before starting the frame; never shared across paths. */

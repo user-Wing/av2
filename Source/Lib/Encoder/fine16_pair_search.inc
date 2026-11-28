@@ -62,6 +62,7 @@ static SvtAv2Error fine16_pair_prepare(RdWork* work,size_t sb,uint16_t old_plan,
         for (uint32_t q=0u;q<4u;++q) if (q!=lo && q!=hi) {others+=shapes[q]*power;power*=5u;}
         for (uint32_t i=0u;i<14u;++i) {
             const uint32_t mask=M6_FINE16_REVERSE_CHOICES?14u-i:1u+i;
+            if (work->ranked_fine16 && !(work->fine16_masks[second] & (1u << mask))) continue;
             const uint32_t low_mask=lo==first?first_mask:mask;
             const uint32_t high_mask=hi==first?first_mask:mask;
             const uint16_t plan=(uint16_t)(11096u+((pair*14u+low_mask-1u)*14u+high_mask-1u)*25u+others);
@@ -69,9 +70,10 @@ static SvtAv2Error fine16_pair_prepare(RdWork* work,size_t sb,uint16_t old_plan,
             if (error!=SVT_AV2_ERROR_NONE) break;
         }
     }
-    if (error==SVT_AV2_ERROR_NONE && search->seen_count!=42u) error=SVT_AV2_ERROR_INVALID_STATE;
+    if (error==SVT_AV2_ERROR_NONE && !work->ranked_fine16 && search->seen_count!=42u) error=SVT_AV2_ERROR_INVALID_STATE;
     if (error==SVT_AV2_ERROR_NONE) {
-        *count=search->best_count;memcpy(seeds,search->best,*count*sizeof(*seeds));
+        *count=work->ranked_fine16 ? SVT_AV2_MIN(2u,search->best_count) : search->best_count;
+        memcpy(seeds,search->best,*count*sizeof(*seeds));
     }
     const uint32_t trials=search->seen_count;
     const SvtAv2RdFrameStats aggregate=work->stats;

@@ -17,6 +17,7 @@
 #include "intra_ist.h"
 #include "intra_ist_modes.h"
 
+#include <string.h>
 #include "cdf_tables.h"
 #include "cdf_tables_coeff.h"
 
@@ -40,8 +41,6 @@
 /* TX_PAD_HOR = 4 (TX_PAD_HOR_LOG2 = 2), TX_PAD_TOP = 1 (enums.h). */
 #define SVT_AV2_TX_PAD_HOR 4u
 #define SVT_AV2_TX_PAD_TOP 1u
-#define SVT_AV2_MAX_SCAN_COEFFS \
-    (SVT_AV2_COEFF_MAX_TX_DIM * SVT_AV2_COEFF_MAX_TX_DIM)
 /* rows of data + top/bottom/trailing padding; multiple of the stride so the
  * "+2 rows" reads used by the 4-neighbour templates stay in bounds. */
 #define SVT_AV2_LEVEL_BUF_SIZE \
@@ -142,7 +141,7 @@ static int lvl_idx(int pos, uint32_t bwl) {
  * Scan order for DCT_DCT (TX_CLASS_2D)
  * ========================================================================== */
 
-size_t svt_av2_coeff_scan_dct_dct(SvtAv2TxSize tx_size, uint16_t* scan) {
+static size_t build_dct_scan(SvtAv2TxSize tx_size, uint16_t* scan) {
     if (scan == NULL) {
         return 0u;
     }
@@ -169,6 +168,30 @@ size_t svt_av2_coeff_scan_dct_dct(SvtAv2TxSize tx_size, uint16_t* scan) {
         }
     }
     return n;
+}
+
+const uint16_t* svt_av2_coeff_scan_view(SvtAv2TxSize tx_size) {
+    /* Each axis has coded lengths 4, 8, 16 and 32. Pack their Cartesian
+     * product into 60*60 entries; 64-pixel transforms alias the 32-wide scan. */
+    static _Thread_local uint16_t storage[60u * 60u];
+    static _Thread_local const uint16_t* scans[SVT_AV2_TX_SIZE_COUNT];
+    if ((unsigned)tx_size >= SVT_AV2_TX_SIZE_COUNT) return NULL;
+    if (!scans[tx_size]) {
+        const uint32_t w = adjusted_dim(tx_size), h = adjusted_height(tx_size);
+        uint16_t* order = storage + (w - 4u) * 60u + w * (h - 4u);
+        build_dct_scan(tx_size, order);
+        scans[tx_size] = order;
+    }
+    return scans[tx_size];
+}
+
+size_t svt_av2_coeff_scan_dct_dct(SvtAv2TxSize tx_size, uint16_t* scan) {
+    if (!scan) return 0u;
+    const uint16_t* order = svt_av2_coeff_scan_view(tx_size);
+    if (!order) return 0u;
+    const size_t count = svt_av2_coeff_coeff_count(tx_size);
+    memcpy(scan, order, count * sizeof(*scan));
+    return count;
 }
 
 /* Number of coded coefficients for tx_size: av2_get_max_eob(), i.e. the 32x32
@@ -438,7 +461,6 @@ int svt_av2_coeff_literals_supported(void) { return 1; }
 
 typedef struct CoeffBlk {
     const uint16_t* scan;
-    size_t          nscan;
     uint32_t        bwl;      /* log2 of the coded grid width (adjusted) */
     uint32_t        width;    /* coded coefficient grid width  (adjusted) */
     uint32_t        height;   /* coded coefficient grid height (adjusted) */
@@ -657,7 +679,9 @@ int svt_av2_coeff_write_block_transform_ist(SvtAv2EntropyEncoder* enc,
     const SvtAv2CoeffPlaneInfo* pi = plane_info;
     if (pi->plane > 2u ||
         (uint32_t)pi->tx_size >= (uint32_t)SVT_AV2_TX_SIZE_COUNT ||
-        (is_inter && pi->tx_size >= SVT_AV2_TX_4X8) ||
+        (is_inter && pi->tx_size >= SVT_AV2_TX_4X8 &&
+         !(pi->plane ? (pi->tx_size == SVT_AV2_TX_16X8 || pi->tx_size == SVT_AV2_TX_8X16) :
+                       (pi->tx_size == SVT_AV2_TX_32X16 || pi->tx_size == SVT_AV2_TX_16X32))) ||
         pi->units_w > SVT_AV2_COEFF_CTX_UNITS || pi->units_h > SVT_AV2_COEFF_CTX_UNITS ||
         pi->x4 >= pi->units_w || pi->y4 >= pi->units_h) {
         return SVT_AV2_COEFF_ERR_UNSUPPORTED;
@@ -690,21 +714,9 @@ int svt_av2_coeff_write_block_transform_ist(SvtAv2EntropyEncoder* enc,
     cb.txs_ctx = svt_av2_coeff_tx_sz_ctx(tx_size);
     cb.eob_multi_size = eob_multi_size_of(tx_size);
 
-    uint16_t scan_buf[SVT_AV2_MAX_SCAN_COEFFS];
-    cb.nscan = svt_av2_coeff_scan_dct_dct(tx_size, scan_buf);
-    cb.scan = scan_buf;
-    if (cb.nscan != (size_t)cb.count) {
-        return SVT_AV2_COEFF_ERR_UNSUPPORTED;
-    }
-
-    const uint32_t stride = cb.width + SVT_AV2_TX_PAD_HOR;
-    cb.lv = cb.lv_buf + SVT_AV2_TX_PAD_TOP * stride;
-    for (size_t i = 0; i < SVT_AV2_LEVEL_BUF_SIZE; ++i) {
-        cb.lv_buf[i] = 0u;
-    }
-
+    cb.scan = svt_av2_coeff_scan_view(tx_size);
     /* --- 1. all_zero (5.20.7.27 p.224; CDF 8.3.2 p.598) ------------------ */
-    cb.eob = svt_av2_coeff_find_eob(qcoeff, scan_buf, cb.count);
+    cb.eob = svt_av2_coeff_find_eob(qcoeff, cb.scan, cb.count);
     const uint32_t ist_mode = enable_ist ? svt_av2_ist_mode(intra_mode) : 12u;
     const int ist_signal = enable_ist && !is_inter && pi->plane == 0u &&
         ist_mode < 12u && cb.eob > 1u &&
@@ -773,6 +785,11 @@ int svt_av2_coeff_write_block_transform_ist(SvtAv2EntropyEncoder* enc,
         }
         return SVT_AV2_COEFF_OK;
     }
+
+    const uint32_t stride = cb.width + SVT_AV2_TX_PAD_HOR;
+    cb.lv = cb.lv_buf + SVT_AV2_TX_PAD_TOP * stride;
+    /* The significance and magnitude contexts reach at most two rows below the block. */
+    memset(cb.lv, 0, (size_t)(cb.height + 2u) * stride);
 
     /* --- 2. eob token, eob_extra, eob_pt_*_extra (5.20.7.27 p.225) ------- */
     {
@@ -869,11 +886,22 @@ int svt_av2_coeff_write_block_transform_ist(SvtAv2EntropyEncoder* enc,
     }
     /* Inter DCT_IDTX reduced set: DCT_DCT is symbol one, uniform binary.
      * Intra DCT and 64x64 transforms are implied; chroma inherits luma type. */
-    if (is_inter && plane == 0u && pi->tx_size < SVT_AV2_TX_64X64) {
-        const uint16_t cdf = 16384u;
+    if (is_inter && plane == 0u && pi->tx_size != SVT_AV2_TX_64X64) {
         const uint32_t diag = ((cb.eob - 1u) >> cb.bwl) + ((cb.eob - 1u) & (cb.width - 1u));
         const uint32_t ectx = diag < 2u ? 1u : diag > cb.width + cb.height - 4u ? 2u : 0u;
-        const int st = emit_sym(enc, SVT_AV2_MODEL_INTER_TX + ectx * 4u + (uint32_t)pi->tx_size, &cdf, 2u, 1u);
+        int st;
+        if (cb.ctx_w != cb.ctx_h) {
+            /* LONG_SIDE_32 signals DCT on the long axis, then DCT on the
+             * short axis with its own last-position context. */
+            static const uint16_t long_cdf = 128u;
+            static const uint16_t short_cdf[3][3] = {
+                {21212u,27810u,32748u}, {31614u,32529u,32748u}, {15407u,26475u,32732u}};
+            st = emit_sym(enc, SVT_AV2_MODEL_INTER_LONG_TX32, &long_cdf, 2u, 1u);
+            if (!st) st = emit_sym(enc, SVT_AV2_MODEL_INTER_LONG_TX16 + ectx, short_cdf[ectx], 4u, 0u);
+        } else {
+            const uint16_t cdf = 16384u;
+            st = emit_sym(enc, SVT_AV2_MODEL_INTER_TX + ectx * 4u + (uint32_t)pi->tx_size, &cdf, 2u, 1u);
+        }
         if (st != 0) return st;
     }
     if (ist_signal) {

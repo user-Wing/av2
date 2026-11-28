@@ -8,6 +8,11 @@ typedef struct SvtAv2EntropyModels {
     uint16_t cdf[SVT_AV2_MODEL_COUNT][12];
 } SvtAv2EntropyModels;
 
+typedef struct SvtAv2EntropyTrial {
+    const SvtAv2EntropyModels* base;
+    uint32_t loaded[(SVT_AV2_MODEL_COUNT + 31u) / 32u];
+} SvtAv2EntropyTrial;
+
 int svt_av2_entropy_models_init(SvtAv2EntropyModels* models, uint32_t qctx);
 /* Decay counts once at frame end before saving the initialized tile context. */
 void svt_av2_entropy_models_decay(SvtAv2EntropyModels* models);

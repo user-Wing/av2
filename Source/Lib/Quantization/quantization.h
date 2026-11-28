@@ -102,6 +102,8 @@ typedef struct SvtAv2QuantParams {
      * points do not need to know about the plane tables. */
     const uint8_t (*inverse_matrix)[3600];
     uint16_t qm_size, qm_offset;  /* Zero size selects flat quantization. */
+    uint8_t qm_width; /* Coded width of the selected matrix. */
+    uint8_t matrix_rounding; /* Round with the effective step at each coefficient. */
     uint8_t avm_fp_round;  /* Use AVM round_fp_QTX in the forward quantizer. */
     int applies;
 } SvtAv2QuantParams;

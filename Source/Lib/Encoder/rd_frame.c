@@ -106,12 +106,12 @@ SvtAv2Error svt_av2_rd_lambda(uint32_t qindex, uint32_t bit_depth,
     return SVT_AV2_ERROR_NONE;
 }
 
-static SvtAv2Error rd_lambda_ai_scaled(uint32_t qindex, uint32_t bit_depth,
+static SvtAv2Error rd_lambda_avm_scaled(uint32_t qindex, uint32_t bit_depth, uint32_t q2_num,
     uint32_t numerator, uint32_t denominator, uint64_t* lambda_q8, uint32_t* qstep_qtx) {
     SvtAv2Error error = svt_av2_rd_lambda(qindex, bit_depth, lambda_q8, qstep_qtx);
     if (error != SVT_AV2_ERROR_NONE) return error;
     const uint64_t q = *qstep_qtx;
-    uint64_t rdmult = (q * q * 80u / 32u + 32u) >> 6u;
+    uint64_t rdmult = (q * q * q2_num / 32u + 32u) >> 6u;
     if (bit_depth == 10u) rdmult = (rdmult + 8u) >> 4u;
     if (rdmult == 0u) rdmult = 1u;
     *lambda_q8 = (rdmult + 1u) >> 1u;
@@ -124,13 +124,13 @@ static SvtAv2Error rd_lambda_ai_scaled(uint32_t qindex, uint32_t bit_depth,
 
 SvtAv2Error svt_av2_rd_lambda_ai(uint32_t qindex, uint32_t bit_depth,
     uint64_t* lambda_q8, uint32_t* qstep_qtx) {
-    return rd_lambda_ai_scaled(qindex, bit_depth, M6_LAMBDA_NUMERATOR,
+    return rd_lambda_avm_scaled(qindex, bit_depth, 80u, M6_LAMBDA_NUMERATOR,
         M6_LAMBDA_DENOMINATOR, lambda_q8, qstep_qtx);
 }
 
 SvtAv2Error svt_av2_rd_lambda_ai150(uint32_t qindex, uint32_t bit_depth,
     uint64_t* lambda_q8, uint32_t* qstep_qtx) {
-    return rd_lambda_ai_scaled(qindex, bit_depth, 6u, 4u, lambda_q8, qstep_qtx);
+    return rd_lambda_avm_scaled(qindex, bit_depth, 80u, 6u, 4u, lambda_q8, qstep_qtx);
 }
 
 SvtAv2Error svt_av2_rd_cost(uint64_t distortion, uint64_t lambda_q8,
@@ -230,11 +230,10 @@ typedef struct RdCoarsePrefix {
 
 /* Three plane bits per leaf index the original coefficient order. */
 typedef struct RdInterTail {
-    uint16_t scans[3][1024]; /* adjusted 8x8, 16x16, 32x32 (including coded 64x64) */
     uint16_t positions[INTER_FINE_MAX_LEAVES * 3u][SVT_AV2_INTER_TAIL_MAX];
     uint8_t counts[INTER_FINE_MAX_LEAVES * 3u];
     uint64_t mask, zero_mask;
-    int try_sparse_planes;
+    int try_sparse_planes, try_levels, apply_levels;
     uint64_t trials, accepts, coeffs[3], leaves[3], zero_tbs, rate_saved_q12;
     int trace;
 } RdInterTail;
@@ -256,10 +255,21 @@ typedef struct RdWork {
     uint32_t video_rect, video_rect_trials, video_rect_wins;
     int rank_intra_only;
     int detail_rd;
+    int qm_trellis;
     int full_inter_fine;
+    int mixed_inter_fine;
     int wide_inter_me;
+    int hierarchical_inter_me;
+    int coarse_long_hme;
+    uint32_t me_mv_weight;
+    int fine_reference_search;
+    uint16_t* me_pyramid[3];
     int edge_inter;
     int late_inter_skip;
+#if M6_FINE16
+    int ranked_fine16;
+    uint16_t fine16_masks[4];
+#endif
     uint32_t rect32_search, rect32_trials, rect32_wins, half_rect_wins, rect16_wins;
     int rect_rdoq;
     uint8_t* smooth_grid; /* Committed Y and UV smooth modes, one entry per 4x4 luma MI. */
@@ -399,8 +409,27 @@ static uint64_t hash_word(uint64_t hash, uint32_t value) {
 static int collect_leaf(void* user, const SvtAv2BlockView* block) {
     RdWork* work = (RdWork*)user;
     if (work->leaf_count >= RD_MAX_LEAVES) return -1;
+    if (work->config->rd_mode == 3u || work->config->screen_trees) {
+        for (uint32_t y = block->y; y < block->y + block->h; y += 4u)
+            memset(&work->leaf_at[y % 64u / 4u][block->x % 64u / 4u],
+                   (int)work->leaf_count, block->w / 4u);
+    }
     work->leaves[work->leaf_count++] = *block;
     return 0;
+}
+
+static void rd_hierarchical_motion(RdWork* work, const SvtAv2FrameBuffer* ref,
+    const SvtAv2BlockView* block, SvtAv2MotionSearchResult* result) {
+    const unsigned rank = ref == work->reference ? 0u : 1u;
+    const int radius = work->config->frame_header.wide_motion ? 31 : 16;
+    svt_av2_motion_hme(work->source, ref, work->me_pyramid[0], work->me_pyramid[1u + rank],
+        block, radius, result);
+    if (work->config->temporal_motion) {
+        int distance = (int)work->config->motion_distance[rank];
+        if (!rank && work->config->frame_header.paired_role >= SVT_AV2_ONLY_MIDPOINT) distance = -distance;
+        svt_av2_motion_temporal(work->source, ref, block, work->config->temporal_motion,
+            distance, radius, result);
+    }
 }
 
 static SvtAv2Error geometry_for_sb(RdWork* work, size_t sb, uint16_t decision) {
@@ -419,13 +448,6 @@ static SvtAv2Error geometry_for_sb(RdWork* work, size_t sb, uint16_t decision) {
     SvtAv2Error error = svt_av2_partition_traverse_sb_plan(&work->geometry, sb,
         work->output->decisions, work->output->decision_count, collect_leaf, work);
     if (error != SVT_AV2_ERROR_NONE) return error;
-    if (work->config->screen_trees) {
-        for (uint32_t i = 0; i < work->leaf_count; ++i) {
-            const SvtAv2BlockView* b = &work->leaves[i];
-            for (uint32_t y = b->y; y < b->y + b->h; y += 4u)
-                memset(&work->leaf_at[y % 64u / 4u][b->x % 64u / 4u], (int)i, b->w / 4u);
-        }
-    }
     if (work->reference != NULL) {
         SVT_AV2_IP_START(profile_me);
         for (uint32_t i = 0u; i < work->leaf_count; ++i) {
@@ -441,6 +463,7 @@ static SvtAv2Error geometry_for_sb(RdWork* work, size_t sb, uint16_t decision) {
             SvtAv2MotionSearchResult result;
             error = svt_av2_motion_estimate(work->source, work->reference, &work->leaves[i], &result);
             if (error != SVT_AV2_ERROR_NONE) return error;
+            if (work->me_pyramid[0]) rd_hierarchical_motion(work, work->reference, &work->leaves[i], &result);
             if (work->wide_inter_me && work->secondary)
                 svt_av2_motion_extend(work->source, work->reference, &work->leaves[i], &result);
             work->mvs[i] = result.mv;
@@ -562,8 +585,12 @@ static int legal_mode(const RdWork* work, uint32_t leaf, uint32_t mode) {
     if (mode == 3u) {
         if (work->secondary != NULL) {
             const SvtAv2BlockView* b = &work->leaves[leaf];
-            if (b->w != b->h || (b->w != 32u && b->w != 64u &&
+            if (b->w != b->h)
+                return work->video_rect >= 4u && !((b->x % b->w) || (b->y % b->h)) &&
+                    ((b->w == 16u && b->h == 32u) || (b->w == 32u && b->h == 16u));
+            if ((b->w != 32u && b->w != 64u &&
                 !(b->w == 16u && work->config->inter_fine) &&
+                !(b->w == 8u && work->me_pyramid[0]) &&
                 !(work->edge_inter && b->w == 8u && (work->region[0].w < 64u || work->region[0].h < 64u))) || b->x % b->w || b->y % b->h) return 0;
         }
         return work->reference != NULL;
@@ -593,7 +620,7 @@ static int reference_decoded(const RdWork* work, uint32_t leaf, int32_t x, int32
     if (py < sb->y) return 1;
     if (py >= sb->y + sb->h) return 0;
     if (px < sb->x) return 1;
-    if (work->config->screen_trees) return px < sb->x + sb->w && work->leaf_at[py % 64u / 4u][px % 64u / 4u] < leaf;
+    if (work->config->rd_mode == 3u || work->config->screen_trees) return px < sb->x + sb->w && work->leaf_at[py % 64u / 4u][px % 64u / 4u] < leaf;
     for (uint32_t i = 0u; i < leaf; ++i) {
         const SvtAv2BlockView* b = &work->leaves[i];
         if (px >= b->x && px < b->x + b->w && py >= b->y && py < b->y + b->h) return 1;
@@ -610,7 +637,7 @@ static uint32_t rd_smooth_neighbor(const RdWork* work, uint32_t leaf,
         const size_t cols = work->geometry.visible_width / 4u;
         return (work->smooth_grid[(y / 4u) * cols + x / 4u] >> (plane != 0u)) & 1u;
     }
-    if (work->config->screen_trees) {
+    if (work->config->rd_mode == 3u || work->config->screen_trees) {
         const uint32_t i = work->leaf_at[y % 64u / 4u][x % 64u / 4u];
         return i < leaf && rd_smooth_mode(plane ? work->uv_ids[i] : work->ids[i]);
     }
@@ -640,8 +667,8 @@ static int rd_motion_predict(const RdWork* work, uint32_t leaf, uint32_t rank,
 
 /* Clip a search seed to the representable interval and preserve the exact
  * predictor parity (choose the lower candidate on a half-lattice tie). */
-static int rd_snap_motion_component(int32_t desired, int32_t predictor, int32_t* target) {
-    int32_t lo = SVT_AV2_MAX(-128, predictor - 256), hi = SVT_AV2_MIN(128, predictor + 256);
+static int rd_snap_motion_component(int32_t limit, int32_t desired, int32_t predictor, int32_t* target) {
+    int32_t lo = SVT_AV2_MAX(-limit, predictor - 2 * limit), hi = SVT_AV2_MIN(limit, predictor + 2 * limit);
     lo += (lo - predictor) % 2 != 0;
     hi -= (hi - predictor) % 2 != 0;
     if (lo > hi) return 0;
@@ -651,10 +678,11 @@ static int rd_snap_motion_component(int32_t desired, int32_t predictor, int32_t*
     return 1;
 }
 
-static int rd_snap_motion(SvtAv2MotionVector desired, SvtAv2MotionVector predictor,
+static int rd_snap_motion(const RdWork* work, SvtAv2MotionVector desired, SvtAv2MotionVector predictor,
     SvtAv2MotionVector* target) {
-    return rd_snap_motion_component(desired.mv_x, predictor.mv_x, &target->mv_x) &&
-        rd_snap_motion_component(desired.mv_y, predictor.mv_y, &target->mv_y);
+    const int32_t limit = svt_av2_motion_q3_limit(work->config->frame_header.wide_motion);
+    return rd_snap_motion_component(limit, desired.mv_x, predictor.mv_x, &target->mv_x) &&
+        rd_snap_motion_component(limit, desired.mv_y, predictor.mv_y, &target->mv_y);
 }
 
 typedef enum ProjectedModeResult {
@@ -673,7 +701,7 @@ static ProjectedModeResult resolve_projected_mode(const RdWork* work, uint32_t l
     if (!rd_motion_predict(work, leaf, mode->reference_rank, &predictor)) return PROJECTED_MODE_ERROR;
     const SvtAv2MotionVector want = leaf < INTER_FINE_MAX_LEAVES && ((work->long_mask | work->q3_seed_mask) & (1u << leaf)) ? work->q3_seed[leaf] :
         (SvtAv2MotionVector){2 * work->mvs[leaf].mv_x, 2 * work->mvs[leaf].mv_y};
-    if (!rd_snap_motion(want, predictor, &target)) return PROJECTED_MODE_EMPTY;
+    if (!rd_snap_motion(work, want, predictor, &target)) return PROJECTED_MODE_EMPTY;
     mode->mv_x = target.mv_x;
     mode->mv_y = target.mv_y;
     return PROJECTED_MODE_OK;
@@ -716,7 +744,7 @@ static int rd_inter_mode(const RdWork* work, uint32_t leaf, uint32_t mode,
 
 static SvtAv2Error predict_with_motion(RdWork* work, uint32_t leaf, uint32_t mode,
     const SvtAv2BlockView blocks[3], uint64_t sad[3], int plane_selection,
-    const SvtAv2TileBlockMode* resolved) {
+    const SvtAv2TileBlockMode* resolved, uint16_t prediction[3][64u * 64u]) {
     uint8_t bytes[64u * 64u * 2u];
     const uint16_t one = 1u;
     const int direct = work->config->rd_mode == 3u && work->source->bit_depth == 10u &&
@@ -735,27 +763,32 @@ static SvtAv2Error predict_with_motion(RdWork* work, uint32_t leaf, uint32_t mod
     for (uint32_t plane=first;plane<(plane_selection==1?1u:3u);++plane) {
         const SvtAv2BlockView* block = &blocks[plane];
         SvtAv2Error error;
-        if (projected_ref != NULL) {
+        if (mode == 3u && work->config->frame_header.regular_filter) {
+            const int scale = projected_ref ? 1 : 2;
+            const SvtAv2EighthPelMotionVector mv = {resolved->mv_x * scale, resolved->mv_y * scale};
+            error = svt_av2_inter_predict_eighth_regular(projected_ref ? projected_ref : work->reference,
+                plane, block, mv, prediction[plane], block->w);
+        } else if (projected_ref != NULL) {
             const SvtAv2EighthPelMotionVector mv = {resolved->mv_x, resolved->mv_y};
             error = svt_av2_inter_predict_eighth_sharp(projected_ref, plane, block, mv,
-                work->prediction[plane], block->w);
+                prediction[plane], block->w);
         } else if (mode == 3u) {
             const SvtAv2MotionVector mv = {resolved->mv_x, resolved->mv_y};
             if (work->config->frame_header.mv_half == 2u) {
                 const SvtAv2QuarterPelMotionVector quarter = {mv.mv_x, mv.mv_y};
                 error = svt_av2_inter_predict_quarter_sharp(work->reference, plane, block, quarter,
-                    work->prediction[plane], block->w);
+                    prediction[plane], block->w);
             } else if (work->config->frame_header.mv_half) {
                 const SvtAv2HalfPelMotionVector half = {mv.mv_x, mv.mv_y};
                 error = work->config->frame_header.sharp_filter ?
                     svt_av2_inter_predict_half_sharp(work->reference, plane, block, half,
-                        work->prediction[plane], block->w) :
+                        prediction[plane], block->w) :
                     svt_av2_inter_predict_half(work->reference, plane, block, half,
-                        work->prediction[plane], block->w);
+                        prediction[plane], block->w);
             } else error = svt_av2_inter_predict(work->reference, plane, block, mv,
-                work->prediction[plane], block->w);
+                prediction[plane], block->w);
         } else {
-            uint8_t* const predicted = direct ? (uint8_t*)work->prediction[plane] : bytes;
+            uint8_t* const predicted = direct ? (uint8_t*)prediction[plane] : bytes;
             const SvtAv2IntraBlock intra = {block->x, block->y, block->w, block->h, plane};
             SvtAv2IntraReference reference;
             if (work->config->frame_header.m5_intra_modes < 2u) {
@@ -774,10 +807,12 @@ static SvtAv2Error predict_with_motion(RdWork* work, uint32_t leaf, uint32_t mod
                     uint32_t tr_count = 0u, bl_count = 0u;
                     const uint32_t tr_limit = plane == 0u && work->mrl[leaf] ? block->w : block->h;
                     const uint32_t bl_limit = plane == 0u && work->mrl[leaf] ? block->h : block->w;
+                    /* Availability is constant within one aligned 4x4 luma MI. */
+                    const uint32_t mi_step=4u/(uint32_t)scale;
                     while (tr_count < tr_limit && reference_decoded(work, leaf,
-                        (int32_t)(block->x + block->w + tr_count) * scale, ((int32_t)block->y - 1) * scale)) ++tr_count;
+                        (int32_t)(block->x + block->w + tr_count) * scale, ((int32_t)block->y - 1) * scale)) tr_count+=SVT_AV2_MIN(mi_step,tr_limit-tr_count);
                     while (bl_count < bl_limit && reference_decoded(work, leaf,
-                        ((int32_t)block->x - 1) * scale, (int32_t)(block->y + block->h + bl_count) * scale)) ++bl_count;
+                        ((int32_t)block->x - 1) * scale, (int32_t)(block->y + block->h + bl_count) * scale)) bl_count+=SVT_AV2_MIN(mi_step,bl_limit-bl_count);
                     const int ibp = work->config->frame_header.enable_ibp && (block->w != 4u || block->h != 4u);
                     uint32_t top_filter = 0u, left_filter = 0u;
                     if (work->smooth_grid) {
@@ -805,7 +840,7 @@ static SvtAv2Error predict_with_motion(RdWork* work, uint32_t leaf, uint32_t mod
                 svt_av2_intra_ibp_dc(work->recon, &intra, predicted, block->w * step);
             if (error == SVT_AV2_ERROR_NONE && !direct)
                 for (uint32_t i = 0u; i < block->w * block->h; ++i)
-                    work->prediction[plane][i] = svt_av2_sample_load(bytes + i * step, work->source->bit_depth);
+                    prediction[plane][i] = svt_av2_sample_load(bytes + i * step, work->source->bit_depth);
         }
         if (error != SVT_AV2_ERROR_NONE) return error;
         if (sad == NULL) continue;
@@ -813,11 +848,8 @@ static SvtAv2Error predict_with_motion(RdWork* work, uint32_t leaf, uint32_t mod
         for (uint32_t y = 0u; y < block->h; ++y) {
             const uint8_t* row = work->source->planes[plane] +
                 (size_t)(block->y + y) * work->source->strides[plane] + (size_t)block->x * step;
-            for (uint32_t x = 0u; x < block->w; ++x) {
-                const int difference = (int)svt_av2_sample_load(row + x * step, work->source->bit_depth) -
-                    work->prediction[plane][(size_t)y * block->w + x];
-                sad[plane] += (uint64_t)(difference < 0 ? -difference : difference);
-            }
+            sad[plane]+=svt_av2_prediction_row_sad(row,prediction[plane]+(size_t)y*block->w,
+                block->w,work->source->bit_depth);
         }
     }
     return SVT_AV2_ERROR_NONE;
@@ -825,10 +857,9 @@ static SvtAv2Error predict_with_motion(RdWork* work, uint32_t leaf, uint32_t mod
 
 static SvtAv2Error predict(RdWork* work, uint32_t leaf, uint32_t mode,
     const SvtAv2BlockView blocks[3], uint64_t sad[3], int plane_selection) {
-    return predict_with_motion(work, leaf, mode, blocks, sad, plane_selection, NULL);
+    return predict_with_motion(work, leaf, mode, blocks, sad, plane_selection, NULL, work->prediction);
 }
 
-#if M6_SATD_ANGLES
 /* Hadamard cost only screens additional modes; exact R+D still decides. */
 static uint64_t angle_satd(const RdWork* work,const SvtAv2BlockView* b) {
     uint64_t cost=0u;
@@ -850,6 +881,7 @@ static uint64_t angle_satd(const RdWork* work,const SvtAv2BlockView* b) {
     }
     return (cost+1u)>>1u;
 }
+#if M6_SATD_ANGLES
 static void angle_satd_rank(const RdWork* work,const SvtAv2BlockView* b,uint32_t mode,uint8_t ranked[4],uint64_t scores[4]) {
     if (!work->config->satd_angles) return;
     const uint64_t score=angle_satd(work,b);
@@ -874,6 +906,12 @@ static SvtAv2Error rank_modes(RdWork* work, uint32_t leaf,
     *count = 0u;
     for (uint32_t mode = 0u; mode < 4u; ++mode) {
         if ((work->rank_intra_only && mode == 3u) || !legal_mode(work, leaf, mode)) continue;
+        if (mode==3u && work->mixed_inter_fine && work->secondary) {
+            SvtAv2TileBlockMode resolved;
+            const ProjectedModeResult state=resolve_projected_mode(work,leaf,mode,&resolved);
+            if (state==PROJECTED_MODE_EMPTY) continue;
+            if (state==PROJECTED_MODE_ERROR) return SVT_AV2_ERROR_INVALID_STATE;
+        }
         uint64_t sad[3];
         const SvtAv2Error error = predict(work, leaf, mode, blocks, sad, 0);
         if (error != SVT_AV2_ERROR_NONE) return error;
@@ -943,7 +981,7 @@ static SvtAv2Error rdoq_rate(const RdWork* work, uint32_t plane,
     SvtAv2EntropyEncoder enc;
     svt_av2_entropy_rate_init(&enc);
     if (svt_av2_coeff_write_block_transform_ist(&enc, &pi, 0u, qcoeff, &neighbours,
-        svt_av2_coeff_q_context(work->config->frame_header.base_q_idx), 0u,
+        svt_av2_coeff_q_context(work->config->frame_header.base_q_idx), work->reference && mode == 3u,
         work->config->frame_header.reduced_tx_set, tx_type, mode,
         work->config->frame_header.enable_intra_ist, 0u) != 0)
         return SVT_AV2_ERROR_INVALID_STATE;
@@ -961,9 +999,15 @@ static uint64_t rdoq_distortion(const RdWork* work, uint32_t plane,
     return (weight * error + (UINT64_C(1) << (shift - 1u))) >> shift;
 }
 
-static uint64_t rdoq_error(int32_t coeff, int32_t dequant) {
-    const int64_t delta = (int64_t)coeff - dequant;
-    return (uint64_t)(delta * delta);
+static uint64_t rdoq_error(int32_t coeff, int32_t dequant, uint32_t weight) {
+    /* zenrav1e prices spectral error using the forward matrix weight.
+     * Neutral Q5 weight gives the original unweighted squared error. */
+    const int64_t delta = (int64_t)coeff-dequant;
+    const uint64_t magnitude = (uint64_t)(delta<0 ? -delta : delta);
+    const uint64_t squared = magnitude*magnitude;
+    if (weight==32u) return squared;
+    const uint32_t w2=weight*weight;
+    return (squared>>10)*w2 + (((squared&1023u)*w2+512u)>>10);
 }
 
 static int32_t rdoq_dequant(const SvtAv2QuantParams* params, int32_t level,
@@ -974,47 +1018,65 @@ static int32_t rdoq_dequant(const SvtAv2QuantParams* params, int32_t level,
     return value < minimum ? minimum : value > maximum ? maximum : value;
 }
 
+static uint32_t rd_plane_qm(const RdWork* work,uint32_t plane) {
+    const SvtAv2FrameHeaderConfig* h=&work->config->frame_header;
+    return plane && h->qm_uv_level ? h->qm_uv_level : h->qm_level;
+}
+
 static SvtAv2Error rdoq_propose(RdWork* work, uint32_t plane,
     const SvtAv2BlockView* block, size_t count, uint32_t tx_type, uint32_t mode) {
     SvtAv2QuantParams params;
     if (svt_av2_quant_params_init_matrix(&params, work->config->frame_header.base_q_idx,
-        block->w, block->h, work->source->bit_depth, work->config->frame_header.qm_level, work->config->frame_header.uv_delta_q) != SVT_AV2_QUANT_OK)
+        block->w, block->h, work->source->bit_depth, rd_plane_qm(work,plane), work->config->frame_header.uv_delta_q) != SVT_AV2_QUANT_OK)
         return SVT_AV2_ERROR_INVALID_STATE;
     /* Restrict the scalar proposal to nearby conservative local changes;
      * the full-SB acceptance still uses the unchanged global lambda. */
-    const uint64_t proposal_lambda = work->rdoq_phase == 0u ?
+    const int inter = work->reference && mode == 3u;
+    const uint64_t proposal_lambda = inter ? work->stats.lambda_q8 : work->rdoq_phase == 0u ?
         (work->stats.lambda_q8 + 8u) >> 4u : work->rdoq_phase == 1u ?
         (work->stats.lambda_q8 + 2u) >> 2u : work->stats.lambda_q8;
     int32_t* q = work->scratch->qcoeff;
     int32_t* dq = work->scratch->dqcoeff;
     const int32_t* coeff = work->scratch->coeff;
-    uint16_t scan[1024];
     SvtAv2TxSize tx;
     if (svt_av2_coeff_tx_size_from_dims(block->w, block->h, &tx) != SVT_AV2_COEFF_OK)
         return SVT_AV2_ERROR_INVALID_STATE;
-    if (svt_av2_coeff_scan_dct_dct(tx, scan) != count)
+    const uint16_t* scan = svt_av2_coeff_scan_view(tx);
+    if (!scan || svt_av2_coeff_coeff_count(tx) != count)
         return SVT_AV2_ERROR_INVALID_STATE;
     uint64_t error = 0u, rate, best_cost;
-    for (size_t c = 0u; c < count; ++c) error += rdoq_error(coeff[c], dq[c]);
+    uint16_t weights[1024];
+    const uint8_t* inverse=work->qm_trellis && !plane && params.qm_size ?
+        params.inverse_matrix[0]+params.qm_offset : NULL;
+    for (size_t c=0; c<count; ++c) {
+        weights[c]=inverse ? (uint16_t)((1024u+inverse[c]/2u)/inverse[c]) : 32u;
+        error+=rdoq_error(coeff[c],dq[c],weights[c]);
+    }
     SvtAv2Error status = rdoq_rate(work, plane, block, q, tx_type, mode, &rate);
     if (status != SVT_AV2_ERROR_NONE ||
         svt_av2_rd_cost(rdoq_distortion(work, plane, &params, error), proposal_lambda,
             rate, &best_cost) != SVT_AV2_ERROR_NONE) return SVT_AV2_ERROR_INVALID_STATE;
+    unsigned priced_levels = 0;
     for (size_t index = count; index != 0u; --index) {
         const uint32_t c = scan[index - 1u];
         const int32_t entering = q[c];
+        if (!entering && !coeff[c]) continue;
+        if (inter) {
+            if (!entering) continue;
+            if (++priced_levels > (work->tail && work->tail->try_levels == 2 ? 32u : 8u)) break;
+        }
         const int32_t sign = coeff[c] < 0 ? -1 : 1;
         const int32_t magnitude = entering < 0 ? -entering : entering;
         int32_t chosen = entering, chosen_dq = dq[c];
         uint64_t chosen_error = error;
-        const uint64_t old_error = rdoq_error(coeff[c], dq[c]);
+        const uint64_t old_error = rdoq_error(coeff[c], dq[c], weights[c]);
         const int32_t levels[2] = {magnitude == 0 ? sign : (magnitude - 1) * sign,
             (magnitude + 1) * sign};
         for (uint32_t i = 0u; i < (magnitude == 0 ? 1u : 2u); ++i) {
             const int32_t candidate = levels[i];
             if (candidate > svt_av2_coeff_max_level() || candidate < -svt_av2_coeff_max_level()) continue;
             const int32_t candidate_dq = rdoq_dequant(&params, candidate, plane, c);
-            const uint64_t next_error = error - old_error + rdoq_error(coeff[c], candidate_dq);
+            const uint64_t next_error = error - old_error + rdoq_error(coeff[c], candidate_dq, weights[c]);
             /* A new nonzero whose squared error cannot improve is not useful
              * as a scalar proposal; context changes are left to exact SB RD. */
             if (magnitude == 0 && next_error >= error) continue;
@@ -1045,8 +1107,8 @@ static SvtAv2Error rdoq_propose(RdWork* work, uint32_t plane,
     for (uint32_t index = eob; index != 0u; --index) {
         const uint32_t c = scan[index - 1u];
         if (q[c] == 0) continue;
-        error -= rdoq_error(coeff[c], dq[c]);
-        error += rdoq_error(coeff[c], 0); q[c] = 0;
+        error -= rdoq_error(coeff[c], dq[c], weights[c]);
+        error += rdoq_error(coeff[c], 0, weights[c]); q[c] = 0;
         if (tx_type != 0u && svt_av2_coeff_find_eob(q, scan, count) <= 1u) break;
         /* Keep cutting even when this cut cannot win: its successor may
          * lower the error. Only the provably losing rate evaluation is skipped. */
@@ -1080,10 +1142,16 @@ static SvtAv2Error forward_trial(RdWork* work, uint32_t plane,
         while (area > 16u && group < 8u) { area >>= 1u; ++group; }
         ++cache->requests_by_area[group];
         for (uint32_t i = 0u; i < 6u; ++i) hash = hash_word(hash, key[i]);
-        for (uint32_t y = 0u; y < block->h; ++y)
-            for (uint32_t x = 0u; x < block->w; ++x)
-                hash = (hash ^ (uint16_t)work->scratch->residual[
-                    (size_t)y * work->scratch->stride + x]) * RD_HASH_PRIME;
+        /* All supported transform widths are multiples of four. The hash
+         * only selects a bucket; hits still compare every residual sample. */
+        for (uint32_t y=0;y<block->h;++y) {
+            const int16_t* row=work->scratch->residual+(size_t)y*work->scratch->stride;
+            for (uint32_t x=0;x<block->w;x+=4u) {
+                uint64_t word;
+                memcpy(&word,row+x,sizeof(word));
+                hash=(hash^word)*RD_HASH_PRIME;
+            }
+        }
         const uint32_t id = rd_tx_memo_find(cache, hash, key,
             work->scratch->residual, work->scratch->stride);
         if (id) {
@@ -1142,6 +1210,33 @@ static uint64_t detail_error(const RdWork* work, const SvtAv2BlockView* block) {
     return (error + 6u) / 12u;
 }
 
+/* zenrav1e cdef_dist weights each 8x8 reconstruction error by the
+ * source and reconstructed contrast. Normalize edge cells to 64 samples. */
+static uint64_t contrast_distortion(const RdWork* work, const SvtAv2BlockView* block) {
+    const uint32_t depth=work->source->bit_depth, step=depth>8u ? 2u : 1u;
+    uint64_t total=0;
+    for (uint32_t by=0; by<block->h; by+=8u) for (uint32_t bx=0; bx<block->w; bx+=8u) {
+        const uint32_t h=SVT_AV2_MIN(8u,block->h-by), w=SVT_AV2_MIN(8u,block->w-bx);
+        uint32_t a=0,b=0,aa=0,bb=0,error=0;
+        for (uint32_t y=0; y<h; ++y) {
+            const size_t xbyte=(size_t)(block->x+bx)*step;
+            const uint8_t* src=work->source->planes[0]+(size_t)(block->y+by+y)*work->source->strides[0]+xbyte;
+            const uint8_t* rec=work->recon->planes[0]+(size_t)(block->y+by+y)*work->recon->strides[0]+xbyte;
+            for (uint32_t x=0; x<w; ++x) {
+                const int v=svt_av2_sample_load(src+x*step,depth), r=svt_av2_sample_load(rec+x*step,depth);
+                a+=v; b+=r; aa+=v*v; bb+=r*r; error+=(v-r)*(v-r);
+            }
+        }
+        if (error) {
+            const double n=w*h, scale=64.0/(n*(1u<<(2u*(depth-8u))));
+            const double vs=(aa-(double)a*a/n)*scale, vr=(bb-(double)b*b/n)*scale;
+            const double weight=(3355.0/12338.0)*(vs+vr+16128.0)/sqrt(3355.0*3355.0+vs*vr);
+            total+=(uint64_t)(error*weight+0.5);
+        }
+    }
+    return total;
+}
+
 /* The inter predictor is the final reconstruction when all three transforms
  * are skipped. Emit the normal coefficient descriptors with packed zero
  * grids, so writer/estimator derive skip_txfm themselves. */
@@ -1174,7 +1269,7 @@ static SvtAv2Error reconstruct_inter_zero(RdWork* work, uint32_t leaf,
             }
         }
         sse[plane] += sum;
-        if (work->detail_rd && !plane) sse[0] += detail_error(work, block);
+        if (work->detail_rd==1 && !plane) sse[0] += detail_error(work, block);
     }
     return SVT_AV2_ERROR_NONE;
 }
@@ -1200,6 +1295,7 @@ static SvtAv2Error quantize_ist(RdWork* work, const SvtAv2BlockView* b, uint32_t
         return SVT_AV2_ERROR_INVALID_STATE;
     memcpy(coeff, work->scratch->coeff, count * sizeof(*coeff));
     svt_av2_intra_ist_transform(coeff, scan, b->w, b->h, depth, mode, primary, code, 0);
+    params.matrix_rounding = work->config->matrix_rounding;
     params.avm_fp_round = work->config->avm_fp_round;
     if (svt_av2_quantize_block(&params, coeff, qcoeff, dqcoeff, count, 0,
             svt_av2_tx_log_scale(b->w, b->h)) != SVT_AV2_QUANT_OK)
@@ -1302,6 +1398,7 @@ static SvtAv2Error reconstruct_leaf_planes(RdWork* work, uint32_t leaf, uint32_t
     int bucket = -1;
     uint64_t before[3];
     if (mode == 3u && planes == 3u && work->inter_pixel != NULL && !work->inter_skip_mask &&
+        !(work->tail && work->tail->apply_levels) &&
         (work->tail == NULL || leaf >= INTER_FINE_MAX_LEAVES ||
          !((work->tail->mask | work->tail->zero_mask) & (UINT64_C(7) << (3u * leaf)))))
         bucket = rd_inter_pixel_bucket(work, leaf, &blocks[0]);
@@ -1315,7 +1412,7 @@ static SvtAv2Error reconstruct_leaf_planes(RdWork* work, uint32_t leaf, uint32_t
         memcpy(before, sse, sizeof(before));
     }
 #endif
-    SvtAv2Error error = predict_with_motion(work, leaf, mode, blocks, NULL, planes==1u, resolved);
+    SvtAv2Error error = predict_with_motion(work, leaf, mode, blocks, NULL, planes==1u, resolved, work->prediction);
     if (error != SVT_AV2_ERROR_NONE) return error;
     if (work->inter_skip_mask && leaf < INTER_FINE_MAX_LEAVES && (work->inter_skip_mask & (1u << leaf))) {
         if (mode != 3u || planes != 3u) return SVT_AV2_ERROR_INVALID_STATE;
@@ -1416,7 +1513,7 @@ static SvtAv2Error reconstruct_leaf_planes(RdWork* work, uint32_t leaf, uint32_t
                 *last += *last > 0 ? -1 : 1;
                 SvtAv2QuantParams params;
                 if (svt_av2_quant_params_init_matrix(&params, work->config->frame_header.base_q_idx,
-                    block->w, block->h, work->source->bit_depth, work->config->frame_header.qm_level, work->config->frame_header.uv_delta_q) != SVT_AV2_QUANT_OK ||
+                    block->w, block->h, work->source->bit_depth, rd_plane_qm(work,plane), work->config->frame_header.uv_delta_q) != SVT_AV2_QUANT_OK ||
                     svt_av2_dequantize_block(&params, work->scratch->qcoeff,
                         work->scratch->dqcoeff, count, (int)plane) != SVT_AV2_QUANT_OK)
                     return SVT_AV2_ERROR_INVALID_STATE;
@@ -1450,10 +1547,14 @@ static SvtAv2Error reconstruct_leaf_planes(RdWork* work, uint32_t leaf, uint32_t
             tx_type = work->rdoq_tx_types[rdoq_block];
             memcpy(work->scratch->qcoeff, work->rdoq_coeff + work->coeff_count, count * sizeof(int32_t));
             if (svt_av2_quant_params_init_matrix(&params, work->config->frame_header.base_q_idx,
-                block->w, block->h, work->source->bit_depth, work->config->frame_header.qm_level, work->config->frame_header.uv_delta_q) != SVT_AV2_QUANT_OK ||
+                block->w, block->h, work->source->bit_depth, rd_plane_qm(work,plane), work->config->frame_header.uv_delta_q) != SVT_AV2_QUANT_OK ||
                 svt_av2_dequantize_block(&params, work->scratch->qcoeff,
                     work->scratch->dqcoeff, count, (int)plane) != SVT_AV2_QUANT_OK)
                 return SVT_AV2_ERROR_INVALID_STATE;
+        }
+        if (work->tail && work->tail->apply_levels && mode == 3u && !all_zero) {
+            error = rdoq_propose(work, plane, block, count, 0u, mode);
+            if (error != SVT_AV2_ERROR_NONE) return error;
         }
         if (work->tail && leaf < INTER_FINE_MAX_LEAVES && (work->tail->zero_mask & (UINT64_C(1) << rdoq_block))) {
             memset(work->scratch->qcoeff, 0, count * sizeof(int32_t));
@@ -1519,7 +1620,8 @@ static SvtAv2Error reconstruct_leaf_planes(RdWork* work, uint32_t leaf, uint32_t
         entry->qcoeff = work->coeffs + work->coeff_count;
         memcpy(work->coeffs + work->coeff_count, work->scratch->qcoeff, count * sizeof(int32_t));
         work->coeff_count += count;
-        for (uint32_t y = 0u; y < block->h; ++y) {
+        if (!plane && work->detail_rd==2) sse[0]+=contrast_distortion(work,block);
+        else for (uint32_t y = 0u; y < block->h; ++y) {
             const uint8_t* src = work->source->planes[plane] +
                 (size_t)(block->y + y) * work->source->strides[plane] + (size_t)block->x * step;
             const uint8_t* rec = destination + (size_t)y * work->recon->strides[plane];
@@ -1529,7 +1631,7 @@ static SvtAv2Error reconstruct_leaf_planes(RdWork* work, uint32_t leaf, uint32_t
                 sse[plane] += (uint64_t)(difference * difference);
             }
         }
-        if (work->detail_rd && !plane) sse[0] += detail_error(work, block);
+        if (work->detail_rd==1 && !plane) sse[0] += detail_error(work, block);
         if (plane == 0u && work->uv_y_cache == 1u) {
             work->uv_y_blocks[leaf] = *entry;
             work->uv_y_offset[leaf] = work->uv_y_size;
@@ -2115,27 +2217,8 @@ static SvtAv2Error refine_basic(RdWork* work,size_t sb,int partial,
 
 static SvtAv2Error rank_cfl_alphas(RdWork* work, const SvtAv2BlockView* block,
     uint32_t plane, int8_t ranked[2]) {
-    uint8_t predicted[64u*64u*2u];
-    uint64_t scores[2]={UINT64_MAX,UINT64_MAX};
-    const uint32_t step=work->source->bit_depth>8u?2u:1u;
     const SvtAv2IntraBlock intra={block->x,block->y,block->w,block->h,plane};
-    for (int32_t alpha=-8;alpha<=8;++alpha) {
-        const SvtAv2Error error=svt_av2_intra_cfl_explicit_predict(work->recon,&intra,64u,
-            predicted,block->w*step,alpha);
-        if (error!=SVT_AV2_ERROR_NONE) return error;
-        uint64_t score=0u;
-        for (uint32_t y=0u;y<block->h;++y) for (uint32_t x=0u;x<block->w;++x) {
-            const uint8_t* sample=work->source->planes[plane]+(size_t)(block->y+y)*work->source->strides[plane]+(block->x+x)*step;
-            const int difference=(int)svt_av2_sample_load(sample,work->source->bit_depth)-
-                (int)svt_av2_sample_load(predicted+((size_t)y*block->w+x)*step,work->source->bit_depth);
-            score+=(uint64_t)(difference*difference);
-        }
-        for (uint32_t slot=0u;slot<2u;++slot) if (score<scores[slot]) {
-            if (!slot) {scores[1]=scores[0];ranked[1]=ranked[0];}
-            scores[slot]=score;ranked[slot]=(int8_t)alpha;break;
-        }
-    }
-    return SVT_AV2_ERROR_NONE;
+    return svt_av2_intra_cfl_rank(work->source, work->recon, &intra, ranked);
 }
 
 typedef struct RdJointChoice {
@@ -2528,11 +2611,29 @@ static uint64_t leaf_tools_key(const RdLeafTools* t) {
         ((uint64_t)t->tx<<32u)|((uint64_t)t->explicit_cfl<<24u)|
         ((uint64_t)t->signs<<16u)|((uint64_t)t->idx<<8u)|t->mh;
 }
+/* The entering prefix is fixed while comparing tools for one leaf. Only
+ * that leaf's reconstructed samples can have changed since the last trial. */
+static void restore_trial_pixels(RdWork* work, const SvtAv2BlockView blocks[3], unsigned planes) {
+    const unsigned step = work->recon->bit_depth > 8u ? 2u : 1u;
+    for (unsigned p = 0; p < planes; ++p) {
+        const SvtAv2BlockView* b = &blocks[p];
+        const SvtAv2BlockView* region = &work->region[p];
+        const uint8_t* saved = (const uint8_t*)work->prefix_recon[p] +
+            ((size_t)(b->y - region->y) * region->w + b->x - region->x) * step;
+        uint8_t* dst = work->recon->planes[p] + (size_t)b->y * work->recon->strides[p] + b->x * step;
+        for (unsigned y = 0; y < b->h; ++y)
+            memcpy(dst + (size_t)y * work->recon->strides[p], saved + (size_t)y * region->w * step, b->w * step);
+    }
+}
+
 /* Partial-prefix scores never masquerade as complete-SB candidate hooks. */
 static SvtAv2Error linear_leaf_trial(RdWork* work,uint32_t leaf,RdLeafTools proposal,
     RdLeafTools* best,uint64_t* cost,uint64_t entering_cost,int* accepted) {
+    SvtAv2BlockView blocks[3];
+    SvtAv2Error geometry = plane_blocks(work, leaf, blocks);
+    if (geometry != SVT_AV2_ERROR_NONE) return geometry;
     leaf_tools_set(work,leaf,&proposal);
-    region_copy_buffer(work,work->prefix_recon,1);
+    restore_trial_pixels(work, blocks, 3u);
     uint64_t score=0u;
 #if M6_Y_BOUND && M6_TX_CACHE
     uint64_t lower=0u,y_rate=0u;
@@ -2546,12 +2647,10 @@ static SvtAv2Error linear_leaf_trial(RdWork* work,uint32_t leaf,RdLeafTools prop
     if (work->transform_cache && work->basic_rate_active && !work->memo_active &&
         !work->uv_y_cache && work->rdoq_target==UINT32_MAX &&
         !work->rdoq_saved[leaf*3u]) {
-        SvtAv2BlockView blocks[3];
-        SvtAv2Error pre=plane_blocks(work,leaf,blocks);
+        SvtAv2Error pre;
         uint64_t y_sse[3]={0u,0u,0u};
         work->coeff_count=work->prefix_coeff_count;work->ids[leaf]=proposal.y;
-        if (pre==SVT_AV2_ERROR_NONE)
-            pre=reconstruct_leaf_planes(work,leaf,proposal.y,blocks,y_sse,1u);
+        pre=reconstruct_leaf_planes(work,leaf,proposal.y,blocks,y_sse,1u);
         if (pre!=SVT_AV2_ERROR_NONE) { *accepted=0;leaf_tools_set(work,leaf,best);return pre; }
         uint64_t partial_sse[3]={work->prefix_sse[0]+y_sse[0],work->prefix_sse[1],work->prefix_sse[2]};
         if (svt_av2_tile_rate_prefix_trial_y(work->basic_rate_prefix,leaf,
@@ -2571,12 +2670,12 @@ static SvtAv2Error linear_leaf_trial(RdWork* work,uint32_t leaf,RdLeafTools prop
         if (lower>*cost) {
             ++work->transform_cache->bound_pruned;
             *accepted=0;leaf_tools_set(work,leaf,best);
-            region_copy_buffer(work,work->prefix_recon,1);
+            restore_trial_pixels(work, blocks, 1u);
             work->coeff_count=work->prefix_coeff_count;
             return SVT_AV2_ERROR_NONE;
         }
 #endif
-        region_copy_buffer(work,work->prefix_recon,1);
+        restore_trial_pixels(work, blocks, 1u);
     }
 #endif
     const SvtAv2Error error=local_basic_cost(work,leaf,proposal.y,&score);
@@ -2761,7 +2860,8 @@ static SvtAv2Error refine_cfl_pair_rd(RdWork* work,uint32_t leaf,const SvtAv2Blo
     uint64_t sse[3];memcpy(sse,work->prefix_sse,sizeof(sse));
     const SvtAv2BlockView* yb=blocks;
     const uint32_t bd=work->source->bit_depth,step=bd>8u?2u:1u;
-    for (uint32_t y=0u;y<yb->h;++y) {
+    if (work->detail_rd==2) sse[0]+=contrast_distortion(work,yb);
+    else for (uint32_t y=0u;y<yb->h;++y) {
         const uint8_t* src=work->source->planes[0]+(size_t)(yb->y+y)*work->source->strides[0]+yb->x*step;
         const uint8_t* rec=work->recon->planes[0]+(size_t)(yb->y+y)*work->recon->strides[0]+yb->x*step;
         for (uint32_t x=0u;x<yb->w;++x) {
@@ -2769,7 +2869,7 @@ static SvtAv2Error refine_cfl_pair_rd(RdWork* work,uint32_t leaf,const SvtAv2Blo
             sse[0]+=(uint64_t)(d*d);
         }
     }
-    if (work->detail_rd) sse[0] += detail_error(work, yb);
+    if (work->detail_rd==1) sse[0] += detail_error(work, yb);
     for (uint32_t p=1u;p<3u;++p) for (uint32_t i=0u;i<(p==1u?nu:nv);++i) {
         const SvtAv2Error error=cfl_quantized_offer(work,blocks+p,p,(p==1u?u:v)+i);
         if (error!=SVT_AV2_ERROR_NONE) return error;
@@ -2917,13 +3017,41 @@ static SvtAv2Error refine_tools_linear(RdWork* work,size_t sb,int partial,
             uint8_t satd_ranked[4]={255u,255u,255u,255u};
             uint64_t satd_scores[4]={UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
 #endif
-            for (uint32_t mode=14u;mode<=61u;++mode) {
-                uint64_t sad[3]={0u,0u,0u};
-                error=predict(work,leaf,mode,blocks,sad,1);
-                if (error!=SVT_AV2_ERROR_NONE) goto cleanup;
-#if M6_SATD_ANGLES
-                angle_satd_rank(work,&blocks[0],mode,satd_ranked,satd_scores);
+            const uint32_t stride = work->config->sparse_angle_search ? 3u : 1u;
+            const int first = work->config->sparse_angle_search ? 15 : 14;
+            uint64_t mode_cost[62] = {0};
+#ifdef _OPENMP
+            /* Each angle reads the same reconstructed edges. Merge scores in
+             * mode order so tied predictors keep the same winner. */
+            const int parallel_angles = work->config->threads > 1u &&
+                blocks[0].w * blocks[0].h >= 256u && !work->config->satd_angles;
+            if (parallel_angles) {
+                int failed = 0;
+                const int increment = (int)stride;
+                int m;
+#pragma omp parallel for num_threads(work->config->threads) schedule(static) reduction(|:failed)
+                for (m = first; m <= 61; m += increment) {
+                    uint16_t prediction[3][64u * 64u];
+                    uint64_t trial_sad[3] = {0};
+                    failed |= predict_with_motion(work, leaf, (uint32_t)m, blocks, trial_sad, 1,
+                        NULL, prediction) != SVT_AV2_ERROR_NONE;
+                    mode_cost[m] = trial_sad[0];
+                }
+                if (failed) { error = SVT_AV2_ERROR_INVALID_STATE; goto cleanup; }
+            }
+#else
+            const int parallel_angles = 0;
 #endif
+            for (uint32_t mode=(uint32_t)first;mode<=61u;mode+=stride) {
+                uint64_t sad[3]={0u,0u,0u};
+                if (parallel_angles) sad[0] = mode_cost[mode];
+                else {
+                    error=predict(work,leaf,mode,blocks,sad,1);
+                    if (error!=SVT_AV2_ERROR_NONE) goto cleanup;
+#if M6_SATD_ANGLES
+                    angle_satd_rank(work,&blocks[0],mode,satd_ranked,satd_scores);
+#endif
+                }
                 for (uint32_t slot=0u;slot<4u;++slot) if (sad[0]<scores[slot] ||
                     (sad[0]==scores[slot] && mode<ranked[slot])) {
                     for (uint32_t j=3u;j>slot;--j) {scores[j]=scores[j-1u];ranked[j]=ranked[j-1u];}
@@ -2964,9 +3092,10 @@ static SvtAv2Error refine_tools_linear(RdWork* work,size_t sb,int partial,
             svt_av2_intra_mode_joint(selected.y)>=5u) {
             static const uint8_t candidates[6]={1u,2u,3u,5u,6u,7u};
             const uint64_t anchor=cost;
-            for (uint32_t index=0u;index<6u;++index) {
+            const uint32_t count = work->config->sparse_angle_search ? 3u : 6u;
+            for (uint32_t index=0u;index<count;++index) {
                 RdLeafTools proposal=selected;
-                proposal.mrl=candidates[work->config->reverse_candidates?5u-index:index];
+                proposal.mrl=candidates[work->config->reverse_candidates?count-1u-index:index];
 #if M6_TOOL_REPEAT
                 if (tool_round) {
                     error=repeat_pair_trial(work,leaf,proposal,&selected,&cost,anchor,1);
@@ -3012,11 +3141,12 @@ static SvtAv2Error refine_tools_linear(RdWork* work,size_t sb,int partial,
             static const uint8_t modes[13]={0u,1u,2u,4u,5u,6u,7u,8u,9u,10u,11u,12u,13u};
             const RdLeafTools anchor_tuple=selected;
             const uint64_t anchor_cost=cost;
-            const uint32_t pairs=work->config->screen_trees?9u:13u*9u;
+            const int single_mode = work->config->screen_trees && !work->config->shortlist_trees;
+            const uint32_t pairs = single_mode ? 9u : 13u * 9u;
             for (uint32_t index=0u;index<pairs;++index) {
                 const uint32_t pair=work->config->reverse_candidates?pairs-1u-index:index;
                 RdLeafTools proposal=anchor_tuple;
-                proposal.y=work->config->screen_trees ? work->alternate_y[leaf] : modes[pair/9u];proposal.tx=(uint8_t)(pair%9u);
+                proposal.y=single_mode ? work->alternate_y[leaf] : modes[pair/9u];proposal.tx=(uint8_t)(pair%9u);
                 proposal.mrl=0u;proposal.effective_tx=0u;
                 if (!legal_mode(work,leaf,proposal.y) ||
                     svt_av2_intra_tx_symbol(svt_av2_intra_tx_mode(proposal.y,w,h,proposal.mrl),w,h,proposal.tx)>=7u ||
@@ -4018,6 +4148,11 @@ static SvtAv2Error refine_halfpel(RdWork* work, size_t sb, uint16_t decision,
 
 static SvtAv2Error quarter_mv_sad(RdWork* work, const SvtAv2BlockView* block,
     SvtAv2MotionVector mv, uint64_t limit, uint64_t* sad) {
+    if (work->config->frame_header.regular_filter) {
+        const SvtAv2EighthPelMotionVector q3 = {mv.mv_x * 2, mv.mv_y * 2};
+        ++work->stats.motion_candidates;
+        return svt_av2_inter_luma_sad_eighth_regular(work->source, work->reference, block, q3, limit, sad);
+    }
     const SvtAv2QuarterPelMotionVector quarter = {mv.mv_x, mv.mv_y};
 #if SVT_AV2_INTER_BOUNDED_SAD
     const SvtAv2Error error = svt_av2_inter_luma_sad_quarter_sharp(work->source, work->reference,
@@ -4049,6 +4184,8 @@ static SvtAv2Error projected_luma_sad(RdWork* work, const SvtAv2FrameBuffer* ref
     const SvtAv2BlockView* b, SvtAv2MotionVector mv, uint64_t limit, uint64_t* sad) {
     ++work->stats.motion_candidates;
     const SvtAv2EighthPelMotionVector q3 = {mv.mv_x, mv.mv_y};
+    if (work->config->frame_header.regular_filter)
+        return svt_av2_inter_luma_sad_eighth_regular(work->source, ref, b, q3, limit, sad);
 #if SVT_AV2_INTER_BOUNDED_SAD && SVT_AV2_INTER_BOUNDED_Q3
     return svt_av2_inter_luma_sad_eighth_sharp(work->source, ref, b, q3, limit, sad);
 #else
@@ -4102,14 +4239,17 @@ static SvtAv2Error refine_long_ref(RdWork* work, size_t sb, uint16_t decision,
         memcpy(work->modes, accepted, leaf * sizeof(*accepted));
         SvtAv2MotionVector last_pred, long_pred, last;
         if (!rd_motion_predict(work, leaf, 0u, &last_pred) || !rd_motion_predict(work, leaf, 1u, &long_pred) ||
-            !rd_snap_motion((SvtAv2MotionVector){2 * work->mvs[leaf].mv_x, 2 * work->mvs[leaf].mv_y}, last_pred, &last))
+            !rd_snap_motion(work, (SvtAv2MotionVector){2 * work->mvs[leaf].mv_x, 2 * work->mvs[leaf].mv_y}, last_pred, &last))
             return SVT_AV2_ERROR_INVALID_STATE;
-        SvtAv2MotionVector seed[3] = {{0,0}, long_pred, {0,0}};
-        if (!rd_snap_motion(seed[0], long_pred, &seed[0])) continue; /* Empty MVD lattice intersection. */
+        SvtAv2MotionVector seed[4] = {{0,0}, long_pred, {0,0}, {0,0}};
+        if (!rd_snap_motion(work, seed[0], long_pred, &seed[0])) continue; /* Empty MVD lattice intersection. */
         const uint32_t* dist = work->config->frame_header.ref_distance;
-        if (!svt_av2_mvp_project_q3(last.mv_x, dist[1], dist[0], &seed[2].mv_x) ||
-            !svt_av2_mvp_project_q3(last.mv_y, dist[1], dist[0], &seed[2].mv_y))
+        if (!svt_av2_mvp_project_q3_range(work->config->frame_header.wide_motion, last.mv_x, dist[1], dist[0], &seed[2].mv_x) ||
+            !svt_av2_mvp_project_q3_range(work->config->frame_header.wide_motion, last.mv_y, dist[1], dist[0], &seed[2].mv_y))
             return SVT_AV2_ERROR_INVALID_STATE;
+        if (work->config->frame_header.paired_role >= SVT_AV2_ONLY_MIDPOINT) {
+            seed[2].mv_x = -seed[2].mv_x; seed[2].mv_y = -seed[2].mv_y;
+        }
         uint64_t base = 0u;
         error = projected_luma_sad(work, work->reference, b, last, UINT64_MAX, &base);
         if (error != SVT_AV2_ERROR_NONE) return error;
@@ -4117,8 +4257,17 @@ static SvtAv2Error refine_long_ref(RdWork* work, size_t sb, uint16_t decision,
         uint64_t best_sad = base + (base >> 4u) + 1u;
         int have = 0;
         SvtAv2MotionVector selected = {0,0};
-        for (uint32_t i = 0u; i < 3u; ++i) {
-            if (!rd_snap_motion(seed[i], long_pred, &seed[i])) return SVT_AV2_ERROR_INVALID_STATE;
+        unsigned seeds = 3u;
+        if (work->coarse_long_hme && work->me_pyramid[2] && base) {
+            SvtAv2MotionSearchResult integer;
+            error = svt_av2_motion_estimate(work->source, work->secondary, b, &integer);
+            if (error != SVT_AV2_ERROR_NONE) return error;
+            rd_hierarchical_motion(work, work->secondary, b, &integer);
+            work->stats.motion_candidates += integer.candidates;
+            seed[seeds++] = (SvtAv2MotionVector){8 * integer.mv.mv_x, 8 * integer.mv.mv_y};
+        }
+        for (uint32_t i = 0u; i < seeds; ++i) {
+            if (!rd_snap_motion(work, seed[i], long_pred, &seed[i])) return SVT_AV2_ERROR_INVALID_STATE;
             int duplicate = 0;
             for (uint32_t j = 0u; j < i; ++j)
                 duplicate |= seed[i].mv_x == seed[j].mv_x && seed[i].mv_y == seed[j].mv_y;
@@ -4137,7 +4286,7 @@ static SvtAv2Error refine_long_ref(RdWork* work, size_t sb, uint16_t decision,
         for (uint32_t i = 0; i < 4u && best_sad; ++i) {
             const SvtAv2MotionVector desired = {anchor.mv_x + dx[i], anchor.mv_y + dy[i]};
             SvtAv2MotionVector q3;
-            if (!rd_snap_motion(desired, long_pred, &q3)) return SVT_AV2_ERROR_INVALID_STATE;
+            if (!rd_snap_motion(work, desired, long_pred, &q3)) return SVT_AV2_ERROR_INVALID_STATE;
             if (q3.mv_x == anchor.mv_x && q3.mv_y == anchor.mv_y) continue;
             uint64_t sad = 0u;
             error = projected_luma_sad(work, work->secondary, b, q3, best_sad - 1u, &sad);
@@ -4176,6 +4325,14 @@ static SvtAv2Error refine_long_ref(RdWork* work, size_t sb, uint16_t decision,
     return SVT_AV2_ERROR_NONE;
 }
 
+/* AVM's HD L1 motion cost is 8 SAD units per whole-pixel displacement
+ * at 8-bit. The caller supplies the number of eighths per MV unit. */
+static uint64_t fine_mv_cost(const RdWork* work, SvtAv2MotionVector mv,
+    SvtAv2MotionVector parent, unsigned eighths) {
+    return (uint64_t)work->me_mv_weight*eighths*
+        (unsigned)(abs(mv.mv_x-parent.mv_x)+abs(mv.mv_y-parent.mv_y));
+}
+
 /* Bounded inter-only 32->16 proposal. Measure the coarse winner's MV on
  * each 32 quadrant, then spend independent ME only on the two worst. */
 static SvtAv2Error fine_search_mv(RdWork* work, const SvtAv2BlockView* block,
@@ -4183,9 +4340,10 @@ static SvtAv2Error fine_search_mv(RdWork* work, const SvtAv2BlockView* block,
     SvtAv2MotionSearchResult integer;
     SvtAv2Error error = svt_av2_motion_estimate(work->source, work->reference, block, &integer);
     if (error != SVT_AV2_ERROR_NONE) return error;
+    if (work->me_pyramid[0]) rd_hierarchical_motion(work, work->reference, block, &integer);
     work->stats.motion_candidates += integer.candidates;
     SvtAv2MotionVector anchor = {4 * integer.mv.mv_x, 4 * integer.mv.mv_y};
-    uint64_t anchor_sad = integer.sad;
+    uint64_t anchor_sad = integer.sad + fine_mv_cost(work,anchor,parent,2u);
     for (int32_t step = 2; step > 0; --step) {
         const SvtAv2MotionVector origin = anchor;
         for (int32_t y = -1; y <= 1; ++y) for (int32_t x = -1; x <= 1; ++x) {
@@ -4194,6 +4352,7 @@ static SvtAv2Error fine_search_mv(RdWork* work, const SvtAv2BlockView* block,
             uint64_t trial_sad;
             error = quarter_mv_sad(work, block, candidate, anchor_sad, &trial_sad);
             if (error != SVT_AV2_ERROR_NONE) return error;
+            trial_sad += fine_mv_cost(work,candidate,parent,2u);
             if (trial_sad < anchor_sad) { anchor_sad = trial_sad; anchor = candidate; }
         }
     }
@@ -4242,6 +4401,7 @@ static SvtAv2Error fine_search_projected(RdWork* work, const SvtAv2FrameBuffer* 
     SvtAv2MotionSearchResult integer;
     SvtAv2Error error = svt_av2_motion_estimate(work->source, ref, block, &integer);
     if (error != SVT_AV2_ERROR_NONE) return error;
+    if (work->me_pyramid[0]) rd_hierarchical_motion(work, ref, block, &integer);
     if (work->wide_inter_me) svt_av2_motion_extend(work->source, ref, block, &integer);
     work->stats.motion_candidates += integer.candidates;
     *mv = parent;
@@ -4249,21 +4409,46 @@ static SvtAv2Error fine_search_projected(RdWork* work, const SvtAv2FrameBuffer* 
     if (error != SVT_AV2_ERROR_NONE || *sad == 0u) return error;
     SvtAv2MotionVector anchor;
     const SvtAv2MotionVector raw = {8 * integer.mv.mv_x, 8 * integer.mv.mv_y};
-    if (!rd_snap_motion(raw, parent, &anchor)) return SVT_AV2_ERROR_INVALID_STATE;
+    if (!rd_snap_motion(work, raw, parent, &anchor)) return SVT_AV2_ERROR_INVALID_STATE;
     uint64_t cost;
     error = projected_luma_sad(work, ref, block, anchor, UINT64_MAX, &cost);
     if (error != SVT_AV2_ERROR_NONE) return error;
+    cost += fine_mv_cost(work,anchor,parent,1u);
+    if (work->hierarchical_inter_me) {
+        /* Follow the inherited motion on its actual reference, in Q3 units.
+         * Retain the zero-centered full search before subpixel refinement. */
+        SvtAv2MotionVector center = parent;
+        uint64_t best = *sad;
+        static const int8_t diamond[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};
+        for (int step = 64; step >= 8 && best; step /= 2) {
+            const SvtAv2MotionVector origin = center;
+            for (unsigned i = 0; i < 4 && best; ++i) {
+                const SvtAv2MotionVector desired = {origin.mv_x + step * diamond[i][0],
+                                                     origin.mv_y + step * diamond[i][1]};
+                SvtAv2MotionVector trial;
+                if (!rd_snap_motion(work, desired, parent, &trial)) continue;
+                if (trial.mv_x == origin.mv_x && trial.mv_y == origin.mv_y) continue;
+                uint64_t v;
+                error = projected_luma_sad(work, ref, block, trial, best - 1u, &v);
+                if (error != SVT_AV2_ERROR_NONE) return error;
+                v += fine_mv_cost(work,trial,parent,1u);
+                if (v < best) { best = v; center = trial; }
+            }
+        }
+        if (best <= cost) { cost = best; anchor = center; }
+    }
     for (int32_t step = 4; step >= 2 && cost > 0u; step /= 2) {
         const SvtAv2MotionVector origin = anchor;
         for (int32_t y = -1; y <= 1 && cost > 0u; ++y) for (int32_t x = -1; x <= 1 && cost > 0u; ++x) {
             if (!x && !y) continue;
             const SvtAv2MotionVector offset = {origin.mv_x + step * x, origin.mv_y + step * y};
             SvtAv2MotionVector trial;
-            if (!rd_snap_motion(offset, parent, &trial)) return SVT_AV2_ERROR_INVALID_STATE;
+            if (!rd_snap_motion(work, offset, parent, &trial)) return SVT_AV2_ERROR_INVALID_STATE;
             if (trial.mv_x == anchor.mv_x && trial.mv_y == anchor.mv_y) continue;
             uint64_t v;
             error = projected_luma_sad(work, ref, block, trial, cost - 1u, &v);
             if (error != SVT_AV2_ERROR_NONE) return error;
+            v += fine_mv_cost(work,trial,parent,1u);
             if (v < cost) { cost = v; anchor = trial; }
         }
     }
@@ -4289,6 +4474,9 @@ static SvtAv2Error refine_inter_fine(RdWork* work, size_t sb, uint16_t* decision
     const InterFinePath coarse = winner;
     SvtAv2MotionVector parent_mv[4], parent_actual[4], child_mv[4][4];
     const SvtAv2FrameBuffer* parent_ref[4] = {0};
+    SvtAv2MotionVector alternate_predictor[4], alternate_mv[4][4];
+    uint32_t alternate_mask[4] = {0};
+    int alternate_valid[4] = {0};
     uint8_t parent_id[4];
     SvtAv2BlockView quadrant[4];
     uint64_t coarse_sad[4];
@@ -4302,13 +4490,22 @@ static SvtAv2Error refine_inter_fine(RdWork* work, size_t sb, uint16_t* decision
         if (projected) {
             parent_actual[q] = (SvtAv2MotionVector){parent_motion[parent].mv_x, parent_motion[parent].mv_y};
             parent_ref[q] = parent_motion[parent].reference_rank ? work->secondary : work->reference;
+            if (work->fine_reference_search) {
+                SvtAv2MotionVector pred;
+                if (!rd_motion_predict(work,parent,1u-parent_motion[parent].reference_rank,&pred))
+                    return SVT_AV2_ERROR_INVALID_STATE;
+                alternate_valid[q]=rd_snap_motion(work, pred,pred,&alternate_predictor[q]);
+            }
         }
         SvtAv2Error error = projected ? projected_luma_sad(work, parent_ref[q], &quadrant[q],
             parent_actual[q], UINT64_MAX, &coarse_sad[q]) :
             quarter_mv_sad(work, &quadrant[q], parent_mv[q], UINT64_MAX, &coarse_sad[q]);
         if (error != SVT_AV2_ERROR_NONE) return error;
     }
-    uint32_t masks[4], mask = 0u, mask_count = 0u;
+    uint32_t masks[15], mask = 0u, mask_count = 0u;
+    uint32_t fine_q=0,fine_cell=0;
+    uint64_t fine_sad=0;
+    SvtAv2MotionVector fine_mv[4];
     const uint64_t min_sad = UINT64_C(32) * 32u * (2u << (work->source->bit_depth - 8u));
     for (uint32_t pass = 0u; pass < (work->full_inter_fine ? 4u : 2u); ++pass) {
         uint32_t q = 0u;
@@ -4324,6 +4521,23 @@ static SvtAv2Error refine_inter_fine(RdWork* work, size_t sb, uint16_t* decision
                 parent_actual[q], &child_mv[q][i], &sad) :
                 fine_search_mv(work, &child, parent_mv[q], &child_mv[q][i], &sad);
             if (error != SVT_AV2_ERROR_NONE) return error;
+#if M6_FINE16_GEOMETRY
+            if (work->me_pyramid[0] && sad>fine_sad) {
+                fine_sad=sad;fine_q=q;fine_cell=i;
+            }
+#endif
+            if (alternate_valid[q] && sad > child.w * child.h) {
+                /* Each 16x16 leaf may use the reference hidden by the parent's
+                 * choice. Both paths are replayed with their own syntax prefix. */
+                const SvtAv2FrameBuffer* other=parent_ref[q]==work->reference?work->secondary:work->reference;
+                uint64_t other_sad;
+                error=fine_search_projected(work,other,&child,alternate_predictor[q],&alternate_mv[q][i],&other_sad);
+                if (error != SVT_AV2_ERROR_NONE) return error;
+                if (other_sad < sad) {
+                    alternate_mask[q] |= 1u<<i;
+                    sad=other_sad;
+                }
+            }
             refined_sad += sad;
         }
         if (refined_sad < coarse_sad[q] || work->full_inter_fine) {
@@ -4333,18 +4547,45 @@ static SvtAv2Error refine_inter_fine(RdWork* work, size_t sb, uint16_t* decision
         coarse_sad[q] = 0u;
     }
     SVT_AV2_IP_ADD(work->profile->fine_screen, profile_fine_screen);
-    for (uint32_t k = 0u; k < mask_count; ++k) {
-        const uint32_t m = masks[work->config->reverse_candidates ? mask_count - 1u - k : k];
+    /* Spend one extra partition trial on the worst residual 16x16 cell.
+     * All four 8x8 motions are measured on the same reconstructed reference. */
+    const uint32_t micro=(fine_sad>256u*(3u<<(work->source->bit_depth-8u)));
+    if (micro) for (unsigned i=0;i<4;++i) {
+        SvtAv2BlockView child=quadrant[fine_q];
+        child.x+=16u*(fine_cell%2u)+8u*(i%2u);
+        child.y+=16u*(fine_cell/2u)+8u*(i/2u);
+        child.w=child.h=8u;
+        uint64_t cost;
+        SvtAv2Error err=projected?fine_search_projected(work,parent_ref[fine_q],&child,child_mv[fine_q][fine_cell],&fine_mv[i],&cost):
+            fine_search_mv(work,&child,child_mv[fine_q][fine_cell],&fine_mv[i],&cost);
+        if (err) return err;
+    }
+    /* Also test nonconsecutive splits. A high-SAD parent need not benefit
+     * from its 16x16 children, even if another quadrant does. */
+    if (work->full_inter_fine == 2u) {
+        mask_count = 0;
+        for (uint32_t subset = mask; subset; subset = (subset - 1u) & mask)
+            masks[mask_count++] = subset;
+    }
+    uint32_t alternate_quadrants=0u;
+    for (unsigned q=0;q<4;++q) if (alternate_mask[q]) alternate_quadrants|=1u<<q;
+    const uint32_t variants=alternate_quadrants?2u:1u;
+    for (uint32_t trial=0;trial<mask_count*variants+micro;++trial) {
+        const uint32_t k=trial/variants, use_alternate=trial%variants;
+        const int small=trial==mask_count*variants;
+        const uint32_t m = small ? 1u<<fine_q : masks[work->config->reverse_candidates ? mask_count - 1u - k : k];
+        if (use_alternate && !(m & alternate_quadrants)) continue;
         /* Ternary square plan: digits 0/1 select 32x32/16x16. */
         uint16_t plan = 4u;
         static const uint16_t power[4] = {1u, 3u, 9u, 27u};
         for (uint32_t q = 0u; q < 4u; ++q) if (m & (1u << q)) plan += power[q];
+        if (small) plan=(uint16_t)(4096u+(fine_q*14u+(1u<<fine_cell)-1u)*125u+124u);
         work->output->decisions[sb] = plan;
         work->leaf_count = 0u;
         SvtAv2Error error = svt_av2_partition_traverse_sb_plan(&work->geometry, sb,
             work->output->decisions, work->output->decision_count, collect_leaf, work);
         if (error != SVT_AV2_ERROR_NONE) { region_copy(work, 1); return error; }
-        uint32_t expected_leaves = 4u;
+        uint32_t expected_leaves = small?7u:4u;
         for (uint32_t q = 0u; q < 4u; ++q) if (m & (1u << q)) expected_leaves += 3u;
         if (work->leaf_count != expected_leaves) {
             region_copy(work, 1);
@@ -4358,14 +4599,18 @@ static SvtAv2Error refine_inter_fine(RdWork* work, size_t sb, uint16_t* decision
             const uint32_t c = (y % 32u / 16u) * 2u + x % 32u / 16u;
             const int split = (m & (1u << q)) != 0u;
             ids[i] = split ? 3u : parent_id[q];
-            work->mvs[i] = !projected && split ? child_mv[q][c] : parent_mv[q];
+            const int tiny=small && q==fine_q && c==fine_cell;
+            const SvtAv2MotionVector proposed=tiny ? fine_mv[((y%16u)/8u)*2u+(x%16u)/8u] :
+                split ? child_mv[q][c] : parent_mv[q];
+            work->mvs[i] = !projected && split ? proposed : parent_mv[q];
             if (projected && ids[i] == 3u) {
                 const uint32_t parent = coarse.decision ? q : 0u;
                 const uint32_t bit = 1u << i;
-                if (parent_motion[parent].reference_rank) work->long_mask |= bit;
+                const int alternate=split && use_alternate && (alternate_mask[q] & (1u<<c));
+                if ((parent_motion[parent].reference_rank != 0u) != alternate) work->long_mask |= bit;
                 if (split || ((coarse.long_mask | coarse.q3_seed_mask) & (1u << parent))) {
                     work->q3_seed_mask |= bit;
-                    work->q3_seed[i] = split ? child_mv[q][c] : coarse.q3_seed[parent];
+                    work->q3_seed[i] = alternate ? alternate_mv[q][c] : split ? proposed : coarse.q3_seed[parent];
                 }
             }
         }
@@ -4374,26 +4619,32 @@ static SvtAv2Error refine_inter_fine(RdWork* work, size_t sb, uint16_t* decision
             if (viable == PROJECTED_MODE_EMPTY) continue;
             if (viable == PROJECTED_MODE_ERROR) { region_copy(work, 1); return SVT_AV2_ERROR_INVALID_STATE; }
         }
-        region_copy(work, 1);
-        uint64_t d = 0u, r = 0u, cost = 0u;
-        uint32_t ignored_path;
-        int legal;
-        error = build_path(work, 0u, 0, 0, ids, &legal, &d, &ignored_path);
-        if (error == SVT_AV2_ERROR_NONE && (!legal || RD_RATE(work, sb, plan,
-                work->blocks, work->leaf_count * 3u, work->modes, work->leaf_count, 0, &r) != 0))
-            error = SVT_AV2_ERROR_INVALID_STATE;
-        if (error == SVT_AV2_ERROR_NONE) error = svt_av2_rd_cost(d, work->stats.lambda_q8, r, &cost);
-        if (error != SVT_AV2_ERROR_NONE) { region_copy(work, 1); return error; }
-        ++work->stats.candidate_count; ++work->stats.inter_fine_trials;
-        const uint64_t id = (UINT64_C(1) << 42u) | plan;
-        if (work->config->candidate_hook)
-            work->config->candidate_hook(work->config->candidate_hook_user, sb, id, d, r, cost, 0);
-        if (cost < best->cost || (cost == best->cost && id < best->id)) {
-            *best = (RdBasicChoice){cost, d, r, path_hash(work), id};
-            fine_save(&winner, work, plan, ids);
+        /* Motion-only children miss newly uncovered background. Replay a
+         * second path that may use causal DC/V/H or its searched motion in
+         * each leaf, paying the entire tree's coefficient and mode rate. */
+        for (int mixed=0;mixed<=work->mixed_inter_fine;++mixed) {
+            region_copy(work, 1);
+            uint64_t d = 0u, r = 0u, cost = 0u;
+            uint32_t ignored_path;
+            int legal;
+            error = build_path(work, 0u, 0, mixed, mixed ? NULL : ids, &legal, &d, &ignored_path);
+            if (mixed && !error && !memcmp(ids,work->ids,work->leaf_count)) continue;
+            if (error == SVT_AV2_ERROR_NONE && (!legal || RD_RATE(work, sb, plan,
+                    work->blocks, work->leaf_count * 3u, work->modes, work->leaf_count, 0, &r) != 0))
+                error = SVT_AV2_ERROR_INVALID_STATE;
+            if (error == SVT_AV2_ERROR_NONE) error = svt_av2_rd_cost(d, work->stats.lambda_q8, r, &cost);
+            if (error != SVT_AV2_ERROR_NONE) { region_copy(work, 1); return error; }
+            ++work->stats.candidate_count; ++work->stats.inter_fine_trials;
+            const uint64_t id = (UINT64_C(1) << 42u) | ((uint64_t)mixed<<17u) | ((uint64_t)use_alternate<<16u) | plan;
+            if (work->config->candidate_hook)
+                work->config->candidate_hook(work->config->candidate_hook_user, sb, id, d, r, cost, 0);
+            if (cost < best->cost || (cost == best->cost && id < best->id)) {
+                *best = (RdBasicChoice){cost, d, r, path_hash(work), id};
+                fine_save(&winner, work, plan, work->ids);
+            }
         }
     }
-    if (mask_count != 0u) {
+    if (mask_count != 0u || micro) {
         region_copy(work, 1);
         if (winner.decision != *decision) ++work->stats.inter_fine_accepts;
         *decision = winner.decision;
@@ -4411,7 +4662,7 @@ static SvtAv2Error refine_inter_near(RdWork* work, size_t sb, uint16_t decision,
     RdBasicChoice* best) {
     enum { max_trials = 2 };
     const int projected = work->secondary != NULL;
-    const int32_t limit = projected ? 128 : 64;
+    const int32_t limit = svt_av2_motion_q3_limit(work->config->frame_header.wide_motion) / (projected ? 1 : 2);
     uint32_t tried = 0u, won = 0u;
     for (uint32_t leaf = 0u; leaf < work->leaf_count && tried < max_trials; ++leaf) {
         SvtAv2TileBlockMode incumbent;
@@ -4650,21 +4901,23 @@ static SvtAv2Error refine_inter_tail(RdWork* work, size_t sb, uint16_t decision,
         for (uint32_t plane = 0u; plane < 3u; ++plane) {
             const uint32_t k = 3u * leaf + plane;
             const SvtAv2TileCoeffBlock* b = &work->blocks[k];
-            if (b->tx_type || b->width != b->height || b->width < 8u || b->width > 64u) continue;
-            const uint32_t side = b->width >= 32u ? 32u : b->width;
-            if (side != 8u && side != 16u && side != 32u) continue;
-            const uint32_t s = side == 8u ? 0u : side == 16u ? 1u : 2u;
+            if (b->tx_type || b->width < 8u || b->height < 8u ||
+                (b->width != b->height && t->try_levels != 2)) continue;
+            SvtAv2TxSize tx;
+            if (svt_av2_coeff_tx_size_from_dims(b->width, b->height, &tx) != SVT_AV2_COEFF_OK)
+                return SVT_AV2_ERROR_INVALID_STATE;
+            const uint32_t count = (uint32_t)svt_av2_coeff_coeff_count(tx);
             if (t->try_sparse_planes) {
-                const uint32_t cap = 1u + side * side / 64u;
+                const uint32_t cap = 1u + count / 64u;
                 unsigned energy = 0u;
-                for (uint32_t i = 0; i < side * side && energy <= cap; ++i) {
+                for (uint32_t i = 0; i < count && energy <= cap; ++i) {
                     const int32_t level = b->qcoeff[i];
                     energy += (unsigned)abs(level);
                     nonzero[k] += level != 0;
                 }
                 if (energy && energy <= cap) sparse_planes[plane != 0u] |= UINT64_C(1) << k;
             }
-            const uint32_t n = svt_av2_inter_tail_positions(b->qcoeff, t->scans[s], side * side, t->positions[k]);
+            const uint32_t n = svt_av2_inter_tail_positions(b->qcoeff, svt_av2_coeff_scan_view(tx), count, t->positions[k]);
             if (!n) continue;
             t->counts[k] = (uint8_t)n;
             masks[plane != 0u] |= UINT64_C(1) << k;
@@ -4916,16 +5169,34 @@ static SvtAv2Error refine_video_rect(RdWork* work, size_t sb, uint16_t* decision
         const SvtAv2BlockView* b = &incumbent.leaves[i];
         parent[(b->y % 64u / 32u) * 2u + b->x % 64u / 32u] = i;
     }
-    if (inter_count && original != 1u) return SVT_AV2_ERROR_NONE;
+    const int motion_rect = inter_count && (work->video_rect >= 4u || (!work->secondary && work->video_rect == 3u)) &&
+        work->config->frame_header.mv_half == 2u && original <= 1u;
+    if (inter_count && original != 1u && !motion_rect) return SVT_AV2_ERROR_NONE;
+    SvtAv2TileBlockMode coarse_motion[4];
+    if (motion_rect && work->secondary) {
+        for (uint32_t i = 0; i < incumbent.count; ++i) {
+            if (!rd_projected_mode(work, i, incumbent.ids[i], &coarse_motion[i]))
+                return SVT_AV2_ERROR_INVALID_STATE;
+            work->modes[i] = coarse_motion[i];
+        }
+    }
     const uint32_t others = 4u * (1u + 7u + 49u); /* Three intact 32x32 quadrants. */
     SvtAv2Error error = SVT_AV2_ERROR_NONE;
     work->rank_intra_only = 1;
-    for (uint32_t index = 0u; index < 50u; ++index) {
-        const uint32_t arm = work->config->reverse_candidates ? 49u - index : index;
-        if (inter_count && arm < 2u) continue;
+    /* Uniform 16x16, 32x16 and 16x32 trees let adjacent quadrants split
+     * together. Each fits in the same sixteen-leaf motion snapshot. */
+    const uint32_t base_trials = motion_rect || (work->video_rect == 2u && !work->reference) ? 53u : 50u;
+    const uint32_t trials = base_trials + (motion_rect && work->video_rect == 5u ? 16u : 0u);
+    for (uint32_t index = 0u; index < trials; ++index) {
+        const uint32_t trial = work->config->reverse_candidates ? trials - 1u - index : index;
+        /* Revisit single-quadrant half-rectangle trees with their own MVs. */
+        const int mixed_motion = trial >= base_trials;
+        const uint32_t arm = mixed_motion ? 2u + trial - base_trials : trial;
+        if (inter_count && (arm < 2u || (original == 0u && arm < 50u && !mixed_motion))) continue;
         const uint16_t plan = (uint16_t)(arm < 2u ? 87u + arm : arm < 18u ?
             SVT_AV2_HALF_RECT_BASE + (arm - 2u) * 343u + others :
-            SVT_AV2_RECT16_BASE + (arm - 18u) * 343u + others);
+            arm < 50u ? SVT_AV2_RECT16_BASE + (arm - 18u) * 343u + others :
+            SVT_AV2_MIXED_RECT32_BASE + (arm == 50u ? 0u : arm - 46u) * 400u);
         work->output->decisions[sb] = plan;
         work->leaf_count = 0u;
         error = svt_av2_partition_traverse_sb_plan(&work->geometry, sb, work->output->decisions,
@@ -4938,16 +5209,33 @@ static SvtAv2Error refine_video_rect(RdWork* work, size_t sb, uint16_t* decision
                 const SvtAv2BlockView* b = &work->leaves[i];
                 const uint32_t old = parent[(b->y % 64u / 32u) * 2u + b->x % 64u / 32u];
                 const int intact = b->w == 32u && b->h == 32u;
-                const int motion_child = work->config->inter_fine && b->w == 16u && b->h == 16u &&
+                const int half_rect = (b->w == 32u && b->h == 16u) || (b->w == 16u && b->h == 32u);
+                const int search_child = motion_rect && (arm >= 50u || (mixed_motion && half_rect)) &&
                     incumbent.ids[old] == 3u;
+                const int motion_child = search_child || (work->config->inter_fine && b->w == 16u &&
+                    b->h == 16u && incumbent.ids[old] == 3u);
                 ids[i] = intact || motion_child ? incumbent.ids[old] : UINT8_MAX;
                 work->mvs[i] = incumbent.mvs[old];
                 work->q3_seed[i] = incumbent.q3_seed[old];
+                if (search_child) {
+                    uint64_t sad;
+                    if (work->secondary) {
+                        const SvtAv2TileBlockMode* parent_mode = &coarse_motion[old];
+                        const SvtAv2MotionVector mv = {parent_mode->mv_x, parent_mode->mv_y};
+                        const SvtAv2FrameBuffer* ref = parent_mode->reference_rank ? work->secondary : work->reference;
+                        error = fine_search_projected(work, ref, b, mv, &work->q3_seed[i], &sad);
+                        work->q3_seed_mask |= 1u << i;
+                    } else {
+                        error = fine_search_mv(work, b, incumbent.mvs[old], &work->mvs[i], &sad);
+                    }
+                    if (error != SVT_AV2_ERROR_NONE) break;
+                }
                 if (ids[i] == 3u) {
                     work->long_mask |= ((incumbent.long_mask >> old) & 1u) << i;
                     work->q3_seed_mask |= ((incumbent.q3_seed_mask >> old) & 1u) << i;
                 }
             }
+            if (error != SVT_AV2_ERROR_NONE) break;
             const ProjectedModeResult state = preflight_projected_path(work, ids, sb, plan);
             if (state == PROJECTED_MODE_EMPTY) continue;
             if (state == PROJECTED_MODE_ERROR) { error = SVT_AV2_ERROR_INVALID_STATE; break; }
@@ -4981,6 +5269,27 @@ static SvtAv2Error refine_video_rect(RdWork* work, size_t sb, uint16_t* decision
     return error;
 }
 
+/* Reserve deep rectangle trials for blocks whose variation cannot be
+ * explained by a single horizontal or vertical predictor. */
+static int deep_rect_activity(const SvtAv2FrameBuffer* src, unsigned sx, unsigned sy, unsigned qindex) {
+    const unsigned left = sx * 64u, top = sy * 64u;
+    const unsigned right = SVT_AV2_MIN(left + 64u, src->visible_width);
+    const unsigned bottom = SVT_AV2_MIN(top + 64u, src->visible_height);
+    const unsigned step = src->bit_depth > 8u ? 2u : 1u, stride = src->strides[0];
+    unsigned total = 0, count = 0;
+    for (unsigned y = top + 4u; y < bottom; y += 8u) {
+        for (unsigned x = left + 4u; x < right; x += 8u) {
+            const uint8_t* p = src->planes[0] + (size_t)y * stride + x * step;
+            const int v = svt_av2_sample_load(p, src->bit_depth);
+            const int dx = abs(v - (int)svt_av2_sample_load(p - 4u * step, src->bit_depth));
+            const int dy = abs(v - (int)svt_av2_sample_load(p - 4u * stride, src->bit_depth));
+            total += (unsigned)SVT_AV2_MIN(dx, dy);
+            ++count;
+        }
+    }
+    return count && total * 256u > count * (unsigned)svt_av2_quant_qlookup((int)qindex);
+}
+
 static double ssim_luma_variance(const SvtAv2FrameBuffer* src, uint32_t bx, uint32_t by) {
     const uint32_t bd = src->bit_depth, step = bd == 8u ? 1u : 2u;
     uint32_t sum = 0u, squares = 0u, n = 0u;
@@ -4995,6 +5304,63 @@ static double ssim_luma_variance(const SvtAv2FrameBuffer* src, uint32_t bx, uint
     }
     const double mean = (double)sum / n;
     return floor(((double)squares / n - mean * mean) / (1u << (2u * (bd - 8u))) + 0.5);
+}
+
+/* zenrav1e variance boost uses the smoothed fifth octile of 8x8 luma
+ * variances to retain gradients without letting a few hard lines dominate.
+ * Search the AV2 AC step table and keep the delta on the signaled lattice. */
+static int octile_q_delta(const SvtAv2FrameBuffer* src, uint32_t sx, uint32_t sy, int base) {
+    unsigned variance[64], n=0;
+    for (unsigned y=sy*64u;y<SVT_AV2_MIN(sy*64u+64u,src->visible_height);y+=8u)
+        for (unsigned x=sx*64u;x<SVT_AV2_MIN(sx*64u+64u,src->visible_width);x+=8u) {
+            const unsigned value=(unsigned)ssim_luma_variance(src,x,y);
+            unsigned at=n++;
+            while (at && variance[at-1u]>value) {
+                variance[at]=variance[at-1u];
+                --at;
+            }
+            variance[at]=value;
+        }
+    const unsigned step=SVT_AV2_MAX(1u,n/8u), mid=SVT_AV2_MAX(1u,5u*n/8u)-1u;
+    const unsigned low=SVT_AV2_MAX(mid>step ? mid-step : 0u,step-1u);
+    const unsigned v=(variance[low]+2u*variance[mid]+variance[SVT_AV2_MIN(n-1u,mid+step)]+2u)/4u;
+    const double scale=1.0+0.15*SVT_AV2_MAX(0.0,10.0-log2((double)SVT_AV2_MAX(v,1u)));
+    const double target=svt_av2_quant_qlookup(base)/scale;
+    const int first=src->bit_depth==10u ? 49 : 1;
+    int q=first;
+    while (q<base && svt_av2_quant_qlookup(q)<target) ++q;
+    const int steps=(int)lround((base-first+545.0)*(base-q)/(1279.0*4.0));
+    return -SVT_AV2_MIN(6,steps);
+}
+
+/* In line art, a strong directional edge and an equally energetic texture
+ * need different Q steps. Compare the eigenvalues of the gradient tensor
+ * in 8x8 cells. Leave flat cells at the picture Q. */
+static int contour_q_delta(const SvtAv2FrameBuffer* src, unsigned left, unsigned top) {
+    const unsigned stride = src->strides[0], step = src->bit_depth > 8u ? 2u : 1u;
+    const unsigned bottom = SVT_AV2_MIN(top + 64u, src->visible_height);
+    const unsigned right = SVT_AV2_MIN(left + 64u, src->visible_width);
+    int sum = 0, cells = 0;
+    for (unsigned y = top; y < bottom; y += 8u) for (unsigned x = left; x < right; x += 8u) {
+        int xx = 0, yy = 0, xy = 0, n = 0;
+        for (unsigned j = y + 1u; j < SVT_AV2_MIN(y + 8u, bottom); j += 2u) {
+            const uint8_t* row = src->planes[0] + (size_t)j * stride;
+            for (unsigned i = x + 1u; i < SVT_AV2_MIN(x + 8u, right); i += 2u) {
+                const uint8_t* px = row + i * step;
+                const int v = svt_av2_sample_load(px, src->bit_depth);
+                const int dx = (v - (int)svt_av2_sample_load(px - step, src->bit_depth)) / (int)(1u << (src->bit_depth - 8u));
+                const int dy = (v - (int)svt_av2_sample_load(px - stride, src->bit_depth)) / (int)(1u << (src->bit_depth - 8u));
+                xx += dx * dx; yy += dy * dy; xy += dx * dy; ++n;
+            }
+        }
+        const int energy = xx + yy;
+        if (energy > 16 * n) {
+            const double coherence = hypot((double)(xx - yy), 2.0 * xy) / energy;
+            sum += coherence >= 0.7 ? -3 : coherence <= 0.35 ? 2 : 0;
+        }
+        ++cells;
+    }
+    return (int)lround((double)sum / cells);
 }
 
 /* AVM SSIM tuning fits a scale per 16x16 from the 8x8 variances. SVT
@@ -5026,18 +5392,91 @@ static void ssim_sb_scales(const SvtAv2FrameBuffer* src, uint32_t cols, uint32_t
     for (size_t sb = 0u; sb < (size_t)cols * rows; ++sb) scales[sb] = exp(scales[sb] - frame_log);
 }
 
+/* Favor long edges parallel to an inexpensive candidate's long side.
+ * Its square incumbent and complete coded-rate evaluation remain available. */
+static uint16_t directional_plan(const RdWork* work, const uint32_t square[4]) {
+    uint32_t plan=SVT_AV2_MIXED_RECT32_BASE, scale=1u;
+    const SvtAv2FrameBuffer* src=work->source;
+    const unsigned step=src->bit_depth>8u?2u:1u;
+    for (unsigned q=0;q<4;++q) {
+        const unsigned left=work->region[0].x+(q%2)*32u, top=work->region[0].y+(q/2)*32u;
+        uint32_t dx=0,dy=0,shape=square[q];
+        for (unsigned y=2;y<32;y+=3) {
+            const uint8_t* row=src->planes[0]+(size_t)(top+y)*src->strides[0]+left*step;
+            for (unsigned x=2;x<32;x+=3) {
+                const uint8_t* pixel=row+x*step;
+                const int v=svt_av2_sample_load(pixel,src->bit_depth);
+                dx+=(uint32_t)abs(v-(int)svt_av2_sample_load(pixel-2u*step,src->bit_depth));
+                dy+=(uint32_t)abs(v-(int)svt_av2_sample_load(pixel-2u*src->strides[0],src->bit_depth));
+            }
+        }
+        if (dx>dy+dy/4u) shape=square[q]==1u?3u:6u;
+        if (dy>dx+dx/4u) shape=square[q]==1u?2u:5u;
+        plan+=scale*shape;
+        scale*=7u;
+    }
+    return (uint16_t)plan;
+}
+
+/* Estimate an asymmetric tree from the measured cost of its constituent
+ * leaves. The winning proposal is then encoded with the live predictors. */
+static uint16_t subrect_plan(const uint64_t cells[7][4][4], const uint32_t shapes[4], int small) {
+    uint64_t lowest=UINT64_MAX;
+    uint16_t best=0;
+    for (unsigned q=0;q<4;++q) {
+        unsigned others=0;
+        uint64_t outside=0;
+        for (unsigned k=4;k-- > 0;) if (k!=q) {
+            others=others*7u+shapes[k];
+            for (unsigned c=0;c<4;++c) outside+=cells[shapes[k]][k][c];
+        }
+        const unsigned variants=small ? 8u : 4u;
+        for (unsigned v=0;v<variants;++v) {
+            uint64_t cost=outside;
+            for (unsigned c=0;c<4;++c) {
+                unsigned shape;
+                if (small) shape=c==v/2u ? 2u+(v&1u) : 0u;
+                else {
+                    const unsigned half=(v&2u) ? c%2u : c/2u;
+                    shape=half==(v&1u) ? 5u+(v>>1) : 0u;
+                }
+                cost+=cells[shape][q][c];
+            }
+            if (cost<lowest) {
+                lowest=cost;
+                best=(uint16_t)((small ? SVT_AV2_RECT16_BASE : SVT_AV2_HALF_RECT_BASE) +
+                    (q*variants+v)*343u + others);
+            }
+        }
+    }
+    return best;
+}
+
 /* Score seven uniform quadrant shapes, then replay their best local choices
  * together so that the mixed tree pays its actual causal prediction and rate. */
-static SvtAv2Error screen_still_trees(RdWork* work, size_t sb, uint16_t* decision, RdBasicChoice* best) {
+static SvtAv2Error screen_still_trees(RdWork* work, size_t sb, uint16_t* decision,
+    RdBasicChoice* best) {
     uint64_t quadrant_cost[4] = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
     uint32_t shape[4] = {0};
     RdTreeSeed seeds[4];
     uint32_t seed_count = 0;
     uint64_t cell_cost[2][4][4] = {0};
+    uint64_t rect_cells[7][4][4] = {0};
     uint64_t square_cost[4] = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
     uint32_t square_shape[4] = {0};
     static const uint16_t long_plans[] = {87u, 88u, 91u, 92u};
-    for (unsigned trial = 0; trial < 10u + SVT_AV2_ARRAY_SIZE(long_plans); ++trial) {
+    const int directional=work->config->balanced_still_search>=2;
+    const unsigned end=10u+SVT_AV2_ARRAY_SIZE(long_plans);
+    uint64_t thin_cost[4]={UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
+    uint32_t thin_shape[4]={0};
+    const unsigned extra=work->config->subrect_search?2u:work->config->thin_still_search?5u:(unsigned)directional;
+    for (unsigned trial = 0; trial < end+extra; ++trial) {
+        /* Compare the four square sizes and the mixed-quadrant proposal. */
+        if (work->config->subrect_search && work->config->balanced_still_search) {
+            if (trial>=10 && trial<end) continue;
+        } else if (work->config->balanced_still_search && trial != 0 && trial != 1 &&
+            trial != 2 && trial != 5 && trial != 8 && trial != end &&
+            !(work->config->balanced_still_search == 3 && trial == 9)) continue;
         uint16_t plan = 0;
         if (trial > 0 && trial < 8)
             plan = (uint16_t)(SVT_AV2_MIXED_RECT32_BASE + (trial - 1) * 400u);
@@ -5075,7 +5514,26 @@ static SvtAv2Error screen_still_trees(RdWork* work, size_t sb, uint16_t* decisio
             continue;
 #endif
         }
-        if (trial >= 10) plan = long_plans[trial - 10];
+        if (work->config->subrect_search && trial>=end) {
+            plan=subrect_plan(rect_cells,shape,trial==end+1u);
+        } else if (work->config->thin_still_search && trial>=end) {
+            static const uint16_t uniform[]={880u,881u,3283u,3284u};
+            if (trial<end+4u) plan=uniform[trial-end];
+            else {
+                uint32_t code=0, used=0;
+                for (unsigned q=4;q-- > 0;) {
+                    const int thin=thin_cost[q]<square_cost[q];
+                    code=code*7u+(thin?thin_shape[q]:square_shape[q]);
+                    used+=(unsigned)thin;
+                }
+                if (!used) continue;
+                plan=svt_av2_partition_mixed7_plan(code);
+                if (plan==880u || plan==881u) continue;
+            }
+        } else if (trial==end) {
+            plan=directional_plan(work,shape);
+            if (plan==SVT_AV2_MIXED_RECT32_BASE+shape[0]+7u*shape[1]+49u*shape[2]+343u*shape[3]) continue;
+        } else if (trial >= 10) plan = long_plans[trial - 10];
         SvtAv2Error error = geometry_for_sb(work, sb, plan);
         if (error != SVT_AV2_ERROR_NONE) return error;
         size_t count;
@@ -5089,13 +5547,38 @@ static SvtAv2Error screen_still_trees(RdWork* work, size_t sb, uint16_t* decisio
             error = plane_blocks(work, leaf, blocks);
             if (error != SVT_AV2_ERROR_NONE) return error;
             uint64_t lowest = UINT64_MAX;
-            uint32_t mode = 0;
+            uint32_t mode = 0, satd_mode = 0;
+            uint64_t lowest_satd = UINT64_MAX;
             for (uint32_t m = 0; m < 14; ++m) {
                 if (!legal_mode(work, leaf, m)) continue;
                 uint64_t sad[3];
                 error = predict(work, leaf, m, blocks, sad, 1);
                 if (error != SVT_AV2_ERROR_NONE) return error;
-                if (sad[0] < lowest) { lowest = sad[0]; mode = m; }
+                const uint64_t score=work->config->thin_still_search?angle_satd(work,&blocks[0]):sad[0];
+                if (work->config->shortlist_trees) {
+                    const uint64_t satd = angle_satd(work, &blocks[0]);
+                    if (satd < lowest_satd) { lowest_satd = satd; satd_mode = m; }
+                }
+                if (score < lowest) { lowest = score; mode = m; }
+            }
+            if (work->config->shortlist_trees && satd_mode != mode) {
+                const uint32_t candidates[2] = {mode, satd_mode};
+                const size_t offset = work->coeff_count;
+                uint64_t best_cost = UINT64_MAX;
+                for (unsigned i = 0; i < 2; ++i) {
+                    uint64_t trial_sse[3] = {0}, trial_rate, trial_cost;
+                    work->coeff_count = offset;
+                    work->ids[leaf] = (uint8_t)candidates[i];
+                    error = reconstruct_leaf(work, leaf, candidates[i], blocks, trial_sse);
+                    if (error != SVT_AV2_ERROR_NONE) return error;
+                    if (svt_av2_tile_rate_prefix_trial(work->basic_rate_prefix, leaf,
+                        work->blocks + 3u * leaf, 0, &trial_rate)) return SVT_AV2_ERROR_INVALID_STATE;
+                    error = svt_av2_rd_cost(svt_av2_rd_distortion(trial_sse, work->source->bit_depth,
+                        work->source->chroma_format), work->stats.lambda_q8, trial_rate - rate, &trial_cost);
+                    if (error != SVT_AV2_ERROR_NONE) return error;
+                    if (trial_cost < best_cost) { best_cost = trial_cost; mode = candidates[i]; }
+                }
+                work->coeff_count = offset;
             }
             work->ids[leaf] = (uint8_t)mode;
             uint64_t sse[3] = {0};
@@ -5111,6 +5594,10 @@ static SvtAv2Error screen_still_trees(RdWork* work, size_t sb, uint16_t* decisio
             if (error != SVT_AV2_ERROR_NONE) return error;
             const unsigned q = (blocks[0].y % 64u / 32u) * 2u + blocks[0].x % 64u / 32u;
             local_cost[q] += cost;
+            if (work->config->subrect_search && trial>0u && trial<8u) {
+                const unsigned cell=(blocks[0].y%32u/16u)*2u+blocks[0].x%32u/16u;
+                rect_cells[trial-1u][q][cell]+=cost;
+            }
             if (trial == 1 || trial == 2) {
                 const unsigned cell = (blocks[0].y % 32u / 16u) * 2u + blocks[0].x % 32u / 16u;
                 cell_cost[trial - 1][q][cell] += cost;
@@ -5118,6 +5605,11 @@ static SvtAv2Error screen_still_trees(RdWork* work, size_t sb, uint16_t* decisio
         }
         if (svt_av2_tile_rate_prefix_finish(work->basic_rate_prefix, &rate))
             return SVT_AV2_ERROR_INVALID_STATE;
+        if (work->config->thin_still_search && (trial==end || trial==end+1u))
+            for (unsigned q=0;q<4;++q) if (local_cost[q]<thin_cost[q]) {
+                thin_cost[q]=local_cost[q];
+                thin_shape[q]=5u+trial-end;
+            }
         if (trial > 0 && trial < 8) {
             for (unsigned i = 0; i < 4; ++i) {
                 if (trial <= 5 && local_cost[i] < square_cost[i]) {
@@ -5148,7 +5640,8 @@ static SvtAv2Error screen_still_trees(RdWork* work, size_t sb, uint16_t* decisio
     RdTreeSeed winner = seeds[0];
     uint8_t alternate[RD_MAX_LEAVES];
     const uint64_t cutoff = winner.choice.cost + winner.choice.cost / 5u;
-    for (uint32_t i = 0; i < seed_count; ++i) {
+    const uint32_t finalists = work->config->balanced_still_search ? 1u : seed_count;
+    for (uint32_t i = 0; i < finalists; ++i) {
         RdTreeSeed* seed = &seeds[i];
         if (seed->choice.cost > cutoff) break;
         SvtAv2Error error = geometry_for_sb(work, sb, seed->decision);
@@ -5180,7 +5673,10 @@ static SvtAv2Error encode_sb(RdWork* work, size_t sb) {
     if (work->basic_memo) {memset(work->basic_memo->slots,0,sizeof(work->basic_memo->slots));work->basic_memo->count=0u;}
     work->coeff_policy = 0u; work->motion_policy = 0u; work->wide_stage = 0u;
     work->inter_skip_mask = 0u;
-    if (work->tail) work->tail->mask = work->tail->zero_mask = 0u;
+    if (work->tail) {
+        work->tail->mask = work->tail->zero_mask = 0u;
+        work->tail->apply_levels = 0;
+    }
     work->long_mask = work->q3_seed_mask = 0u;
 #if SVT_AV2_INTER_PIXEL_REUSE
     if (work->inter_pixel != NULL) {
@@ -5679,7 +6175,8 @@ static SvtAv2Error encode_sb(RdWork* work, size_t sb) {
     if (error!=SVT_AV2_ERROR_NONE) { region_copy(work,1); return error; }
 #if M6_FINE16
     if (!partial && work->config->rd_mode==3u && work->config->partition_selection>=2u &&
-        work->config->tree_finalists) {
+        work->config->tree_finalists && (!work->ranked_fine16 || best_decision != 0u)) {
+        if (work->ranked_fine16) fine16_rank_masks(work);
         RdTreeSeed fine16_seeds[4];uint32_t fine16_count=0u;
         error=fine16_prepare(work,sb,best_decision,fine16_seeds,&fine16_count);
         if (error==SVT_AV2_ERROR_NONE && fine16_count)
@@ -5756,6 +6253,22 @@ static SvtAv2Error encode_sb(RdWork* work, size_t sb) {
     SVT_AV2_IP_ADD(work->profile->final, profile_replay);
     if (work->tail && !partial) {
         SVT_AV2_IP_START(profile_tail);
+        if (work->tail->try_levels) {
+            /* Price a bounded set of levels on the winning motion path,
+             * then accept using the entire SB's live entropy context. */
+            RdBasicChoice trial = tool_best;
+            work->tail->apply_levels = 1;
+            error = replay_sb_choice(work, sb, best_decision, &trial);
+            if (error != SVT_AV2_ERROR_NONE) return error;
+            if (trial.cost < tool_best.cost) {
+                tool_best = trial;
+                rate = trial.rate;
+            } else {
+                work->tail->apply_levels = 0;
+                error = replay_sb_choice(work, sb, best_decision, &tool_best);
+                if (error != SVT_AV2_ERROR_NONE) return error;
+            }
+        }
         error = refine_inter_tail(work, sb, best_decision, &tool_best, &rate);
         SVT_AV2_IP_ADD(work->profile->tail, profile_tail);
         if (error != SVT_AV2_ERROR_NONE) { region_copy(work, 1); return error; }
@@ -5820,24 +6333,31 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
     SvtAv2RdFrameOutput* output, SvtAv2RdFrameStats* stats) {
     if (stats != NULL) memset(stats, 0, sizeof(*stats));
     if (output != NULL) output->block_count = output->mode_count = output->coeff_count = output->decision_count = 0u;
+    const int video_key=config && config->rd_mode==3u && config->end_models &&
+        config->frame_header.multi_frame && !config->frame_header.inter_frame && !reference &&
+        config->frame_header.entropy_adaptation && config->frame_header.m5_intra_modes>=3u &&
+        !config->frame_header.enable_cfl_intra && (config->screen_trees ||
+            (config->tree_finalists==4u && config->transform_selection==2u)) &&
+        config->partition_selection==7u && config->transform_selection==config->coeff_optimization &&
+        (config->transform_selection==0u || config->transform_selection==2u);
     if (source == NULL || recon == NULL || config == NULL || scratch == NULL || output == NULL ||
         source->buffer == NULL || recon->buffer == NULL || source->buffer == recon->buffer ||
         source->visible_width != recon->visible_width || source->visible_height != recon->visible_height ||
         source->bit_depth != recon->bit_depth || source->chroma_format != recon->chroma_format ||
         config->rd_mode < 1u || config->rd_mode > 3u || config->partition_selection > 10u ||
-        (config->rd_mode==3u && (reference!=NULL || config->frame_header.multi_frame ||
+        (config->rd_mode==3u && (reference!=NULL || (config->frame_header.multi_frame && !video_key) ||
             config->frame_header.m5_intra_modes<3u || config->partition_selection>7u ||
             config->intra_joint || config->coeff_optimization==1u || config->motion_optimization ||
             config->tree_finalists>4u)) ||
         config->rd_lambda_model > 2u || (config->rd_lambda_model && (reference != NULL ||
-            config->frame_header.multi_frame) && !(config->rd_mode == 2u && config->frame_header.multi_frame)) ||
+            config->frame_header.multi_frame) && !video_key && !(config->rd_mode == 2u && config->frame_header.multi_frame)) ||
         (config->rd_lambda_scale && (config->rd_lambda_scale < 50u || config->rd_lambda_scale > 250u || !config->rd_lambda_model)) ||
         (config->partition_selection >= 2u && config->frame_header.m5_intra_modes < 2u) ||
         config->frame_header.enable_mrls > 1u || (config->frame_header.enable_mrls &&
             (reference != NULL || config->frame_header.multi_frame || config->frame_header.m5_intra_modes<3u)) ||
         (config->tree_finalists!=0u && config->tree_finalists!=2u && config->tree_finalists!=4u &&
          config->tree_finalists!=8u && config->tree_finalists!=10u) ||
-        (config->tree_finalists && (reference!=NULL || config->frame_header.multi_frame ||
+        (config->tree_finalists && (reference!=NULL || (config->frame_header.multi_frame && !video_key) ||
             config->partition_selection<2u || config->frame_header.m5_intra_modes<2u)) ||
         config->intra_joint > 1u || (config->intra_joint && (reference != NULL ||
             config->frame_header.multi_frame || config->frame_header.m5_intra_modes < 3u ||
@@ -5846,7 +6366,7 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
         (config->mhccp_search && (reference != NULL || config->frame_header.multi_frame ||
             config->frame_header.m5_intra_modes != 4u)) ||
         config->cfl_search > 1u || (config->cfl_search && (reference != NULL ||
-            config->frame_header.multi_frame || config->frame_header.m5_intra_modes != 4u)) ||
+            (config->frame_header.multi_frame && !video_key) || config->frame_header.m5_intra_modes != 4u)) ||
 #if SVT_AV2_EXPERIMENTAL_VIDEO_CFL
         !svt_av2_frame_header_video_cfl_valid(&config->frame_header) || config->video_cfl_search>1u ||
         (config->video_cfl_search && (!config->frame_header.enable_cfl_intra || config->rd_mode!=2u ||
@@ -5854,9 +6374,9 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
             source->bit_depth!=10u || source->chroma_format!=SVT_AV2_CHROMA_420)) ||
 #endif
         config->angle_search > 1u || (config->angle_search && (reference != NULL ||
-            config->frame_header.multi_frame || config->frame_header.m5_intra_modes < 3u)) ||
+            (config->frame_header.multi_frame && !video_key) || config->frame_header.m5_intra_modes < 3u)) ||
         config->transform_selection > 2u ||
-        (config->transform_selection && (reference != NULL || config->frame_header.multi_frame ||
+        (config->transform_selection && (reference != NULL || (config->frame_header.multi_frame && !video_key) ||
             config->frame_header.reduced_tx_set != (config->transform_selection == 2u ? 0u : 1u) ||
             config->frame_header.m5_intra_modes < 2u ||
             config->transform.forward_type == NULL || config->transform.inverse_type == NULL)) ||
@@ -5887,13 +6407,13 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
                  config->frame_header.base_q_idx, config->frame_header.bit_depth))) ||
         (config->coeff_optimization == 2u && config->frame_header.m5_intra_modes < 2u) ||
         (config->coeff_optimization && config->motion_optimization) ||
-        (config->frame_header.entropy_adaptation &&
+        (config->frame_header.entropy_adaptation && !video_key &&
             (config->frame_header.multi_frame || reference != NULL) &&
             (config->rd_mode != 2u || config->frame_header.m5_intra_modes > 1u ||
              config->partition_selection > 1u || config->coeff_optimization)) ||
         config->frame_header.m5_intra_modes > 4u ||
         (config->frame_header.m5_intra_modes >= 2u && (reference != NULL ||
-            config->frame_header.multi_frame || config->coeff_optimization == 1u || config->motion_optimization)) ||
+            (config->frame_header.multi_frame && !video_key) || config->coeff_optimization == 1u || config->motion_optimization)) ||
         config->transform.forward == NULL || config->transform.inverse == NULL ||
         output->blocks == NULL || output->modes == NULL || output->qcoeff == NULL || output->decisions == NULL ||
         scratch->residual == NULL || scratch->inverse_residual == NULL || scratch->coeff == NULL ||
@@ -5917,7 +6437,9 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
         second->bit_depth != source->bit_depth || second->chroma_format != source->chroma_format ||
         config->rd_mode != 2u || config->motion_optimization != 5u || config->partition_selection > 1u ||
         config->inter_skip_search || header->logical_ref_count != 2u ||
-        header->ref_distance[0] != 1u || header->ref_distance[1] < 2u || header->ref_distance[1] > 8u))
+        header->ref_distance[0] < 1u || header->ref_distance[0] > 8u || header->ref_distance[1] < 1u ||
+        (header->paired_role < SVT_AV2_ONLY_MIDPOINT && header->ref_distance[0] >= header->ref_distance[1]) ||
+        header->ref_distance[1] > 8u))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
     if (second == NULL && (header->logical_ref_count == 2u || header->ref_distance[0] || header->ref_distance[1]))
         return SVT_AV2_ERROR_INVALID_PARAMETER;
@@ -5937,21 +6459,43 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
     work->ist_all_leaves = ist_search && !strcmp(ist_search, "full");
     const char* edge = getenv("SVT_AV2_EDGE_INTER");
     work->edge_inter = edge && !strcmp(edge, "1");
+    const char* inter_search = getenv("SVT_AV2_INTER_SEARCH");
+    const int priced_mixed = inter_search && !strcmp(inter_search, "hme-cost-mixed");
+    work->coarse_long_hme = inter_search && !strcmp(inter_search, "hme-cost-long");
+    const int priced_hme = work->coarse_long_hme || priced_mixed || (inter_search && !strcmp(inter_search, "hme-cost"));
+    work->me_mv_weight=priced_hme ? 1u<<(source->bit_depth-8u) : 0u;
+    work->mixed_inter_fine = priced_mixed || (inter_search && !strcmp(inter_search,"mixed"));
+    work->fine_reference_search = priced_hme || work->mixed_inter_fine || (inter_search && (!strcmp(inter_search, "references") || !strcmp(inter_search, "hme")));
+    work->hierarchical_inter_me = work->fine_reference_search || (inter_search && !strcmp(inter_search, "hierarchical"));
     const char* wide_me = getenv("SVT_AV2_INTER_ME_WIDE");
     work->wide_inter_me = wide_me && !strcmp(wide_me, "1");
     const char* fine = getenv("SVT_AV2_INTER_FINE_FULL");
-    work->full_inter_fine = fine && !strcmp(fine, "1");
+    work->full_inter_fine = fine && !strcmp(fine, "subsets") ? 2 : fine && !strcmp(fine, "1");
     const char* late_skip = getenv("SVT_AV2_FINAL_SKIP");
     work->late_inter_skip = ref && config->inter_tail && late_skip && !strcmp(late_skip, "1");
+    const char* trellis = getenv("SVT_AV2_QM_TRELLIS");
+    work->qm_trellis = trellis && !strcmp(trellis,"luma");
     const char* detail = getenv("SVT_AV2_DETAIL_RD");
     work->detail_rd = detail && (!strcmp(detail, "all") || !strcmp(detail, header->inter_frame ? "p" : "key"));
+    if (detail && !strcmp(detail,"contrast") && !header->multi_frame)
+        work->detail_rd=2;
     const char* video_rect = getenv("SVT_AV2_VIDEO_RECT");
     work->video_rect = header->multi_frame && header->m5_intra_modes == 1u &&
         config->rd_mode == 2u && !config->coeff_optimization && !config->transform_selection &&
-        video_rect && (!strcmp(video_rect, "all") || !strcmp(video_rect, header->inter_frame ? "p" : "key"));
+        video_rect && (!strcmp(video_rect, "all") || !strcmp(video_rect, "motion") || !strcmp(video_rect, "dual-motion") ||
+                       !strcmp(video_rect, "mixed-motion") || !strcmp(video_rect, "key-trees") ||
+                       !strcmp(video_rect, header->inter_frame ? "p" : "key"));
+    if (work->video_rect && !strcmp(video_rect, "key-trees")) work->video_rect = 2u;
+    if (work->video_rect && !strcmp(video_rect, "motion")) work->video_rect = 3u;
+    if (work->video_rect && !strcmp(video_rect, "dual-motion")) work->video_rect = 4u;
+    if (work->video_rect && !strcmp(video_rect, "mixed-motion")) work->video_rect = 5u;
     const char* rect32 = getenv("SVT_AV2_STILL_RECT_RD");
     const char* rect_rdoq = getenv("SVT_AV2_RECT_RDOQ");
     work->rect_rdoq = rect_rdoq && !strcmp(rect_rdoq, "1");
+#if M6_FINE16
+    const char* fine16_search = getenv("SVT_AV2_FINE16_SEARCH");
+    work->ranked_fine16 = fine16_search && !strcmp(fine16_search, "ranked");
+#endif
     if (rect32 && config->rd_mode == 3u && config->partition_selection == 7u)
         work->rect32_search = !strcmp(rect32, "deep") ? 3u : !strcmp(rect32, "half") ? 2u : !strcmp(rect32, "1") ? 1u : 0u;
 #if SVT_AV2_EXPERIMENTAL_STILL_UV_RD
@@ -6011,11 +6555,12 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
 #endif
 #if M6_TX_CACHE
     /* Allocation failure safely falls back to the original forward path. */
-    if (config->rd_mode==3u && svt_av2_transform_path_cacheable(&config->transform,
+    if (!config->balanced_still_search && config->rd_mode==3u && svt_av2_transform_path_cacheable(&config->transform,
         header->base_q_idx,header->bit_depth))
         work->transform_cache=rd_tx_memo_create();
     if (work->transform_cache) {
         work->transform_cache->qm_level = header->qm_level;
+        work->transform_cache->qm_uv_level = header->qm_uv_level;
         work->transform_cache->uv_delta_q = header->uv_delta_q;
     }
 #endif
@@ -6026,26 +6571,26 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
         config->rd_lambda_model ?
         svt_av2_rd_lambda_ai(header->base_q_idx, source->bit_depth, &work->stats.lambda_q8, &qstep) :
         svt_av2_rd_lambda(header->base_q_idx, source->bit_depth, &work->stats.lambda_q8, &qstep);
+    if (error == SVT_AV2_ERROR_NONE && reference && config->rd_lambda_model && header->mv_half == 2u) {
+        const char* model = getenv("SVT_AV2_VIDEO_LAMBDA");
+        if (model && !strcmp(model, "low-delay"))
+            error = rd_lambda_avm_scaled(header->base_q_idx, source->bit_depth, 82u, 1u, 1u,
+                &work->stats.lambda_q8, &qstep);
+    }
     if (error == SVT_AV2_ERROR_NONE && config->rd_lambda_scale) {
         work->stats.lambda_q8 = SVT_AV2_MAX(UINT64_C(1), (work->stats.lambda_q8 * config->rd_lambda_scale + 50u) / 100u);
     }
     if (error == SVT_AV2_ERROR_NONE && config->inter_tail) {
         work->tail = (RdInterTail*)calloc(1u, sizeof(*work->tail));
         const char* zero = getenv("SVT_AV2_SPARSE_PLANES");
-        if (work->tail) work->tail->try_sparse_planes = zero && !strcmp(zero, "1");
+        if (work->tail) {
+            work->tail->try_levels = zero && !strcmp(zero, "rect-levels") ? 2 : zero && !strcmp(zero, "levels");
+            work->tail->try_sparse_planes = work->tail->try_levels || (zero && !strcmp(zero, "1"));
+        }
         if (work->tail == NULL) error = SVT_AV2_ERROR_OUT_OF_MEMORY;
         else {
             const char* trace = getenv("SVT_AV2_INTER_TAIL_TRACE");
             work->tail->trace = trace && trace[0] == '1' && trace[1] == '\0';
-            for (uint32_t i = 0u; i < 3u; ++i) {
-                const uint32_t side = 8u << i;
-                SvtAv2TxSize tx;
-                if (svt_av2_coeff_tx_size_from_dims(side, side, &tx) != SVT_AV2_COEFF_OK ||
-                    svt_av2_coeff_scan_dct_dct(tx, work->tail->scans[i]) != side * side) {
-                    error = SVT_AV2_ERROR_INVALID_STATE;
-                    break;
-                }
-            }
         }
     }
     if (error == SVT_AV2_ERROR_NONE)
@@ -6078,23 +6623,80 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
     const uint64_t frame_lambda = work->stats.lambda_q8;
     double* ssim_scales = NULL;
     const char* ssim = getenv("SVT_AV2_SSIM_RD");
-    if (error == SVT_AV2_ERROR_NONE && ssim &&
-        (!strcmp(ssim, "all") || !strcmp(ssim, header->inter_frame ? "p" : "key"))) {
+    const char* aq_mode=getenv("SVT_AV2_STILL_AQ");
+    const int octile=config->sb_qindex && aq_mode && !strcmp(aq_mode,"octile");
+    const int contour=config->sb_qindex && aq_mode && !strcmp(aq_mode,"contour");
+    if (error == SVT_AV2_ERROR_NONE && ((config->sb_qindex && !octile && !contour) || (ssim &&
+        (!strcmp(ssim, "all") || !strcmp(ssim, header->inter_frame ? "p" : "key"))))) {
         ssim_scales = (double*)malloc(output->decision_count * sizeof(*ssim_scales));
         if (!ssim_scales) error = SVT_AV2_ERROR_OUT_OF_MEMORY;
         else ssim_sb_scales(source, work->geometry.sb_cols, work->geometry.sb_rows, ssim_scales);
     }
+    if (!error && ref && header->mv_half==2u && (priced_hme || (inter_search && !strcmp(inter_search,"hme")))) {
+        const SvtAv2FrameBuffer* frames[3]={source,ref,second};
+        for (unsigned i=0;i<3 && frames[i];++i) {
+            const size_t count=(size_t)(source->visible_width/4u)*(source->visible_height/4u);
+            work->me_pyramid[i]=(uint16_t*)malloc(count*sizeof(uint16_t));
+            if (!work->me_pyramid[i]) { error=SVT_AV2_ERROR_OUT_OF_MEMORY;break; }
+            svt_av2_motion_downsample4(frames[i],work->me_pyramid[i]);
+        }
+    }
+    SvtAv2RdFrameConfig local = *config;
+    SvtAv2TransformPathState* quant=NULL;
+    if (config->sb_qindex) {
+        if (!svt_av2_transform_path_cacheable(&config->transform, header->base_q_idx, source->bit_depth))
+            error=SVT_AV2_ERROR_UNSUPPORTED;
+        else {
+            quant=(SvtAv2TransformPathState*)config->transform.user;
+            work->config=&local;
+        }
+    }
+    const char* search_profile = getenv("SVT_AV2_STILL_SEARCH");
+    const int adaptive_rect = !header->multi_frame && config->rd_mode == 3u &&
+        config->tree_finalists == 4u && search_profile && !strcmp(search_profile, "adaptive-rect");
+    if (adaptive_rect) work->config = &local;
     SVT_AV2_IP_START(profile_sb_loop);
     if (error == SVT_AV2_ERROR_NONE)
         for (size_t sb = 0u; sb < output->decision_count; ++sb) {
-            if (ssim_scales)
+            if (quant) {
+                /* Allocate extra precision to smooth areas, using actual AV2
+                 * quantizer steps. The map keeps deltas representable at edges. */
+                int delta;
+                if (contour)
+                    delta=contour_q_delta(source,64u*(uint32_t)(sb%work->geometry.sb_cols),
+                        64u*(uint32_t)(sb/work->geometry.sb_cols));
+                else if (octile)
+                    delta=octile_q_delta(source,(uint32_t)(sb%work->geometry.sb_cols),
+                        (uint32_t)(sb/work->geometry.sb_cols),(int)header->base_q_idx);
+                else {
+                    delta=(int)lround(2.0*log2(ssim_scales[sb]));
+                    delta=SVT_AV2_MAX(-3,SVT_AV2_MIN(3,delta));
+                }
+                int q=(int)header->base_q_idx+4*delta;
+                const int lo=source->bit_depth==10u?49:1,hi=lo+254;
+                while (q<lo) q+=4;
+                while (q>hi) q-=4;
+                config->sb_qindex[sb]=(uint16_t)q;
+                quant->base_q_idx=local.frame_header.base_q_idx=(uint32_t)q;
+                const double ratio=(double)svt_av2_quant_qlookup(q)/svt_av2_quant_qlookup((int)header->base_q_idx);
+                work->stats.lambda_q8=(uint64_t)(frame_lambda*ratio*ratio+0.5);
+            } else if (ssim_scales)
                 work->stats.lambda_q8 = (uint64_t)((double)frame_lambda * ssim_scales[sb] + 0.5);
+            if (adaptive_rect) {
+                const int deep = deep_rect_activity(source, (unsigned)(sb % work->geometry.sb_cols),
+                    (unsigned)(sb / work->geometry.sb_cols), local.frame_header.base_q_idx);
+                local.screen_trees = !deep;
+                local.balanced_still_search = deep ? 0u : 2u;
+                local.sparse_angle_search = !deep;
+                local.tree_finalists = deep ? config->tree_finalists : 0u;
+            }
             error = encode_sb(work, sb);
             if (error != SVT_AV2_ERROR_NONE) {
                 if (work->fine_trace) fprintf(stderr, "rd_failed hint=%u sb=%zu err=%d\n", header->order_hint, sb, (int)error);
                 break;
             }
         }
+    if (quant) {quant->base_q_idx=header->base_q_idx;work->config=config;}
     free(ssim_scales);
     work->stats.lambda_q8 = frame_lambda;
 #if SVT_AV2_INTER_PROFILE
@@ -6281,6 +6883,7 @@ SvtAv2Error svt_av2_rd_frame_encode(const SvtAv2FrameBuffer* source,
         free(work->coarse_prefix);
     }
 #endif
+    for (unsigned i=0;i<3;++i) free(work->me_pyramid[i]);
     free(work->smooth_grid);
     free(work);
     return error;

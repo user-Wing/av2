@@ -229,6 +229,10 @@ SvtAv2Error svt_av2_intra_cfl_explicit_predict(const SvtAv2FrameBuffer* recon,
     const SvtAv2IntraBlock* block, uint32_t sb_size, uint8_t* dst,
     uint32_t stride, int32_t alpha_q3);
 
+/* Best two signalled alphas by chroma SSE, ties ordered by signed alpha. */
+SvtAv2Error svt_av2_intra_cfl_rank(const SvtAv2FrameBuffer* source, const SvtAv2FrameBuffer* recon,
+    const SvtAv2IntraBlock* block, int8_t ranked[2]);
+
 /* AV2 implicit CfL, filter index zero; the same reconstruction prerequisites
  * apply. alpha_q8 may be NULL. */
 SvtAv2Error svt_av2_intra_cfl_implicit_predict(const SvtAv2FrameBuffer* recon,

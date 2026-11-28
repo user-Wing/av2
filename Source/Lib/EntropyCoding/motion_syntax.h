@@ -19,7 +19,9 @@ typedef struct SvtAv2MotionSyntax {
     SvtAv2MotionCell* cells;
     uint32_t cols, rows;
     uint32_t mv_half; /* Historical name: 0=integer, 1=half, 2=quarter. */
+    uint32_t wide_motion;
     uint32_t two_refs; /* Set by the tile writer from its verified frame header. */
+    uint32_t opposite_directions; /* Rank 0 is future and rank 1 is past at a paired midpoint. */
     uint32_t ref_distance[2]; /* Both nonzero only for supported two-past projection. */
 } SvtAv2MotionSyntax;
 typedef struct SvtAv2MotionPrefix {
